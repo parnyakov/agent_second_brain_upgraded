@@ -1,0 +1,50 @@
+# Secrets: never commit environment files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+/dist/
+
+# Runtime and local tooling
+/.dbrain/
+/.agents/
+/.claude/
+/skills-lock.json
+*.log
+
+# Personal vault: your notes live in their own PRIVATE repository
+# (created during setup), never in this code repository. Only the shared
+# agent instructions and packaging config under vault/ are tracked here.
+# /vault/* (not /vault/) is ignored so the negations below work; the
+# vault's own .git stays ignored too.
+/vault/*
+!/vault/.claude/
+!/vault/.claude-plugin/
+!/vault/.memory-config.json

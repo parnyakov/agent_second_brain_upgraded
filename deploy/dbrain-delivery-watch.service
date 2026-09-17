@@ -1,0 +1,13 @@
+[Unit]
+Description=d-brain delivery-channel watch (out-of-band)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/dbrain
+# Intentionally shares nothing with dbrain-bot/dbrain-watchdog: no python, no
+# d_brain import, no shared process. Whatever breaks the delivery path must
+# not be able to break the thing that reports it. Exit 1 means "a fault was
+# found and both alert channels were told" — that is a successful run of this
+# unit, not a failure of it, so a fault must not trigger OnFailure noise.
+SuccessExitStatus=0 1
+ExecStart=%h/projects/dbrain/scripts/delivery-watch.sh

@@ -1,0 +1,41 @@
+[Unit]
+Description=d-brain Telegram bot (drives the persistent Claude session)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=dbrain-notify@%n.service
+
+[Service]
+Type=simple
+# KillMode=process: stopping/restarting the bot must NOT kill the detached
+# tmux brain that lives in this unit's cgroup (the default control-group would
+# take it down). The brain outlives bot restarts; ensure_session re-attaches.
+KillMode=process
+# A clean stop/restart exits 143 (SIGTERM); that is success, not a failure, so
+# it must not trigger the OnFailure= alert.
+SuccessExitStatus=143 SIGTERM
+# Bounded stop. Without it a stop can run into the *default* 90s
+# DefaultTimeoutStopSec, after which systemd logs that a python3 unit
+# process "remains running after unit stopped" and can start a second
+# instance over the live one. A graceful aiogram shutdown takes seconds.
+TimeoutStopSec=45
+# Why TimeoutStopSec alone does NOT close that gap: ExecStart is `uv run`, so
+# the tracked MainPID is the uv wrapper and `python -m d_brain` is its CHILD.
+# Under KillMode=process both the SIGTERM and the post-TimeoutStopSec SIGKILL
+# go to the MainPID only: SIGKILL to the uv PID leaves
+# the python child alive, reparented away. This
+# reaps that child by exact command line, never by cgroup, so the detached
+# tmux brain (and the watchdog) are never signalled. Leading '-': a clean
+# stop leaves nothing to kill and pkill's exit 1 must not fail the unit.
+ExecStopPost=-/usr/bin/pkill -KILL -x -f '.*python[0-9.]* -m d_brain'
+WorkingDirectory=%h/projects/dbrain
+ExecStart=%h/.local/bin/uv run python -m d_brain
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=CLAUDE_CONFIG_DIR=%h/.claude
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

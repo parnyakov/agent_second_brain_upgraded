@@ -1,0 +1,10 @@
+[Unit]
+Description=d-brain daily processing
+OnFailure=dbrain-notify@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/dbrain
+ExecStart=%h/projects/dbrain/scripts/process.sh
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_CONFIG_DIR=%h/.claude

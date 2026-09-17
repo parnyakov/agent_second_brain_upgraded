@@ -1,0 +1,8 @@
+# Product files owned by the code repository, not by your memory:
+/.claude/
+/.claude-plugin/
+/.memory-config.json
+.session/*.json
+.sessions/
+attachments/*
+!attachments/.gitkeep

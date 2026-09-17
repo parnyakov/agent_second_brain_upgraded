@@ -1,0 +1,157 @@
+#!/bin/bash
+# dbrain — one command to control your d-brain assistant.
+#
+# Usage: dbrain <status|restart|logs|doctor|clear|attach|repair|login|onboarding|permissions>
+#
+# Designed for non-technical users: every command prints plain-language output
+# and the next thing to try if something is wrong.
+set -euo pipefail
+
+RUNTIME_DIR="${DBRAIN_RUNTIME_DIR:-$HOME/.dbrain}"
+# Same Claude config dir as the systemd units, for doctor/login/onboarding.
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJECT_FILE="$RUNTIME_DIR/project.path"
+PROJECT_DIR="${DBRAIN_PROJECT:-$( [ -f "$PROJECT_FILE" ] && cat "$PROJECT_FILE" || echo "$HOME/projects/dbrain" )}"
+NAME_FILE="$RUNTIME_DIR/brain.name"
+BRAIN="$( [ -f "$NAME_FILE" ] && cat "$NAME_FILE" || echo "dbrain" )"
+
+# ── C9: instance / scope awareness ──────────────────────────────────────
+# All three default to today's single-instance install, so an operator who
+# sets nothing gets byte-for-byte the previous commands.
+INSTANCE="${DBRAIN_INSTANCE:-}"
+SYSTEMD_SCOPE="${DBRAIN_SYSTEMD_SCOPE:-user}"
+if [ -n "$INSTANCE" ]; then
+  BOT_UNIT="${DBRAIN_BOT_UNIT:-dbrain-bot@$INSTANCE.service}"
+  WATCHDOG_UNIT="${DBRAIN_WATCHDOG_UNIT:-dbrain-watchdog@$INSTANCE.service}"
+else
+  BOT_UNIT="${DBRAIN_BOT_UNIT:-dbrain-bot.service}"
+  WATCHDOG_UNIT="${DBRAIN_WATCHDOG_UNIT:-dbrain-watchdog.service}"
+fi
+
+# Read-only queries need no privileges in either scope.
+_sctl_ro() {
+  if [ "$SYSTEMD_SCOPE" = "user" ]; then systemctl --user "$@"; else systemctl "$@"; fi
+}
+# Mutating commands: system units go through the sudoers whitelist (plan
+# §3.5) because polkit 0.105 cannot grant per-unit rights. `-n` never
+# prompts — a missing rule fails loudly instead of hanging on a password.
+_sctl_rw() {
+  if [ "$SYSTEMD_SCOPE" = "user" ]; then systemctl --user "$@"; else sudo -n systemctl "$@"; fi
+}
+
+cmd="${1:-status}"
+
+_uv() { (cd "$PROJECT_DIR" && uv run "$@"); }
+_engine() {
+  local e="${DBRAIN_CHAT_ENGINE:-$(grep -E '^DBRAIN_CHAT_ENGINE=' "$PROJECT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2)}"
+  echo "${e:-claude}"
+}
+
+case "$cmd" in
+  status)
+    echo "📋 Статус d-brain"
+    ENGINE="$(_engine)"
+    if [ -f "$RUNTIME_DIR/STATUS.md" ]; then
+      state="$(sed -n 's/^state: //p' "$RUNTIME_DIR/STATUS.md" | head -1)"
+      at="$(sed -n 's/^checked_at: \([0-9]*\).*/\1/p' "$RUNTIME_DIR/STATUS.md" | head -1)"
+      if [ -n "$state" ] && [ -n "$at" ]; then
+        echo "— сторож:   $state (проверено $(date -d "@$at" '+%d.%m %H:%M:%S' 2>/dev/null || echo "$at"))"
+      else
+        cat "$RUNTIME_DIR/STATUS.md"
+      fi
+    else
+      echo "(нет STATUS.md — watchdog ещё не запускался)"
+    fi
+    echo "— bot:      $(_sctl_ro is-active "$BOT_UNIT" 2>/dev/null || echo unknown)"
+    echo "— watchdog: $(_sctl_ro is-active "$WATCHDOG_UNIT" 2>/dev/null || echo unknown)"
+    if [ "$ENGINE" = "codex" ]; then
+      # Codex has no long-lived session: every message starts `codex exec`.
+      if out="$(codex login status 2>&1)" && [[ "${out,,}" == *"logged in"* ]] && [[ "${out,,}" != *"not logged in"* ]]; then
+        echo "— мозг:     Codex, вход выполнен (запускается на каждое сообщение)"
+      else
+        echo "— мозг:     Codex, НУЖЕН ВХОД → dbrain login"
+      fi
+    elif tmux has-session -t "$BRAIN" 2>/dev/null; then
+      echo "— мозг:     жив ($BRAIN)"
+    else
+      echo "— мозг:     НЕ запущен"
+    fi
+    echo "Полная проверка с ответом агента: dbrain doctor"
+    ;;
+  restart)
+    echo "♻️  Перезапускаю сервисы…"
+    _sctl_rw reset-failed "$BOT_UNIT" "$WATCHDOG_UNIT" 2>/dev/null || true
+    _sctl_rw restart "$BOT_UNIT" "$WATCHDOG_UNIT"
+    echo "Готово. Проверь: dbrain status"
+    ;;
+  logs)
+    # System instances write to a per-instance file (LogsDirectory=dbrain/%i +
+    # StandardOutput=append:), deliberately NOT to the shared journal — so
+    # conversation text stays out of a log every account can read, and each
+    # operator reads their own without sudo.
+    LOG_FILE="/var/log/dbrain/$INSTANCE/bot.log"
+    if [ "$SYSTEMD_SCOPE" != "user" ] && [ -n "$INSTANCE" ] && [ -f "$LOG_FILE" ]; then
+      tail -n "${2:-80}" "$LOG_FILE"
+    else
+      journalctl --user -u "$BOT_UNIT" -n "${2:-80}" --no-pager 2>/dev/null || echo "Логи недоступны (нет systemd --user?)"
+    fi
+    ;;
+  doctor)
+    echo "🩺 Запускаю осмотр…"
+    _uv python -m d_brain.services.doctor
+    ;;
+  clear)
+    if tmux has-session -t "$BRAIN" 2>/dev/null; then
+      tmux send-keys -t "$BRAIN" "/clear" Enter
+      echo "🧹 Память сессии очищена (durable-данные в файлах не тронуты)."
+    else
+      echo "Мозг не запущен — нечего чистить. Попробуй: dbrain repair"
+    fi
+    ;;
+  attach)
+    exec tmux attach -t "$BRAIN"
+    ;;
+  repair)
+    echo "🔧 Чиню: сброс ошибок + перезапуск…"
+    _sctl_rw reset-failed "$BOT_UNIT" "$WATCHDOG_UNIT" 2>/dev/null || true
+    _sctl_rw restart "$BOT_UNIT" "$WATCHDOG_UNIT" 2>/dev/null || true
+    echo "Если не помогло, посмотри: dbrain logs"
+    ;;
+  login)
+    ENGINE="$(_engine)"
+    if [ "$ENGINE" = "codex" ]; then
+      echo "🔑 Запускаю безопасный device-login Codex…"
+      codex login --device-auth
+      echo "Готово. Перезапускаю сервисы…"
+      _sctl_rw restart "$BOT_UNIT" "$WATCHDOG_UNIT"
+      exit 0
+    fi
+    echo "🔑 Запускаю вход в Claude (нужна подписка)…"
+    echo "Открой ссылку ниже на телефоне/ноутбуке, подтверди и вставь код сюда:"
+    # Pin the config dir to the one the brain runs under (the systemd units set
+    # CLAUDE_CONFIG_DIR=$HOME/.claude), so the new token lands where the
+    # session reads it — not in some other dir the login shell might point to.
+    CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" claude setup-token
+    # Auth is read only at session START. The live tmux brain holds the old
+    # (logged-out) auth in memory; `dbrain restart` won't help (KillMode=process
+    # keeps the brain alive). Recreate BOTH sessions so the bot rebuilds them
+    # with the fresh login on the next message / cron job.
+    echo "♻️  Пересоздаю сессию, чтобы она подхватила новый вход…"
+    tmux kill-session -t "$BRAIN" 2>/dev/null || true
+    tmux kill-session -t "${BRAIN}_cron" 2>/dev/null || true
+    echo "Готово. Бот поднимет сессию заново при следующем сообщении. Проверь: dbrain status"
+    ;;
+  onboarding)
+    shift || true
+    cd "$PROJECT_DIR"
+    exec uv run python -m d_brain.onboarding --vault "$PROJECT_DIR/vault" "$@"
+    ;;
+  permissions)
+    shift || true
+    exec bash "$PROJECT_DIR/scripts/configure-permissions.sh" "$@"
+    ;;
+  *)
+    echo "Usage: dbrain <status|restart|logs|doctor|clear|attach|repair|login|onboarding|permissions>"
+    exit 1
+    ;;
+esac
