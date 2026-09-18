@@ -1,11 +1,15 @@
 # Agent Second Brain
 
+**Установка (на русском): [docs/install.ru.md](docs/install.ru.md)** ·
+Описание: [README.ru.md](README.ru.md)
+
 A personal AI agent in Telegram with Obsidian-based memory. You send
 thoughts, tasks and notes by text or voice; the agent files them, keeps
 context between conversations, reminds you of what matters and sends a daily
 summary.
 
-Primary documentation is in Russian: [README.ru.md](README.ru.md).
+Primary documentation is in Russian: [README.ru.md](README.ru.md), install
+guide [docs/install.ru.md](docs/install.ru.md).
 
 ## What it does
 
@@ -39,21 +43,27 @@ recurring jobs are created by the agent through the `cron` skill.
 
 ## Two repositories
 
-- **This code repository:** bot, agent instructions, skills, templates. No
-  personal data; history starts from a clean commit.
+- **This code repository (public):** bot, agent instructions, skills,
+  templates. No personal data. Install and updates download it without a
+  GitHub login; no fork or invitation is needed.
 - **Your private memory repository** (the vault, default name `dbrain-vault`):
-  your notes, tasks, goals and agent memory. Created during setup, always
-  private. In this code repository `vault/` is ignored except the shared
+  your notes, tasks, goals and agent memory. A separate repository in your
+  own GitHub account, created during setup, always private. In this code repository `vault/` is ignored except the shared
   agent instructions in `vault/.claude/`.
 
 ## Install
 
 The only supported install guide is [docs/install.ru.md](docs/install.ru.md).
 
-In short: a fresh Ubuntu 24.04 server, a dedicated user, then one start
-command from the guide that installs `gh`, signs in to GitHub, clones this
-private repository to `~/projects/agent-second-brain` and runs
-`bash ~/projects/agent-second-brain/bootstrap.sh`. Setup asks for the
+In short: a fresh Ubuntu 24.04 server, a dedicated sudo user, then the start
+command:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl && git clone https://github.com/parnyakov/agent_second_brain_upgraded.git ~/projects/agent-second-brain && bash ~/projects/agent-second-brain/bootstrap.sh
+```
+
+Setup installs `gh` itself and signs in to GitHub at step 5 (device code),
+only to create your private memory repository. Setup asks for the
 Telegram bot token and your Telegram ID, a Deepgram key, your timezone, the
 engine (1 Codex, default; 2 Claude Code) and the permission profile (1 full
 access on a dedicated server, default; 2 standard), and creates a private

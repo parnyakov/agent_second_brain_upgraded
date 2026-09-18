@@ -179,7 +179,9 @@ configure_github() {
     if gh auth status -h github.com >/dev/null 2>&1; then
         success "GitHub уже подключён"
     else
-        echo "  Сейчас GitHub покажет одноразовый код и ссылку github.com/login/device."
+        echo "  Вход нужен только для вашей приватной памяти (репозиторий dbrain-vault)."
+        echo "  На первый вопрос GitHub (Y/n) нажмите Enter, это значит «да»."
+        echo "  Затем GitHub покажет одноразовый код и ссылку github.com/login/device."
         echo "  Откройте ссылку на компьютере, введите код и подтвердите доступ."
         gh auth login -h github.com -p https -w || fail "Вход в GitHub не завершён." "Повторите установку и завершите вход по ссылке."
     fi
@@ -557,7 +559,7 @@ final_check() {
     done
     if [ "$units_ok" != "1" ]; then
         fail "Сервисы агента не запустились." \
-             "Выполните dbrain repair, затем dbrain logs 100 и перешлите вывод тому, кто выдал доступ."
+             "Выполните dbrain repair, затем dbrain logs 100 и перешлите вывод тому, кто помогает вам с установкой."
     fi
     doctor_rc="$(cat "$RUNTIME_DIR/install-doctor.rc" 2>/dev/null || echo none)"
     if [ "$doctor_rc" != "0" ]; then
