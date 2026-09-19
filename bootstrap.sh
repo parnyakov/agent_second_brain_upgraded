@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "$EUID" -eq 0 ]; then
     echo "[X] Не запускайте установку от root."
-    echo "    Войдите обычным пользователем по SSH: ssh ivan@IP_СЕРВЕРА  (docs/install.ru.md, раздел «5. Рабочий пользователь»)"
+    echo "    Войдите обычным пользователем по SSH: ssh user@IP_СЕРВЕРА  (docs/install.ru.md, раздел «5. Рабочий пользователь»)"
     exit 1
 fi
 
