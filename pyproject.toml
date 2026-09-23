@@ -12,7 +12,7 @@ dependencies = [
     "croniter>=2.0,<7",
     "deepgram-sdk>=5.3,<6",
     "httpx>=0.28,<1",
-    # Heavy-attachment prep (agent-infra-backlog item 21): downscaling
+    # Heavy-attachment prep: downscaling
     # document-images and extracting PDF text before the brain reads them.
     # These were installed ad-hoc in the venv and NOT declared — upgrade.sh
     # runs `uv sync`, which prunes undeclared packages, so declaring them is

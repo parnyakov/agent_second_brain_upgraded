@@ -43,11 +43,11 @@ def _finish_before_review(vault: Path) -> None:
 
 def test_state_is_versioned_and_owner_only(tmp_path: Path):
     vault = _vault(tmp_path)
-    ob.save_answer(vault, "profile", "name", "Иван")
+    ob.save_answer(vault, "profile", "name", "Тест")
     path = ob.state_path(vault)
     raw = json.loads(path.read_text())
     assert raw["version"] == ob.STATE_VERSION == 2
-    assert raw["sections"]["profile"]["answers"] == {"name": "Иван"}
+    assert raw["sections"]["profile"]["answers"] == {"name": "Тест"}
     assert raw["sections"]["profile"]["status"] == "in_progress"
     assert path.stat().st_mode & 0o077 == 0
     assert not list(path.parent.glob("*.tmp"))
@@ -69,7 +69,7 @@ def test_v1_state_is_migrated_with_backup(tmp_path: Path):
         "version": 1,
         "completed": ["profile", "work", "goals"],
         "answers": {
-            "profile": {"name": "Иван", "timezone": "Europe/Moscow", "language": "Русский", "role": "Менеджер", "about": ""},
+            "profile": {"name": "Тест", "timezone": "Europe/Moscow", "language": "Русский", "role": "Менеджер", "about": ""},
             "work": {"projects": "Проект А", "people": "", "responsibilities": "Продажи"},
             "goals": {"vision": "", "year": "Рост", "month": "Запуск", "week": "Отчёт"},
             "notes": {"deferred": True},
@@ -82,7 +82,7 @@ def test_v1_state_is_migrated_with_backup(tmp_path: Path):
 
     assert state["version"] == 2
     assert state["sections"]["profile"]["status"] == "done"
-    assert state["sections"]["profile"]["answers"]["name"] == "Иван"
+    assert state["sections"]["profile"]["answers"]["name"] == "Тест"
     assert "about" not in state["sections"]["profile"]["answers"]
     assert state["sections"]["projects"]["status"] == "done"
     assert state["sections"]["projects"]["answers"]["responsibilities"] == "Продажи"
@@ -100,14 +100,14 @@ def test_v1_state_is_migrated_with_backup(tmp_path: Path):
 
 def test_resume_mid_section_at_first_unanswered_question(tmp_path: Path):
     vault = _vault(tmp_path)
-    ob.save_answer(vault, "profile", "name", "Иван")
+    ob.save_answer(vault, "profile", "name", "Тест")
     ob.save_answer(vault, "profile", "timezone", "Europe/Moscow")
 
     payload = ob.next_payload(ob.load_state(vault))
 
     assert payload["section"]["id"] == "profile"
     assert payload["section"]["first_unanswered"] == "language"
-    assert payload["section"]["answers"] == {"name": "Иван", "timezone": "Europe/Moscow"}
+    assert payload["section"]["answers"] == {"name": "Тест", "timezone": "Europe/Moscow"}
 
 
 def test_optional_empty_answer_counts_as_answered(tmp_path: Path):
@@ -160,7 +160,7 @@ def test_reopen_affects_only_that_section(tmp_path: Path):
 
 def test_complete_refuses_missing_required(tmp_path: Path):
     vault = _vault(tmp_path)
-    ob.save_answer(vault, "profile", "name", "Иван")
+    ob.save_answer(vault, "profile", "name", "Тест")
     with pytest.raises(ob.OnboardingError, match="timezone"):
         ob.complete_section(vault, "profile")
     assert ob.load_state(vault)["sections"]["profile"]["status"] == "in_progress"
@@ -306,7 +306,7 @@ def test_backups_and_archives_never_keep_secret_answers(tmp_path: Path, capsys):
     v1 = {"version": 1, "completed": [], "answers": {"services": {"used": f"бот {BOT_TOKEN}", "wanted": "Gmail"}}}
     path.write_text(json.dumps(v1, ensure_ascii=False))
     ob.load_state(vault)
-    ob.save_answer(vault, "profile", "name", "Иван")
+    ob.save_answer(vault, "profile", "name", "Тест")
     code, out = _cli(vault, "restart", "--yes", "--json", capsys=capsys)
     assert code == 0
     for file in path.parent.iterdir():
@@ -314,7 +314,7 @@ def test_backups_and_archives_never_keep_secret_answers(tmp_path: Path, capsys):
         assert BOT_TOKEN not in text, file.name
     backup = json.loads(path.with_name("state.v1.backup.json").read_text())
     assert backup["answers"]["services"] == {"used": ob.REDACTED, "wanted": "Gmail"}
-    assert "Иван" in Path(json.loads(out.out)["archived"]).read_text()
+    assert "Тест" in Path(json.loads(out.out)["archived"]).read_text()
 
 
 def test_services_and_notes_targets(tmp_path: Path):
@@ -422,7 +422,7 @@ def test_status_and_next_json_schema(tmp_path: Path, capsys):
     assert [s["id"] for s in status["sections"]] == list(ob.SECTIONS)
     assert {"id", "index", "title", "status", "answered", "total_questions", "missing_required", "updated_at"} <= set(status["sections"][0])
 
-    code, out = _cli(vault, "answer", "profile", "name", "--value", "Иван", "--json", capsys=capsys)
+    code, out = _cli(vault, "answer", "profile", "name", "--value", "Тест", "--json", capsys=capsys)
     assert code == 0 and json.loads(out.out)["first_unanswered"] == "timezone"
 
     code, out = _cli(vault, "next", "--json", capsys=capsys)
@@ -479,11 +479,11 @@ def _scripted(lines: list[str]):
 
 def test_wizard_eof_saves_partial_answers_and_resumes(tmp_path: Path, capsys):
     vault = _vault(tmp_path)
-    code = ob.run_wizard(vault, input_fn=_scripted(["Иван", "Europe/Moscow"]))
+    code = ob.run_wizard(vault, input_fn=_scripted(["Тест", "Europe/Moscow"]))
     assert code == 130
     assert "dbrain onboarding resume" in capsys.readouterr().out
     state = ob.load_state(vault)
-    assert state["sections"]["profile"]["answers"] == {"name": "Иван", "timezone": "Europe/Moscow"}
+    assert state["sections"]["profile"]["answers"] == {"name": "Тест", "timezone": "Europe/Moscow"}
     assert state["sections"]["profile"]["status"] == "in_progress"
 
     # Resume: language, role, about (multiline, "." ends), then Ctrl+C in projects.
@@ -522,11 +522,11 @@ def test_wizard_refuses_secret_and_reasks(tmp_path: Path, capsys):
 
 def test_restart_archives_state(tmp_path: Path, capsys):
     vault = _vault(tmp_path)
-    ob.save_answer(vault, "profile", "name", "Иван")
+    ob.save_answer(vault, "profile", "name", "Тест")
     code, out = _cli(vault, "restart", "--yes", "--json", capsys=capsys)
     assert code == 0
     archived = Path(json.loads(out.out)["archived"])
-    assert archived.exists() and "Иван" in archived.read_text()
+    assert archived.exists() and "Тест" in archived.read_text()
     assert archived.name.startswith("state.2")
     fresh = ob.load_state(vault)
     assert fresh["sections"]["profile"]["answers"] == {}

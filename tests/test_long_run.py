@@ -1,6 +1,6 @@
-"""Tests for long_run.py — unattended long-turn tracking (agent-infra-backlog
-item 22). Table-driven over the pure `next_state` transition, plus the
-read/write/clear file plumbing and the `is_active` staleness guard."""
+"""Tests for long_run.py — unattended long-turn tracking. Table-driven over
+the pure `next_state` transition, plus the read/write/clear file plumbing
+and the `is_active` staleness guard."""
 
 from d_brain.services import long_run
 from d_brain.services.long_run import LongRun

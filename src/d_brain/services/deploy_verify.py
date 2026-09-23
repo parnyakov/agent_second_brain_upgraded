@@ -1,18 +1,18 @@
 """Canary check for a self-deploy of delivery-critical code.
 
-The 2026-08-20 problem in one sentence: the session deployed a change to its
+The underlying problem in one sentence: the session deployed a change to its
 own reply path, had no way to test that path except by using it, and so the
 first evidence that anything was wrong was a human noticing silence hours
 later. The way out is not "test more before deploying" — the pre-deploy test
 suite was green and stayed green through the whole outage. It is to make the
 deploy itself unfinished until a real round trip has succeeded.
 
-Four things have to hold for a reply to reach the owner, and each one broke at
-some point on 2026-08-20:
+Four things have to hold for a reply to reach the owner, and each one broke
+at some point during a real production outage:
 
   unit_active     — the service is up (and, after a deploy, up SINCE it)
   single_instance — exactly one `python -m d_brain`; a second one is the
-                    orphan-under-`uv` bug that survived a restart at 10:51:40
+                    orphan-under-`uv` bug that survived a restart
   telegram_api    — the token still authenticates and api.telegram.org answers
   brain_canary    — a trivial prompt goes through the live tmux pane, through
                     marker extraction, and comes back — the actual code a
@@ -27,7 +27,7 @@ nothing to do with `DEFAULT_TIMEOUT` (3600s). That ceiling exists for real
 tool-dense work; a canary is a no-op turn, so anything slower than a couple of
 minutes IS the failure we are looking for. Reusing the runaway ceiling here
 would mean waiting an hour to learn the channel is dead — which is roughly how
-long it took on 2026-08-20.
+long it took during the real outage that motivated this canary.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ DELIVERY_CRITICAL_PATHS = (
     "src/d_brain/services/delivery_guard.py",
     "src/d_brain/services/runtime.py",
     "src/d_brain/services/long_run.py",
-    # The durable-delivery modules (backlog item 33). A reply now lives in
+    # The durable-delivery modules. A reply now lives in
     # the outbox, an incoming message in the inbox, a message waiting for a
     # busy session in the chat queue, and the stop decides which of them
     # survives a restart — a bug in any of them is a lost message that no

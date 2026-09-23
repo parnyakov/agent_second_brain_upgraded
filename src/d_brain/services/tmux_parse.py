@@ -599,7 +599,7 @@ _CHROME_LINE_RE = re.compile(
 
 # The prompt box's TOP border carries a trailing label whenever the session on
 # screen has a NAME — measured in ~/.dbrain/pane.log (2026-09-19,
-# agent-infra-backlog item 28) and live on Claude Code 2.1.278:
+#) and live on Claude Code 2.1.278:
 #   "──────…────── night-second-brain ─"
 #   "❯ "
 # A label alone does NOT mean "foreign": `/rename foo` in the bot's own
@@ -643,7 +643,7 @@ def foreign_view_label(text: str) -> str | None:
     A pane showing a background task still looks READY, and a prompt typed
     into it is answered by that task, not by the bot's conversation — so the
     reply never reaches the main transcript and every ask() times out with
-    ``region=None ever_saw_r_marker=False`` (the 2026-09-19 incident).
+    ``region=None ever_saw_r_marker=False`` (seen live once).
     Measured from the last NON-blank row, since capture-pane pads a
     not-yet-full pane with empty rows below the prompt box.
     """
@@ -732,7 +732,7 @@ def is_working_progressing(
     whole-turn marker, not a per-tick counter, and a genuinely silent-but-
     alive task holds it byte-identical on screen for its entire duration.
 
-    ``trust_static`` (backlog item 13, 2026-09-04) bounds that exemption in
+    ``trust_static`` (-09-04) bounds that exemption in
     TIME without touching it in kind. Default True ⇒ byte-identical to the
     behaviour described above, which is what every legacy call site gets.
     Passing False says "this caller has watched the pane sit byte-identical
@@ -793,7 +793,7 @@ def is_idle(text: str) -> bool:
 
 # ── main-turn liveness / salvage extraction ───────────────────────────────
 #
-# Added for backlog item 10 (2026-08-21): a reply is lost forever when the
+# Added for (2026-08-21): a reply is lost forever when the
 # model finishes its turn but never emits the closing `<<<E:id>>>` marker.
 # `is_working()`/`is_working_progressing()` above are DELIBERATELY left
 # untouched — they answer "is ANYTHING happening in this pane" (main turn OR
@@ -975,7 +975,7 @@ def main_area_working(text: str) -> bool:
     the model had written so far and mark the rid delivered, permanently
     blocking the real answer.
 
-    Before backlog item 32 this net was a `_WORKING_RE` check ask() ran
+    Before this net was a `_WORKING_RE` check ask ran
     against the pane region it had scraped between the reply marker and the
     first boundary line. The reply text no longer comes from the pane, so
     there is no such region any more — but the SCOPE that made the old check
@@ -1072,7 +1072,7 @@ def extract_open_reply(text: str, rid: str) -> str | None:
     """Return the body of an UNTERMINATED ``<<<R:rid>>>`` span (no closing
     ``<<<E:rid>>>``), or ``None``.
 
-    The salvage path for backlog item 10: the model occasionally never
+    The salvage path for the model occasionally never
     emits the closing marker for an otherwise-complete answer, and with no
     E line :func:`extract_reply` (which requires a complete pair) has
     nothing to return — there is otherwise no delivery path at all for that

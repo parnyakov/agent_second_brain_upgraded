@@ -209,7 +209,7 @@ def get_cron_session(settings: Settings) -> EngineDriver:
 
 
 def get_duty_session(settings: Settings) -> EngineDriver:
-    """Return the duty brain — a THIRD, isolated session (backlog items 29-30).
+    """Return the duty brain — a THIRD, isolated session.
 
     Exact sibling of ``get_cron_session``: same persona and vault, its own
     session name and its own runtime dir. Two things are deliberately

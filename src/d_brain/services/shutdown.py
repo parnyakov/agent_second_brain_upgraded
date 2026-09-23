@@ -1,11 +1,10 @@
 """Graceful stop: a restart stops taking new work instead of cutting it off.
 
-Step 3 of the reliability plan (``thoughts/projects/agent-infra-backlog.md``
-item 33). Step 1 made sure a reply that was BORN could not be lost on the way
-out; step 2 made sure a message that ARRIVED could not be lost on the way in.
-This one covers the moment between them — the turn that is *in flight* when
-the owner restarts the bot, which he does several times a day (six, on
-2026-09-22).
+Step 3 of a five-step reliability plan. Step 1 made sure a reply that was
+BORN could not be lost on the way out; step 2 made sure a message that
+ARRIVED could not be lost on the way in. This one covers the moment between
+them — the turn that is *in flight* when the owner restarts the bot, which
+he does several times a day.
 
 What used to happen: ``systemctl restart`` sends SIGTERM, aiogram's own signal
 handler stops polling, ``start_polling`` returns, the loop closes and every

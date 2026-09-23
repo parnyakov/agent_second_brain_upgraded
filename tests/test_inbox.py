@@ -1,4 +1,4 @@
-"""Tests for the durable inbox (2026-09-22, step 2 of the reliability plan).
+"""Tests for the durable inbox.
 
 What is pinned down here is exactly what the feature promises, and nothing
 about how the files happen to be named:

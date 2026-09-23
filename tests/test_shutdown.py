@@ -1,4 +1,4 @@
-"""Tests for the graceful stop (2026-09-22, step 3 of the reliability plan).
+"""Tests for the graceful stop.
 
 What is pinned down here is what a restart PROMISES, not how the module is
 built:

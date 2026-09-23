@@ -1,5 +1,4 @@
-"""Tests for the durable reply outbox (2026-09-22, step 1 of the reliability
-plan).
+"""Tests for the durable reply outbox.
 
 What is pinned down here is exactly what the feature promises, and nothing
 about how the files happen to be named:

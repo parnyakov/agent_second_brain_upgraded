@@ -1,4 +1,4 @@
-"""``/resend`` command handler (backlog item 14).
+"""``/resend`` command handler.
 
 A manual, READ-ONLY escape hatch: re-sends the last assistant reply by
 reading it straight from the session's JSONL transcript, bypassing the

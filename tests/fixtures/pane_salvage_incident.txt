@@ -246,4 +246,4 @@ Cooked for 3m 41s · 1 background task still running
 
   ● main
   ◯ general-purpose  Reviewing salvage fix diff   3m 14s · ↓ 42.7k tokens
-  ⧉  example-task-2026-01-01
+  ⧉  scratch-notes-2026-08-17

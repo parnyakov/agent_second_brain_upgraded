@@ -6,7 +6,7 @@ CodexExecDriver directly against a throwaway runtime dir and a working root
 you pass in; it never reads Settings, never touches the live engine selection
 (`DBRAIN_CHAT_ENGINE` / `DBRAIN_CRON_ENGINE`), and never touches the running
 services. Flipping anything live is a separate, explicit decision (see
-agent-infra-backlog item 26).
+).
 
 This is the "one real, honest check" the compressed phase-2 scope asks for:
 unit tests prove the parsing and the state machine, this proves the parsing
@@ -27,8 +27,8 @@ What it exercises, in order:
 
 Sandbox: `workspace-write` (the default), scoped to --work-dir. That is write
 protection, not read isolation — `--sandbox workspace-write` does not restrict
-reads (phase-0 spike, step 3). The owner removed the privacy half of that finding
-on 2026-09-05 and kept the write-protection half, which is why the default is
+reads (phase-0 spike, step 3). The owner decided to drop the privacy half of
+that finding and keep the write-protection half, which is why the default is
 kept as-is here.
 """
 

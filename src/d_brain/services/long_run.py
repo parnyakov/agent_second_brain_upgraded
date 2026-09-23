@@ -1,6 +1,6 @@
 """Tracks unattended long-running turns for USER VISIBILITY only.
 
-Background (agent-infra-backlog item 22): during a long autonomous agent
+Background: during a long autonomous agent
 cascade, the pane's main turn can stay visibly active (progressing) for far
 longer than a normal chat turn, while nobody's `ask()` holds the process-wide
 ask-lock — the interactive session is being driven by a background

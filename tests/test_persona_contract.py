@@ -26,7 +26,7 @@ def test_persona_names_autograph_memory():
 
 
 def test_persona_has_long_cascade_dispatch_rule():
-    """agent-infra-backlog item 22: the root turn of a multi-level agent
+    """agent-infra: the root turn of a multi-level agent
     cascade must dispatch and close, not stay open while sub-agents run —
     otherwise the pane looks identical to a wedged session from outside."""
     text = PERSONA.read_text()

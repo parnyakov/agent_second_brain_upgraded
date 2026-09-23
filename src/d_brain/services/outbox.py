@@ -165,7 +165,7 @@ class Item:
     next_attempt: float = 0.0
     last_error: str = ""
     # The message this chunk answers, when saying so is worth it — today
-    # only a reply that comes out of the per-chat queue (item 33 step 5),
+    # only a reply that comes out of the per-chat queue,
     # where minutes may have passed since the question. 0 = a plain send,
     # which is what every entry written before this field existed reads as.
     reply_to: int = 0

@@ -80,9 +80,10 @@ DEFAULT_ALERT_COOLDOWN_MAX = 12 * 3600.0  # back-off cap (doubles 1h→2h→…�
 DEFAULT_NUDGE_COOLDOWN = 600.0
 DEFAULT_NUDGE_COOLDOWN_MAX = 3600.0
 # Fallback when the banner carries no readable reset time: nudge anyway after
-# this long rather than sit parked forever, which is the 2026-08-20 incident.
+# this long rather than sit parked forever, a failure mode seen in
+# production before this fallback existed.
 DEFAULT_LIMIT_MAX_WAIT = 6 * 3600.0
-# R3 (Fable audit): the incident registry measured a ~10x jump in the
+# R3 (Fable audit): a prior production measurement found a ~10x jump in the
 # closing-marker drop rate at this boundary (1.3% below vs ~12.2%/11.6% in
 # the 400-600k/600k+ buckets) — notification only, no automatic /clear: that
 # stays the user's call per durable-state-first (brain-system.md).
@@ -101,7 +102,7 @@ DEFAULT_CONTEXT_ALERT_TOKENS = 400_000
 # just one) re-arms within under a minute rather than being noticeably
 # delayed.
 DEFAULT_CONTEXT_REARM_TICKS = 3
-# agent-infra-backlog item 22 (2026-09): how long an UNATTENDED long turn
+# (2026-09): how long an UNATTENDED long turn
 # (main turn active on the pane, but the ask-lock free — the shape of a
 # multi-level autonomous agent cascade) runs before the watchdog sends one
 # heads-up notice. See long_run.py's module docstring for the marker
@@ -114,7 +115,7 @@ DEFAULT_LONG_RUN_ALERT = 900.0
 # background agents. 0.0 means this code path never fires — see
 # Watchdog._track_long_run.
 DEFAULT_LONG_RUN_NUDGE = 0.0
-# agent-infra-backlog item 29 (2026-09): HARD cap. An unattended turn of the
+# (2026-09): HARD cap. An unattended turn of the
 # main session that runs longer than this is closed automatically (one
 # interrupt() per run) and the owner is told why. The rule this encodes is
 # the owner's own: a long background job belongs to an agent, the main
@@ -217,7 +218,7 @@ class Watchdog:
         self._limited_since: float | None = None
         self._last_nudge_ts = 0.0
         self._nudge_attempts = 0
-        # agent-infra-backlog item 22: unattended long-run tracking (see
+        # agent-infra: unattended long-run tracking (see
         # long_run.py). 0.0 disables the whole feature — no marker writes,
         # no notices.
         self._long_run_alert_seconds = long_run_alert_seconds
@@ -225,7 +226,7 @@ class Watchdog:
         # 0.0 (the default) means this never fires.
         self._long_run_nudge_seconds = long_run_nudge_seconds
         self._long_run_nudge_sent = False
-        # Item 29: hard cap. 0.0 (or a non-positive value) never closes
+        # hard cap. 0.0 (or a non-positive value) never closes
         # anything. Both pieces of state are per-RUN latches reset on
         # 'started'/'ended', exactly like _long_run_nudge_sent — so at most
         # ONE interrupt() is ever issued for a given unattended run, however
@@ -337,8 +338,8 @@ class Watchdog:
 
         Claude Code parks at the banner and never re-checks the clock — it
         only acts on the next input. Before this, a limit that reset at
-        midnight left the brain silent until the user happened to write (verified
-        2026-08-20: a manual send-keys revived it instantly).
+        midnight left the brain silent until the owner happened to write
+        (confirmed once: a manual send-keys revived it instantly).
         """
         now = self._clock()
         first_sighting = self._limited_since is None
@@ -448,7 +449,7 @@ class Watchdog:
         )
         logger.info("R3: context alert sent at %d tokens", tokens)
 
-    # ── unattended long-run tracking (agent-infra-backlog item 22) ──────
+    # ── unattended long-run tracking ──────
 
     def _track_long_run(self) -> None:
         """Track an unattended long-running turn — see long_run.py's module
@@ -462,7 +463,7 @@ class Watchdog:
         Three thresholds hang off the same tracked run, in this order (see
         ``DEFAULT_LONG_RUN_MAX``): ``alert`` → one heads-up message;
         ``nudge`` (off by default) → one in-pane reminder to self-close;
-        ``max`` → ``_enforce_long_run_cap`` closes the turn. Item 29's cap
+        ``max`` → ``_enforce_long_run_cap`` closes the turn. 's cap
         is the only one of the three that CHANGES the session's state
         rather than just reporting on it.
 
@@ -549,7 +550,7 @@ class Watchdog:
         self._enforce_long_run_cap(new_state.since, now)
 
     def _enforce_long_run_cap(self, since: float, now: float) -> None:
-        """Hard cap on an unattended run (agent-infra-backlog item 29).
+        """Hard cap on an unattended run.
 
         Last stage of the threshold ladder documented on
         ``DEFAULT_LONG_RUN_MAX``: alert (heads-up) < nudge (ask the session
@@ -632,7 +633,7 @@ class Watchdog:
 
     def _deliver_notices(self) -> None:
         """Forward the session's owner notices (e.g. "conversation context
-        reset: the pane was parked", agent-infra-backlog item 28). Parking
+        reset: the pane was parked",). Parking
         can happen at bot start-up or in force_recover(), with no chat reply
         to carry the notice — this tick is what makes it reach the owner.
         Best-effort; a session without notices (Codex driver) is skipped.

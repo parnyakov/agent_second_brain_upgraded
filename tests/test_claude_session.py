@@ -70,7 +70,7 @@ class FakeTmux:
     demonstrably said — so the transcript Claude Code writes has it too. That
     invariant is what lets the existing pane-shaped fixtures keep describing
     real turns now that ask() reads the reply from the transcript instead of
-    the screen (backlog item 32). Tests for the case the two DISAGREE — a
+    the screen. Tests for the case the two DISAGREE — a
     reply too long for the capture window, the exact bug this change fixes —
     write the transcript themselves and leave the pane without it.
     """
@@ -200,7 +200,7 @@ def _isolated_home(tmp_path, monkeypatch):
 def _mirror_pane_into_transcript(monkeypatch):
     """Wire every ClaudeSession built in this module to its FakeTmux.
 
-    ask() reads the reply from the session transcript (backlog item 32), so a
+    ask reads the reply from the session transcript, so a
     pane-only fixture would describe a turn that never answered. Rather than
     restate every scripted pane as a JSONL fixture, the fake keeps the two in
     sync (see FakeTmux._mirror) — and a session id is pinned so there IS a
@@ -774,7 +774,7 @@ def test_ask_long_silent_work_not_interrupted(tmp_path, clock):
     assert not any(c[-1] == "C-c" for c in fake.sent_keys())
 
 
-# ── bounded trust in the static hint (backlog item 13) ──────────────────
+# ── bounded trust in the static hint ──────────────────
 #
 # "esc to interrupt" is a footer segment this CLI version shows whenever
 # ANYTHING is interruptible (99.6% of its occurrences on a real pane.log),
@@ -793,7 +793,7 @@ def _grow_pane_log(tmp_path: Path, text: str) -> None:
 
 
 def test_is_working_false_once_static_trust_window_expires(tmp_path, clock):
-    """Regression (item 13): a pane holding the static hint byte-identical,
+    """Regression: a pane holding the static hint byte-identical,
     with no pane.log growth, is a FROZEN pane once the window is spent —
     the watchdog's hang detector must be able to see it."""
     fake = FakeTmux([THINKING], exists=True)
@@ -845,7 +845,7 @@ def test_is_working_ticking_progress_keeps_resetting_the_window(tmp_path, clock)
 
 
 def test_ask_frozen_static_pane_eventually_stalls(tmp_path, clock):
-    """Regression (item 13), the practical win: a pane frozen mid-turn with
+    """Regression, the practical win: a pane frozen mid-turn with
     the static footer present used to hold ask()'s stall detector disarmed
     for the WHOLE turn budget. It now interrupts about
     (STATIC_TRUST_WINDOW + stall_timeout) in — late, deliberately, but not
@@ -867,7 +867,7 @@ def test_ask_frozen_static_pane_stalls_at_production_constants(tmp_path, clock):
     processor.py passes timeout=DEFAULT_TIMEOUT, both on the service's
     DEFAULT_STALL_TIMEOUT.
 
-    This is the test the first cut of item 13 was missing. That one ran at
+    This is the test the first cut of was missing. That one ran at
     timeout=STATIC_TRUST_WINDOW*2, a configuration no caller ever uses, and
     so it stayed green while the shipped constants (2700 + 900 == 3600 ==
     DEFAULT_TIMEOUT exactly) made the interrupt UNREACHABLE in production:
@@ -1748,7 +1748,7 @@ def test_busy_wait_has_own_budget_despite_leftover_turn_progressing(tmp_path, cl
     (smaller) budget regardless of how much progress the OTHER turn keeps
     showing.
 
-    Status updated to 'busy_active' (agent-infra-backlog item 22, 2026-09):
+    Status updated to 'busy_active' (agent-infra, 2026-09):
     this fixture's frames DO show genuine, changing progress every poll —
     exactly the case the new progress-aware classification distinguishes
     from a frozen pane. The budget-discipline assertion below (own budget,
@@ -1759,7 +1759,7 @@ def test_busy_wait_has_own_budget_despite_leftover_turn_progressing(tmp_path, cl
 
     # Paren-anchored main-turn spinner (is_main_turn_active), not a bare
     # background-agent-row shape (which is_main_turn_active deliberately
-    # excludes — see backlog item 10, 2026-08-21): this test is about the
+    # excludes — see -08-21): this test is about the
     # busy-wait's OWN budget for a leftover turn that is genuinely still the
     # MAIN turn, not about background-agent rows.
     frames = [f"Warping… ({i}s · ↓{i}k tokens)\n" for i in range(1, 200)]
@@ -1785,7 +1785,7 @@ def test_busy_wait_has_own_budget_despite_leftover_turn_progressing(tmp_path, cl
     assert clock["now"] <= 60
 
 
-# ── busy vs. busy_active classification (agent-infra-backlog item 22) ────
+# ── busy vs. busy_active classification ────
 
 
 def test_busy_with_progressing_pane_returns_busy_active(tmp_path, clock):
@@ -2075,7 +2075,7 @@ def test_correctly_sized_session_is_left_alone(tmp_path, clock):
     assert "resize-window" not in fake.sent_subcommands()
 
 
-# ── backlog item 10 (2026-08-21): reply lost when the closing ────────────
+# ── (2026-08-21): reply lost when the closing ────────────
 # <<<E:id>>> marker never appears — salvage / no-main-turn ceiling.
 #
 # The "incident pane": a line-anchored <<<R:rid>>> marker, a multi-line
@@ -2089,7 +2089,7 @@ def test_correctly_sized_session_is_left_alone(tmp_path, clock):
 # fixture makes unpatched ask() return status="timeout" after the FULL
 # DEFAULT_TIMEOUT (3600s) — reproducing the incident precisely.
 
-# Production forms captured live 2026-08-22 (backlog item 12 plan §2.4):
+# Production forms captured live 2026-08-22 (plan §2.4):
 # the box rule is 200 columns wide (pane width), the idle input line is
 # "❯ ", and the footer — with "esc to interrupt" INSIDE it, the mandatory
 # form for catching defect C2 (a footer-only hint must no longer pin
@@ -2248,7 +2248,7 @@ def test_salvage_refuses_early_but_ceiling_salvages_when_region_has_a_working_si
     generating reply must never be marked delivered THAT early, since the
     real full answer would then be permanently blocked by handled_rids.
 
-    Backlog item 32 moved the reply itself to the transcript, so the check
+    moved the reply itself to the transcript, so the check
     that refuses here is no longer `_WORKING_RE` against a scraped pane
     region but `main_area_working()` against the frame (same scope, same
     purpose — see that function's docstring).
@@ -2377,7 +2377,7 @@ def test_ask_does_not_salvage_a_streaming_reply_still_in_progress(tmp_path, cloc
 def test_ask_does_not_salvage_while_esc_to_interrupt_present_outside_footer(
     tmp_path, clock
 ):
-    """Legacy hint semantics survive C2 (backlog item 12): a standalone,
+    """Legacy hint semantics survive C2: a standalone,
     non-footer "(esc to interrupt)" line is still the whole-turn hint it
     always was — is_main_turn_active() stays True and salvage stays
     refused. Only a footer-FUSED occurrence of the same string is affected
@@ -2389,7 +2389,7 @@ def test_ask_does_not_salvage_while_esc_to_interrupt_present_outside_footer(
 
 
 def test_ask_salvages_when_only_footer_esc_to_interrupt_present(tmp_path, clock):
-    """C2 fix (backlog item 12, defect P3): this CLI version renders "esc to
+    """C2 fix (defect P3): this CLI version renders "esc to
     interrupt" INSIDE its persistent footer whenever ANYTHING is
     interruptible — background tasks, monitors — with the main turn long
     finished (99.6% of 6512 real occurrences measured 2026-08-22). Pre-fix,
@@ -2439,7 +2439,7 @@ _FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 def test_ask_salvages_the_golden_incident_fixture(tmp_path, clock):
-    """End-to-end proof against the golden fixture (backlog item 12, T3): a
+    """End-to-end proof against the golden fixture (T3): a
     hand-constructed but byte-faithful ~239-line incident pane (long reply,
     no closing marker, turn-summary line, then the real 11-line bottom
     chrome including the footer-fused "esc to interrupt" hint). ask() must
@@ -2733,7 +2733,7 @@ def test_defect_b_pre_send_background_rows_never_set_maintenance_placeholder(
     assert all(not line.startswith(MAINT_PREFIX) for line in seen_inflight_first_lines)
 
 
-# ── last_reply_for_resend (backlog item 14: /resend) ─────────────────────
+# ── last_reply_for_resend (/resend) ─────────────────────
 
 
 def _jsonl_assistant_record(text: str) -> dict:
@@ -2776,11 +2776,10 @@ def test_last_reply_for_resend_recovers_unclosed_marker_when_not_active(
     tmp_path, clock
 ):
     """F1 fix: this is the literal shape of every real delivery-loss
-    incident on record (bfbe3335, df4f87ef, 9dd35326) — an open
-    <<<R:id>>> span with no closing marker. No turn is active here (the
-    fake pane is idle), so the recovered body must be delivered as
-    'ready' with a salvage notice, not falsely reported as still in
-    progress."""
+    incident on record — an open <<<R:id>>> span with no closing marker.
+    No turn is active here (the fake pane is idle), so the recovered body
+    must be delivered as 'ready' with a salvage notice, not falsely
+    reported as still in progress."""
     fake = FakeTmux([READY], exists=False)
     s = make_session(tmp_path, fake, clock)
     s.ensure_session()
@@ -2983,7 +2982,7 @@ def test_start_command_pins_claude_config_dir(tmp_path, monkeypatch):
     assert "CLAUDE_CONFIG_DIR" not in plain
 
 
-# ── exact tmux addressing (agent-infra-backlog item 28, 2026-09-19) ─────────
+# ── exact tmux addressing (agent-infra, 2026-09-19) ─────────
 #
 # tmux resolves a bare `-t dbrain_X` by PREFIX. With the main session gone
 # and `dbrain_X_cron` alive, has-session said "exists" and the chat brain
@@ -3100,7 +3099,7 @@ def test_prefix_sibling_is_not_the_main_session_real_tmux(
 # standby) and was used by hand; its TUI was left on the background task
 # `night-second-brain`. On the switch back the bot reused that pane, and all
 # seven prompts timed out with ever_saw_r_marker=False
-# (agent-infra-backlog item 28).
+#.
 #
 # Conservative order, each step verified live on Claude Code 2.1.278:
 # 1. a label that is one of the pinned conversation's own titles (/rename)
@@ -3864,7 +3863,7 @@ def test_requeued_notices_go_back_in_front_of_newer_ones(tmp_path, clock):
     assert s.pop_notices() == []
 
 
-# ── the reply comes from the transcript, not the screen (item 32) ─────────
+# ── the reply comes from the transcript, not the screen ─────────
 
 
 def _write_record(session, text: str, *, is_sidechain: bool = False) -> None:
@@ -3931,7 +3930,7 @@ def _transcript_session(tmp_path, fake, clock, rid, **kw):
 
 
 def test_reply_too_long_for_the_capture_window_is_still_delivered(tmp_path, clock):
-    """THE regression test for backlog item 32 (live case, 22.09).
+    """THE regression test for a real delivery-loss case.
 
     The answer is longer than the 200-line capture window, so by the time the
     turn ends the pane holds only its TAIL: the closing `<<<E:rid>>>` is on

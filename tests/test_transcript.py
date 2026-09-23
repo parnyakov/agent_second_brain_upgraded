@@ -90,7 +90,7 @@ def test_transcript_path_falls_back_to_the_computed_path_when_nothing_exists(
     assert p.name == "abc-123.jsonl" and not p.exists()
 
 
-# ── ReplyTail (THE reply source, backlog item 32) ─────────────────────────
+# ── ReplyTail (THE reply source) ───────────────────────────────────────────
 
 
 def _append(path: Path, *records: dict) -> None:
@@ -433,7 +433,7 @@ def test_latest_context_tokens_skips_synthetic_model_records(tmp_path):
     assert latest_context_tokens(path) == 420_000
 
 
-# ── latest_reply (backlog item 14: /resend) ───────────────────────────────
+# ── latest_reply (/resend) ───────────────────────────────
 
 
 def test_latest_reply_missing_file_is_unavailable(tmp_path):

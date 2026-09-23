@@ -1,4 +1,4 @@
-"""Tests for the /work command handler ("что сейчас в работе", item 29).
+"""Tests for the /work command handler ("что сейчас в работе").
 
 The report is assembled from four independent best-effort readings (engine
 busy flags, long-run marker, cron store, ask-health ledger). What these

@@ -228,7 +228,7 @@ async def send_response(
     then hand every chunk to the durable outbox and drain it right away.
 
     ``reply_to`` threads the answer under the message it answers — used by
-    the per-chat queue (item 33 step 5), where the question may be many
+    the per-chat queue, where the question may be many
     minutes old by the time this runs. Only the FIRST chunk carries it: a
     long answer should look like one reply, not like five quotes of the same
     line. Never load-bearing — see ``outbox.send_one``.

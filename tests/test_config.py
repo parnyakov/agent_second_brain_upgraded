@@ -47,7 +47,7 @@ def test_cron_fields_have_safe_defaults():
 
 
 def test_duty_fields_have_safe_defaults():
-    """backlog items 29-30: on by default, but every knob is a rollback."""
+    """on by default, but every knob is a rollback."""
     s = _settings()
     assert s.duty_session_enabled is True
     assert s.duty_turn_timeout == 600.0
@@ -192,8 +192,8 @@ def test_env_file_defaults_to_dotenv_and_honors_dbrain_env_file(tmp_path, monkey
     happens to live there. Settings must read DBRAIN_ENV_FILE at class
     definition time (systemd's own EnvironmentFile= already lands it in the
     process env before this module is imported) and fall back to today's
-    exact ".env" when it's unset, so the owner's existing --user unit (which
-    never sets it) is unaffected."""
+    exact ".env" when it's unset, so an existing --user unit (which never
+    sets it) is unaffected."""
     monkeypatch.delenv("DBRAIN_ENV_FILE", raising=False)
     import importlib
 
@@ -202,16 +202,16 @@ def test_env_file_defaults_to_dotenv_and_honors_dbrain_env_file(tmp_path, monkey
     importlib.reload(config_module)
     assert config_module.Settings.model_config["env_file"] == ".env"
 
-    instance_env = tmp_path / "second.env"
+    instance_env = tmp_path / "instance.env"
     instance_env.write_text(
-        "TELEGRAM_BOT_TOKEN=second-token\nDEEPGRAM_API_KEY=second-key\n"
+        "TELEGRAM_BOT_TOKEN=instance-token\nDEEPGRAM_API_KEY=instance-key\n"
     )
     monkeypatch.setenv("DBRAIN_ENV_FILE", str(instance_env))
     importlib.reload(config_module)
     try:
         assert config_module.Settings.model_config["env_file"] == str(instance_env)
         s = config_module.Settings()
-        assert s.telegram_bot_token == "second-token"
+        assert s.telegram_bot_token == "instance-token"
     finally:
         monkeypatch.delenv("DBRAIN_ENV_FILE", raising=False)
         importlib.reload(config_module)
@@ -245,7 +245,7 @@ def _base_settings(tmp_path, **over):
 
 
 def test_long_run_max_seconds_defaults_above_the_alert_threshold(tmp_path):
-    """Item 29: the three long-run thresholds form a ladder — alert (a
+    """the three long-run thresholds form a ladder — alert (a
     heads-up) then, optionally, nudge (ask the session to self-close) then
     max (the watchdog closes it). A default that inverted that order would
     close the turn before the owner was ever told anything."""

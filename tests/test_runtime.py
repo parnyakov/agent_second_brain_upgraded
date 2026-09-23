@@ -69,7 +69,7 @@ def test_get_cron_session_is_isolated_sibling(tmp_path):
 
 def test_engine_round_trip_keeps_names_and_dirs(tmp_path):
     """The owner flips DBRAIN_CHAT_ENGINE/DBRAIN_CRON_ENGINE and restarts the
-    bot (agent-infra-backlog item 28). Claude → Codex → Claude must land on
+    bot. Claude → Codex → Claude must land on
     the SAME persisted tmux names and runtime dirs, so the Claude side finds
     its own sessions again (exact-match addressing and the foreign-view check
     in ClaudeSession take it from there) and the Codex side its own thread."""
@@ -126,7 +126,7 @@ def test_engine_round_trip_keeps_names_and_dirs(tmp_path):
 
 
 def test_get_duty_session_is_an_isolated_third_sibling(tmp_path):
-    """backlog items 29-30: the duty brain is a THIRD session — same persona
+    """the duty brain is a THIRD session — same persona
     and vault, its own session name and its own runtime dir, sharing state
     with neither the main brain nor the cron one."""
     rt.reset()

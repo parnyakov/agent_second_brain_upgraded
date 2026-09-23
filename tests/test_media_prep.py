@@ -1,5 +1,5 @@
 """Tests for media_prep — heavy attachments must never be handed raw to the
-brain (agent-infra-backlog item 21).
+brain.
 
 All binary fixtures are GENERATED here at test-run time, never committed:
 tests/fixtures/ in this repo holds text fixtures only (see

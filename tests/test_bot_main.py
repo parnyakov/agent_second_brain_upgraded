@@ -1,4 +1,4 @@
-"""Tests for backlog item 4 (Part A): reply-keyboard removal.
+"""Tests for (Part A): reply-keyboard removal.
 
 Covers:
 - cmd_start no longer sends reply_markup

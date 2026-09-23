@@ -2,9 +2,10 @@
 # Out-of-band health check for the delivery channel.
 #
 # Runs from its own systemd timer, in its own process, using nothing from the
-# d_brain package. That independence is the entire point: on 2026-08-20 every
-# component that could have noticed the outage was downstream of the component
-# that was broken, so the first detection was a human, hours late.
+# d_brain package. That independence is the entire point: during a real
+# production outage, every component that could have noticed it was
+# downstream of the component that was broken, so the first detection was a
+# human, hours late.
 #
 # Only POSITIVE fault signals — never "it has been quiet for a while". Quiet is
 # normal at night, and an alerter that cries wolf at 3am gets muted, which is
@@ -46,8 +47,8 @@ faults=()
 
 # `is-active` is true only for active/reloading — a unit in `deactivating`
 # fails it. That used to be a window of a second or two; since 2026-09-22 a
-# graceful stop can hold `deactivating` for up to ~5.5 minutes (backlog item
-# 33 step 3: the bot lets the turn in flight finish before it exits), which
+# graceful stop can hold `deactivating` for up to ~5.5 minutes (the bot lets
+# the turn in flight finish before it exits), which
 # is LONGER than this check's own 5-minute timer. Keeping the shortcut would
 # have alerted "бот не активен" on both channels during essentially every
 # restart that paid the grace — cry-wolf, which this script's header forbids,

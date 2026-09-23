@@ -27,7 +27,7 @@ class FakeManager:
         return self.reply
 
     def is_turn_active(self) -> bool:
-        # Idle by default — the media busy-guard (agent-infra-backlog item 21)
+        # Idle by default — the media busy-guard
         # consults this before anything can reach ask().
         return False
 
@@ -195,7 +195,7 @@ def test_text_when_idle_goes_to_normal_turn(monkeypatch):
 
 
 # ── Step D: /stop reaching a pane-active-but-lock-free turn (F3, blind-review
-# round, 2026-09, agent-infra-backlog item 22) ──────────────────────────────
+# round) ─────────────────────────────────────────────────────────────────
 
 
 class PaneActiveManager(FakeManager):
@@ -294,8 +294,8 @@ def test_extract_media_video_note_is_mp4():
 def test_forward_note_variants():
     from d_brain.bot.handlers.chat import forward_note
 
-    user = _Stub(sender_user=_Stub(full_name="Ivan Petrov"))
-    assert "Ivan Petrov" in forward_note(user)
+    user = _Stub(sender_user=_Stub(full_name="Test User"))
+    assert "Test User" in forward_note(user)
     channel = _Stub(sender_user=None, chat=_Stub(title="AI News"))
     assert "AI News" in forward_note(channel)
     hidden = _Stub(sender_user=None, chat=None, sender_user_name="Hidden Guy")
@@ -311,12 +311,12 @@ def test_build_media_prompt_contract():
         rel_path="attachments/2026-06-10/img-120000.pdf",
         original_name="report.pdf",
         caption="квартальный отчёт",
-        fwd="[переслано от: Ivan]\n",
+        fwd="[переслано от: Тест]\n",
     )
     assert "attachments/2026-06-10/img-120000.pdf" in p
     assert "report.pdf" in p
     assert "квартальный отчёт" in p
-    assert "Ivan" in p
+    assert "Тест" in p
     # the brain must be told to actually open the file
     assert "Read" in p or "прочитай" in p.lower() or "посмотри" in p.lower()
 
@@ -418,14 +418,14 @@ def test_text_during_maintenance_turn_gets_busy_reply(monkeypatch):
 
 
 # ── heavy attachments: pre-ask() busy guard + prompt contracts
-#    (agent-infra-backlog item 21) ───────────────────────────────────────────
+# ───────────────────────────────────────────
 
 
 class BusyManager(FakeManager):
     """A turn is already running. Nothing here may reach ask(): a 'busy'
     result from ask() is counted as a FAILURE by ask_health, and three of
     those in a row fire the delivery_guard 'channel broken' alert — the exact
-    escalation that item 21 documents for 2026-08-31."""
+    escalation that documents for 2026-08-31."""
 
     def is_turn_active(self) -> bool:
         return True
@@ -621,7 +621,7 @@ def test_album_prompt_uses_derivatives_and_per_file_instructions():
 
 def test_media_prompt_without_prep_keeps_todays_wording():
     """The fallback path (media_prep failed) must be byte-identical to the
-    behavior that shipped before item 21."""
+    behavior that shipped before."""
     from d_brain.bot.handlers.chat import build_media_prompt
     from d_brain.services.media_prep import DEFAULT_INSTRUCTION
 
@@ -756,7 +756,7 @@ class LockingManager(FakeManager):
 
 
 def test_two_documents_in_the_same_second_only_dispatch_one(monkeypatch, tmp_path):
-    """The literal 31.08 incident: two heavy documents arrive in the same
+    """A real incident's exact shape: two heavy documents arrive in the same
     second. main.py runs aiogram with handle_as_tasks=True, so each update is
     its own concurrent asyncio task — and is_turn_active() only reflects the
     pane lock taken far downstream, inside ask(). Without an in-process claim
@@ -791,7 +791,7 @@ def test_two_documents_in_the_same_second_only_dispatch_one(monkeypatch, tmp_pat
     assert chat._media_claim_at is None
 
 
-# ── duty session routing (agent-infra-backlog items 29-30) ────────────────
+# ── duty session routing ────────────────
 
 
 class DutyManager(FakeManager):
@@ -825,7 +825,7 @@ class DutyManager(FakeManager):
 
 
 def test_busy_main_session_answers_from_duty_without_entering_ask(monkeypatch):
-    """The owner's complaint (item 29): during an unattended cascade the
+    """The owner's complaint: during an unattended cascade the
     ask-lock is free, so the message used to go into ask() and burn the
     whole busy-wait budget only to return a brush-off. The pane check now
     routes it to the duty session instead — ask() is never entered."""

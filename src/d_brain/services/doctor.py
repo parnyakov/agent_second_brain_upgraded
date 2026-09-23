@@ -215,8 +215,8 @@ def check_marker_compliance(
     re-parsing a 100MB+ transcript on every daily doctor run.
 
     Always reports ok=True: this is a TREND metric to watch, not a pass/fail
-    gate the audit asked for — a rising drop rate is the owner's call (see R3),
-    not a reason to red-alert the whole daily doctor over it.
+    gate the audit asked for — a rising drop rate is the owner's call (see
+    R3), not a reason to red-alert the whole daily doctor over it.
     """
     state_file = runtime_dir / "last_marker_compliance_check"
     now = clock_fn()

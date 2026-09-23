@@ -803,8 +803,8 @@ def test_ask_never_raises_on_a_garbage_stream(tmp_path):
 
 
 def test_smoke_script_exists_and_is_not_wired_into_the_bot():
-    """The live check the owner asked for is a standalone script, deliberately
-    not reachable from the bot's engine selection."""
+    """The live check is a standalone script, deliberately not reachable
+    from the bot's engine selection."""
     script = Path(__file__).resolve().parents[1] / "scripts" / "codex-smoke.py"
     assert script.exists()
     body = script.read_text()
@@ -813,7 +813,7 @@ def test_smoke_script_exists_and_is_not_wired_into_the_bot():
 
 
 def test_watchdog_long_run_cap_never_fires_on_this_engine(tmp_path):
-    """Item 29's auto-close is Claude-engine-only today — and, crucially,
+    """'s auto-close is Claude-engine-only today — and, crucially,
     it can never FALSELY close a live Codex turn.
 
     The cap hangs off long-run tracking, which classifies ``capture_text()``

@@ -49,7 +49,7 @@ def create_dispatcher() -> Dispatcher:
     # Read-only status of what's running — must be reachable while the
     # session is busy, so it goes BEFORE chat.router's catch-all.
     dp.include_router(work.router)
-    # Reply-keyboard buttons DISABLED 2026-08-22 (backlog item 4): the owner kept
+    # Reply-keyboard buttons DISABLED 2026-08-22: the owner kept
     # hitting "⚙️ Обработать" by accident. To restore: uncomment the import
     # above and this include_router call, and re-add
     # reply_markup=get_main_keyboard() to cmd_start() in handlers/commands.py.

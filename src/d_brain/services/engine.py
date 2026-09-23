@@ -1,6 +1,6 @@
 """Engine seam: the structural contract every brain backend must satisfy.
 
-Phase 1 of the engine implementation plan.
+Phase 1 of the Codex-engine plan.
 The ONLY thing this module adds today is a *name* for the surface the bot
 already calls on ``ClaudeSession``: a ``typing.Protocol``. Nothing here is
 imported by the live reply path, nothing here changes behavior. It exists so
@@ -10,7 +10,7 @@ without anyone having to touch ``claude_session.py``.
 Why a Protocol and not an ABC
 -----------------------------
 ``ClaudeSession`` must not be edited at all — it is delivery-critical code
-hardened by real incidents (agent-infra-backlog items 10, 11, 13, 21-24), and
+hardened by real incidents (agent-infra, 21-24), and
 adding a base class to it would be an edit. Structural typing needs no
 inheritance and no wrapper: ``ClaudeSession`` conforms *as it is written
 today*, which ``tests/test_engine.py`` verifies signature-by-signature rather

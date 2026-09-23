@@ -11,8 +11,8 @@ a metric.
     uv run python scripts/marker_compliance.py
     uv run python scripts/marker_compliance.py --transcript /path/to/other.jsonl
 
-Background: agent-infra-backlog.md item 11 found (2026-08-21, manual read of
-the raw transcript) that the model drops the closing marker more often as
+Background: a manual read of the raw transcript found that the model drops
+the closing marker more often as
 context grows — 1.5% under 400k tokens, 6.9% at 400-600k, 12.8% at 300k+ in a
 provisional sample. This script reproduces that measurement mechanically so
 it doesn't require re-reading the transcript by hand each time.
@@ -31,7 +31,7 @@ from pathlib import Path
 # bullet/indentation from UI rendering is fine) — matching only that, not
 # any occurrence of the substring, is what keeps this from false-matching
 # later prose that quotes a marker while describing an incident (e.g. a
-# daily.md entry saying "closing marker `<<<E:9dd35326>>>` never appeared").
+# daily.md entry saying "closing marker `<<<E:abc12345>>>` never appeared").
 OPEN_RE = re.compile(r"^[\s⏺>*-]*<<<R:([A-Za-z0-9_-]+)>>>[\s]*$", re.MULTILINE)
 CLOSE_RE = re.compile(r"^[\s⏺>*-]*<<<E:([A-Za-z0-9_-]+)>>>[\s]*$", re.MULTILINE)
 # The instruction line the harness appends to prompts that expect a
@@ -52,8 +52,8 @@ def default_transcript_path() -> Path:
     .jsonl" guessing can pick a DIFFERENT concurrent session's file — the
     cron brain (get_cron_session) shares this exact same project directory
     (same work_dir/vault_path), and any other Claude Code session someone
-    happens to run against this vault would too (found live 2026-08-22,
-    documented in the incident registry). Prefer the pinned id; fall back to
+    happens to run against this vault would too (found live once, and
+    documented at the time). Prefer the pinned id; fall back to
     the old mtime guess ONLY for an install that predates R1, with a loud
     warning so the caller knows the result may be wrong.
     """

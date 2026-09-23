@@ -30,8 +30,9 @@ VAULT_DIR="${VAULT_PATH:-$PROJECT_DIR/vault}"
 # resolves correctly only by coincidence — the installed unit's
 # WorkingDirectory happens to be the repo root. After phases 5/6 both
 # instances' units set WorkingDirectory to the SHARED checkout, so a relative
-# VAULT_PATH in /etc/dbrain/<instance>/.env would resolve to ANOTHER instance's vault: the
-# worst-case isolation failure, from a one-character config mistake.
+# VAULT_PATH in a second instance's env file would resolve to the OTHER
+# instance's vault: the worst-case isolation failure, from a one-character
+# config mistake.
 # Anchor it to $PROJECT_DIR explicitly instead of trusting the cwd.
 case "$VAULT_DIR" in
     /*) : ;;  # already absolute — untouched
@@ -110,13 +111,12 @@ sync_git() {
             # started BEFORE this instance's user was added to dbrain
             # -- supplementary groups are fixed at process start, not re-read
             # live -- so a bare `flock` here would itself fail to even open
-            # the lock FILE under the stale group list (found live
-            # 2026-08-23: wrapping only the inner git commands still hit
+            # the lock FILE under the stale group list (found live:
+            # wrapping only the inner git commands still hit
             # `flock: Permission denied` on the lock file itself, before ever
             # reaching git). `sg` re-checks /etc/group at invocation time, so
-            # it must be the outermost command. See
-            # the multi-instance rollout plan, phase 3
-            # status for the original EACCES-on-.git finding this fixes.
+            # it must be the outermost command. This fixes the original
+            # EACCES-on-.git finding from the multi-instance rollout.
             if command -v flock >/dev/null 2>&1 && [ -d "$(dirname "$SHARED_LOCK")" ]; then
                 echo "=== Git: shared projects repo (flock) ==="
                 # -w 300: never block forever. If the other instance's

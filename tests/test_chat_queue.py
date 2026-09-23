@@ -1,4 +1,4 @@
-"""Per-chat queue — item 33, step 5.
+"""Per-chat queue.
 
 The five things the owner asked for, one test each and then some: a second
 message during work is parked and acknowledged at once, the queue drains
@@ -382,9 +382,9 @@ def test_the_limit_is_per_chat_not_global(tmp_path):
 
 
 def test_plain_busyness_parks_instead_of_spending_a_duty_turn(monkeypatch, queue):
-    """The owner's rule: «отвечать мне должна основная сессия в 99% случаев».
-    A live, progressing turn is busyness, not a failure — the message waits
-    for the session that has the context."""
+    """The product rule: the main session should answer almost every time —
+    a live, progressing turn is busyness, not a failure — so the message
+    waits for the session that has the context."""
     from d_brain.bot.handlers import chat
 
     mgr = BusyManager()
@@ -604,9 +604,8 @@ def test_a_requested_stop_keeps_the_worker_from_starting_new_jobs(queue):
 
 
 def test_a_leaked_lane_expires_instead_of_deafening_the_chat(tmp_path):
-    """Never let one bug become a standing outage (items 22/23). The lane is
-    released in a finally on every path; if one ever leaks, the chat heals
-    by itself."""
+    """Never let one bug become a standing outage. The lane is released in
+    a finally on every path; if one ever leaks, the chat heals by itself."""
     clock = {"t": 0.0}
     box = chat_queue.ChatQueue(tmp_path, monotonic_fn=lambda: clock["t"])
     assert box.try_acquire(10) is True
@@ -626,7 +625,7 @@ def test_an_unparsable_job_is_quarantined_not_retried_forever(tmp_path):
 
 
 def test_a_file_arriving_during_a_turn_is_queued_not_brushed_off(monkeypatch, queue):
-    """The media path had its own busy guard (item 21) that answered "файл
+    """The media path had its own busy guard that answered "файл
     сохранил, сессия занята" and stopped there. With the queue it steps
     aside: the file is prepared, parked and acknowledged like any other
     message, and the MAIN session answers it."""
@@ -656,7 +655,7 @@ def test_a_file_arriving_during_a_turn_is_queued_not_brushed_off(monkeypatch, qu
 
 
 def test_without_a_queue_the_media_busy_guard_is_untouched(monkeypatch):
-    """Rollback: no queue ⇒ byte-for-byte item 21's guard."""
+    """Rollback: no queue ⇒ byte-for-byte 's guard."""
     from d_brain.bot.handlers import chat
 
     chat._release_media_dispatch()

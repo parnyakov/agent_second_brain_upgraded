@@ -39,8 +39,8 @@ _STATUS_MESSAGES = {
     "error": "❌ Ошибка сессии. Попробуй позже.",
     # Busy-panel UX finding (2026-08-22): a legitimately busy panel (a
     # previous turn still running after the full busy-wait budget) reads as
-    # honest, not scary — showing "❌ Ошибка сессии" here misled the owner into
-    # thinking something had crashed at 04:27 UTC when nothing was actually
+    # honest, not scary — showing "❌ Ошибка сессии" here misled the owner
+    # into thinking something had crashed when nothing was actually
     # wrong. B3 fix (2026-08-22): the ORIGINAL wording here promised "отвечу,
     # как только освобожусь" (I'll answer once I'm free) — but no queue
     # mechanism exists to make that true; this message is a one-shot reply
@@ -48,14 +48,14 @@ _STATUS_MESSAGES = {
     # Reworded to state the fact (still busy) without promising a callback.
     "busy": "🔧 Предыдущая задача ещё выполняется, ничего не сломалось. "
     "Напиши ещё раз через минуту-другую.",
-    # agent-infra-backlog item 22 (2026-09): the pane is busy with a leftover
+    # (2026-09): the pane is busy with a leftover
     # turn that demonstrably kept making progress across the whole wait — a
     # live, working turn (typically an unattended agent cascade), not a
     # wedged one. Deliberately does NOT promise a callback/auto-reply (same
     # constraint the "busy" wording above was reworded for): nothing
     # re-sends the answer later, this is a one-shot reply to the message
     # that triggered it.
-    # Step D (agent-infra-backlog item 22): /stop now actually reaches the
+    # Step D: /stop now actually reaches the
     # interrupt path for a pane-active-but-lock-free turn too (see
     # ClaudeSession.is_pane_turn_active / chat.py's stop-word handling), so
     # this message can honestly point the user at it.
@@ -73,7 +73,7 @@ _NO_MARKERS_MESSAGE = (
 )
 
 
-# agent-infra-backlog item 30: the chat path now caps a main-session turn at
+# agent-infra: the chat path now caps a main-session turn at
 # settings.chat_turn_timeout instead of inheriting DEFAULT_TIMEOUT. On that
 # ceiling ask() returns status "timeout" with detail "no reply in Ns" and —
 # unlike every other exit — does NOT mark the rid handled and leaves the
@@ -152,7 +152,7 @@ class Busy:
 
     Returned by ``send_message`` INSTEAD of a reply string when the engine
     reported ``busy_active``: the pane is busy with a turn that demonstrably
-    kept making progress, i.e. healthy work, not a wedge. Until item 33's
+    kept making progress, i.e. healthy work, not a wedge. Until 's
     step 5 that outcome went straight to the duty session; now the caller
     parks the message in the per-chat queue and the MAIN session — the one
     with the conversation's context — answers it when it is free. The duty
@@ -190,7 +190,7 @@ def wrap_duty_prompt(text: str) -> str:
     this session is that the main one is busy. ``VaultStorage.append_to_daily``
     appends rather than rewrites, so a concurrent duty write cannot clobber
     the file wholesale; the general question of parallel vault writes is
-    backlog item 9 and is deliberately NOT solved here. The exclusion list
+    and is deliberately NOT solved here. The exclusion list
     below (``projects/*/status.md``, ``MEMORY.md``, ``.session/handoff.md``)
     covers the files that ARE rewritten whole.
     """
@@ -334,7 +334,7 @@ class ChatSessionManager:
         Serialized via the process-wide ask-lock; runs the blocking ask() in a
         worker thread so the event loop stays responsive.
 
-        THE BUSY SPLIT (item 33, step 5) is the heart of this method, and it
+        THE BUSY SPLIT is the heart of this method, and it
         is not a new judgement — it reads one ``ask()`` already makes:
 
         * ``busy_active`` — the pane is busy and made a REAL, RECENT change
@@ -346,7 +346,7 @@ class ChatSessionManager:
         * ``busy`` — no real progress at all across the whole busy-wait
           budget (up to 300s). That is failure class B3, the wedge signature,
           and it is exactly the emergency the duty session exists for. It
-          keeps answering those, as it has since item 29.
+          keeps answering those, as it has since.
 
         The main outcome is scored in the health ledger on BOTH branches
         before anything else happens — that ledger tracks the MAIN delivery
@@ -388,7 +388,7 @@ class ChatSessionManager:
             )
         else:
             text = self._reply_text(user_id, res)
-        # agent-infra-backlog item 28: if this very turn had to park a pane
+        # agent-infra: if this very turn had to park a pane
         # stuck on a background task, the owner must learn that the
         # conversation context is gone — right on the reply it affected.
         # Only on a non-empty reply: an empty one is chat.py's retry signal,
@@ -413,14 +413,14 @@ class ChatSessionManager:
             return []
 
     def _main_turn_timeout(self) -> float:
-        """Ceiling for a chat-initiated main turn (backlog item 30). 0 or no
+        """Ceiling for a chat-initiated main turn. 0 or no
         Settings ⇒ DEFAULT_TIMEOUT — exactly what this call passed before
         the setting existed."""
         settings = self._config()
         limit = getattr(settings, "chat_turn_timeout", 0.0) or 0.0
         return float(limit) if limit > 0 else float(DEFAULT_TIMEOUT)
 
-    # ── duty session (backlog items 29-30) ───────────────────────────
+    # ── duty session ───────────────────────────
 
     def _pane_active(self) -> bool:
         """Blocking pane probe, exception-proof. A driver without the probe
@@ -440,7 +440,7 @@ class ChatSessionManager:
         the pre-ask gate the chat handler uses so a user does not pay ask()'s
         busy-wait just to be told the session is busy.
 
-        WHAT IT MEANS CHANGED WITH ITEM 33's STEP 5, the evidence did not.
+        WHAT IT MEANS CHANGED WITH 's STEP 5, the evidence did not.
         This used to be the "answer from the duty session" gate; now it is
         the "park it in the per-chat queue" gate. Both readings rest on the
         same two pieces of evidence below, but the new one is the weaker
@@ -640,7 +640,7 @@ class ChatSessionManager:
         return body
 
     def _is_turn_limit(self, res: Any) -> bool:
-        """True iff this result is the chat-turn CEILING (backlog item 30)
+        """True iff this result is the chat-turn CEILING
         rather than any other timeout — see ``_TURN_LIMIT_DETAIL_MARKER``.
         Both engines emit the same ``timeout`` / ``"no reply in Ns"`` pair
         for their hard deadline, which is why the engine question below is
@@ -693,7 +693,7 @@ class ChatSessionManager:
         if res.ok:
             reply = res.reply or ""
             if res.salvaged:
-                # backlog item 10 (2026-08-21): delivered from an
+                # (2026-08-21): delivered from an
                 # unterminated <<<R:id>>> span because the closing marker
                 # never appeared. Health/streak accounting is unaffected —
                 # from ask_health's perspective this IS "ok": the user
@@ -721,7 +721,7 @@ class ChatSessionManager:
         return _STATUS_MESSAGES.get(res.status, _STATUS_MESSAGES["error"])
 
     def progress_transcript(self) -> Path | None:
-        """Файл стенограммы, по которому карточка прогресса (backlog item 33,
+        """Файл стенограммы, по которому карточка прогресса (
         шаг 4) читает события хода, или ``None``, если карточку показывать не
         по чему.
 
@@ -767,7 +767,7 @@ class ChatSessionManager:
         return self._session.is_turn_active()
 
     def is_pane_turn_active(self) -> bool:
-        """Step D (agent-infra-backlog item 22): true iff the PANE shows the
+        """Step D: true iff the PANE shows the
         main turn running, regardless of whether the ask-lock is held — see
         ClaudeSession.is_pane_turn_active."""
         return self._session.is_pane_turn_active()
@@ -782,7 +782,7 @@ class ChatSessionManager:
         await asyncio.to_thread(self._session.interrupt)
 
     async def resend_last_reply(self, user_id: int) -> tuple[str, str | None]:
-        """Status + optional body for ``/resend`` (backlog item 14).
+        """Status + optional body for ``/resend``.
 
         Deliberately NOT under ``get_ask_lock()`` — same reasoning as
         ``steer``/``interrupt`` above: the whole point of ``/resend`` is

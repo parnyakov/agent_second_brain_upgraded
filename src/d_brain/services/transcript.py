@@ -8,7 +8,7 @@ is pure parsing + incremental file I/O, no tmux/subprocess — mirrors the
 tmux_parse/claude_session split so this stays independently unit-testable
 against small hand-built JSONL fixtures.
 
-**This is THE source of a reply** (backlog item 32, 2026-09-22). It was
+**This is THE source of a reply.** It was
 diagnostic-only ("shadow mode") until the failure that made the screen-scrape
 path untenable: ``capture-pane`` only ever shows the last
 ``_CAPTURE_SCROLLBACK`` lines, so a reply LONGER than that window scrolls its
@@ -16,10 +16,11 @@ own ``<<<R:id>>>`` opening marker out of the frame before the turn ends. The
 pane then holds a complete, ready answer that the parser cannot recognise
 (``region=None``), the caller waits out its whole ceiling and the owner gets
 "превышено время ожидания" — the longer and more useful the answer, the more
-likely it is lost (live case on a second instance, 22.09, 412 694 ms). The
-transcript has no window: every record ever appended stays in the file, so
-length stops being a delivery risk. The pane is still read, but only for
-PANE STATE (working / finished / rate-limited / logged out / foreign view) —
+likely it is lost (seen live once, a reply long enough to take several
+minutes). The transcript has no window: every record ever appended stays in
+the file, so length stops being a delivery risk. The pane is still read, but
+only for PANE STATE (working / finished / rate-limited / logged out / foreign
+view) —
 never for reply text. See :class:`ReplyTail`, the one entry point ``ask()``
 uses.
 
@@ -175,7 +176,7 @@ def latest_reply(
     scanning the tail IN REVERSE — WITHOUT requiring a known ``rid`` up
     front (unlike :class:`ReplyTail`, which follows a known one).
 
-    Backlog item 14: powers the ``/resend`` command, a manual, READ-ONLY
+    powers the ``/resend`` command, a manual, READ-ONLY
     escape hatch for the ~3.3% of turns measured where the tmux-pane-scrape
     delivery path never produces a closing marker at all — the user can ask
     the bot to re-fetch the last reply straight from the transcript instead.
@@ -206,8 +207,8 @@ def latest_reply(
     - ``("unclosed", text)`` — the most recent assistant text record has an
       open ``<<<R:id>>>`` marker with NO matching ``<<<E:id>>>`` — this is
       the literal shape of every real delivery-loss incident on record
-      (bfbe3335, df4f87ef, 9dd35326: full reply text, end of message, no
-      closing marker). ``text`` is the recovered/salvaged body found after
+      (full reply text, end of message, no closing marker). ``text`` is the
+      recovered/salvaged body found after
       the open marker. Deliberately kept a DISTINCT outcome from
       ``in_progress`` rather than folded into it: this function stays pure
       and lock-free (no liveness check here), so it cannot itself decide
@@ -415,7 +416,7 @@ class TranscriptTail:
 
 
 class ReplyTail:
-    """THE reply source for one in-flight turn (backlog item 32).
+    """THE reply source for one in-flight turn.
 
     Anchored at the transcript's end the moment the prompt is sent, so it can
     only ever see text the model produced FOR THIS TURN — an older reply
@@ -439,7 +440,7 @@ class ReplyTail:
         deliver this as a finished answer on sight (half a reply is worse
         than a late one). It is what the caller's existing salvage/ceiling
         rules judge, for the ~3% of turns where the model never emits the
-        closing marker at all (backlog item 11).
+        closing marker at all.
       * ``TranscriptReply(closed=True)`` — a complete reply. Deliverable.
 
     Never raises: a missing file, an unreadable one, a malformed line and an

@@ -13,7 +13,7 @@
 #
 #   Usage: backup-notify.sh "message"
 #
-# Configuration (this is the part only you can do) —
+# Configuration (owner: this is the part only you can do) —
 #   1. Talk to @BotFather, /newbot, e.g. "d-brain backup alerts".
 #   2. Open a chat with the new bot and press Start, ONCE. A bot cannot
 #      message a user who has never started it, so an unstarted backup bot is

@@ -1,9 +1,8 @@
 """Drive the brain as a sequence of `codex exec` processes (Codex engine).
 
-Phase 2 of the engine implementation plan,
-built on the empirical findings of the phase-0 spike
-(~115 real
-`codex exec` turns on this exact machine and CLI version, 0.153.4).
+Phase 2 of the Codex-engine plan, built on the empirical findings of the
+phase-0 spike (~115 real `codex exec` turns on this exact machine and CLI
+version, 0.153.4).
 
 This is the second implementation of ``engine.EngineDriver``. It is NOT a
 port of ``claude_session.py`` and shares no code with it beyond the outcome
@@ -57,10 +56,11 @@ Facts about the CLI this driver depends on (verified, not assumed)
   the spike's explicit warning to phase 2.
 * ``--sandbox workspace-write`` restricts WRITES only; reads are unrestricted
   (spike step 3's isolation finding). This driver therefore does not treat
-  the sandbox flag as a read boundary and never claims to. The owner removed the
-  privacy half of that finding on 2026-09-05 ("пусть читает настоящие данные")
-  but explicitly kept the write-protection half, which is why the default
-  sandbox here stays ``workspace-write`` rather than ``danger-full-access``.
+  the sandbox flag as a read boundary and never claims to. The owner decided
+  the model should read real data rather than a sandboxed copy, so the
+  privacy half of that finding was dropped — but the write-protection half
+  was explicitly kept, which is why the default sandbox here stays
+  ``workspace-write`` rather than ``danger-full-access``.
 * stdin must be ``DEVNULL``. With an inherited stdin the CLI prints "Reading
   additional input from stdin..." and waits, which would hang every turn.
 
@@ -83,7 +83,7 @@ of ``EngineDriver`` precisely because they are tmux concepts. Compatibility
 shims exist at the bottom of this class so a Codex session degrades to
 "watchdog finds nothing to do" instead of crash-looping on AttributeError,
 but a real watchdog for this engine is explicitly out of the compressed
-phase-2 scope (agent-infra-backlog item 26).
+phase-2 scope — the owner compressed the timeline for this round.
 """
 
 import fcntl
@@ -961,9 +961,9 @@ class CodexExecDriver:
         where the turn ends — and ``ask()`` never asks for markers. But the
         SHARED vault skills and any operator-written ``AGENTS.md`` may still
         instruct the model to emit them (they were written for the Claude
-        engine and are also read by the other engine's session, so they must not be
-        forked). Stripping is defensive, cheap, and keeps the delivered text
-        clean either way.
+        engine and are also read by other bot instances' sessions, so they
+        must not be forked). Stripping is defensive, cheap, and keeps the
+        delivered text clean either way.
         """
         lines = [ln for ln in reply.splitlines() if not _is_marker_line(ln)]
         return "\n".join(lines).strip() or reply.strip()
@@ -1320,7 +1320,7 @@ class CodexExecDriver:
     # no-ops so that a codex-backed session degrades to "the watchdog finds
     # nothing to do" instead of crash-looping on AttributeError. A watchdog
     # that actually understands this engine is explicitly out of the
-    # compressed phase-2 scope (agent-infra-backlog item 26).
+    # compressed phase-2 scope.
 
     def current_state(self):
         """Always ``PaneState.READY`` — the tmux vocabulary the watchdog speaks.

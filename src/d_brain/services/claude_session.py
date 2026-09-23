@@ -122,7 +122,7 @@ DEFAULT_BUSY_WAIT_BUDGET = 300
 # How long the pane must show a finished, not-working main turn AND the
 # transcript must hold a byte-identical body for an unterminated <<<R:id>>>
 # span before ask() salvages the reply from that span instead of waiting for
-# a closing <<<E:id>>> that may never come (backlog item 10, 2026-08-21: the
+# a closing <<<E:id>>> that may never come (-08-21: the
 # model occasionally drops the literal closing marker for an otherwise-
 # complete answer). Stability is checked on the reply BODY only, never on the
 # whole pane capture — the whole pane changes every second from ticking
@@ -143,7 +143,7 @@ DEFAULT_SALVAGE_STABLE = 120.0
 DEFAULT_NO_MAIN_TURN_CEILING = 300.0
 # How long a byte-identical pane (no chrome change AND no pane.log growth)
 # may keep being trusted purely on the static "esc to interrupt" hint before
-# the liveness predicates stop believing it (backlog item 13).
+# the liveness predicates stop believing it.
 #
 # The value is pinned by an INEQUALITY, not by taste — it must sit strictly
 # between two hard numbers:
@@ -245,8 +245,8 @@ AGENTS_LIST_VIEW = "← agents list"
 # Rounds of C-k + C-u _clear_input_draft may spend on a multi-line draft
 # (each round clears about one line, verified live).
 _MAX_CLEAR_ROUNDS = 8
-# Extra Enters _send_prompt may press when the first one was lost (the
-# 2026-09-19 incident: five prompts glued together in the input box, never
+# Extra Enters _send_prompt may press when the first one was lost (seen
+# live once: five prompts glued together in the input box, never
 # sent). Two, not more: a box that still holds the prompt after three Enters
 # is not a lost keystroke.
 _ENTER_RETRIES = 2
@@ -278,7 +278,7 @@ class AskResult:
     # "ok" | "rate_limited" | "logged_out" | "timeout" | "error" | "busy" |
     # "busy_active"
     #
-    # "busy_active" (agent-infra-backlog item 22, 2026-09): the pane is busy
+    # "busy_active" (agent-infra, 2026-09): the pane is busy
     # with a leftover turn that DEMONSTRABLY MADE PROGRESS across the whole
     # wait — a live, working turn (e.g. mid an unattended agent cascade), not
     # a wedged one. Distinct from plain "busy" (no progress observed —
@@ -291,7 +291,7 @@ class AskResult:
     detail: str | None = None
     # True iff this reply was recovered from an unterminated <<<R:id>>> span
     # (no closing marker ever appeared) rather than a complete R/E pair.
-    # Purely additive/default-valued — see backlog item 10 (2026-08-21).
+    # Purely additive/default-valued — see (2026-08-21).
     salvaged: bool = False
     # Elapsed busy-wait time (seconds), set only when status is "busy" or
     # "busy_active" — purely additive/default-valued. Lets callers (e.g.
@@ -373,7 +373,7 @@ class ClaudeSession:
         self._busy_wait_budget = busy_wait_budget
         self._salvage_stable = salvage_stable
         self._no_main_turn_ceiling = no_main_turn_ceiling
-        # B3 (agent-infra-backlog item 22): how stale a long_run.json marker
+        # B3: how stale a long_run.json marker
         # may be before the pre-send busy-wait stops trusting it — see
         # DEFAULT_LONG_RUN_STALE_AFTER and long_run.is_active().
         self._long_run_stale_after = long_run_stale_after
@@ -400,7 +400,7 @@ class ClaudeSession:
         # show change tick-to-tick, the same guard ask()'s stall loop
         # applies to its own polling (see is_working_progressing).
         self._last_is_working_cap: str | None = None
-        # Backlog item 13: when the pane first went byte-identical (chrome
+        # when the pane first went byte-identical (chrome
         # unchanged AND pane.log not growing) as seen by is_working(). None
         # ⇒ the pane changed on the last observation, i.e. nothing frozen to
         # time. Only ever read/written by is_working() — see STATIC_TRUST_WINDOW.
@@ -418,7 +418,7 @@ class ClaudeSession:
         # `-t dbrain_X` by PREFIX, so while `dbrain_X` is absent it silently
         # finds `dbrain_X_cron` — has-session says "exists", and every prompt,
         # capture and cron `/clear` lands in the cron brain's pane (incident
-        # 2026-09-19, agent-infra-backlog item 28). The trailing `:` is what
+        # 2026-09-19,). The trailing `:` is what
         # makes the same string valid for pane/window commands too: verified
         # live on tmux 3.2a that `=name` alone is rejected by capture-pane/
         # send-keys/paste-buffer/pipe-pane/set-option ("can't find pane") and
@@ -467,8 +467,8 @@ class ClaudeSession:
         # R1 step 1 (Fable audit): the pinned Claude Code --session-id for
         # the CURRENTLY RUNNING `claude` process in this tmux session — makes
         # the JSONL transcript path deterministic (see _new_session_id,
-        # _ensure_locked). Also closes the marker_compliance.py mtime
-        # footgun noted in the incident registry: a caller can read this
+        # _ensure_locked). Also closes a marker_compliance.py mtime
+        # footgun found in production: a caller can read this
         # file instead of guessing by mtime across concurrent sessions.
         self._session_id_file = self.runtime_dir / "session_id"
         # R2a (Fable audit): orphan-salvage stability tracking for an
@@ -673,8 +673,8 @@ class ClaudeSession:
         return transcript_path(self.work_dir, sid)
 
     def last_reply_for_resend(self) -> tuple[str, str | None]:
-        """Status + optional body for the ``/resend`` command (backlog item
-        14): a manual, READ-ONLY escape hatch that re-sends the last
+        """Status + optional body for the ``/resend`` command: a manual,
+        READ-ONLY escape hatch that re-sends the last
         assistant reply straight from the JSONL transcript when the normal
         tmux-pane-scrape delivery path silently drops it (~3.3% of turns
         measured with no closing marker ever appearing). This is a NEW,
@@ -739,14 +739,14 @@ class ClaudeSession:
             return "no_markers", None
         if status == "unclosed":
             # F1 fix: this is the literal shape of every real delivery-loss
-            # incident on record (bfbe3335, df4f87ef, 9dd35326) — a closed
-            # <<<R:id>>>/<<<E:id>>> pair never appeared, but the finished
-            # reply text is sitting right there. latest_reply() stays pure/
-            # lock-free and cannot itself tell "still typing" from "done,
-            # marker just never landed" — liveness is the only thing that
-            # can, and it is decided HERE, not in transcript.py. Mirrors the
-            # salvage notice pop_orphan_replies() already prepends for the
-            # analogous pane-scrape case (see chat_session.py).
+            # incident on record — a closed <<<R:id>>>/<<<E:id>>> pair never
+            # appeared, but the finished reply text is sitting right there.
+            # latest_reply() stays pure/lock-free and cannot itself tell
+            # "still typing" from "done, marker just never landed" —
+            # liveness is the only thing that can, and it is decided HERE,
+            # not in transcript.py. Mirrors the salvage notice
+            # pop_orphan_replies() already prepends for the analogous
+            # pane-scrape case (see chat_session.py).
             try:
                 active = self.is_turn_active()
             except Exception:
@@ -827,7 +827,7 @@ class ClaudeSession:
 
         An existing session is reused only while its pane shows the bot's own
         conversation. A pane switched to a background task via the
-        "← N agents" view (agent-infra-backlog item 28: it sat on
+        "← N agents" view (agent-infra: it sat on
         `night-second-brain` after two weeks of human use while the bot ran
         on Codex) still looks READY but answers into a transcript the bot
         never reads, so every ask() times out. Conservative order — the
@@ -983,7 +983,7 @@ class ClaudeSession:
             )
             self._attach_pipe()
 
-    # ── foreign view handling (agent-infra-backlog item 28) ────────────
+    # ── foreign view handling ────────────
 
     def _own_titles(self) -> set[str]:
         """Every name the pinned conversation has carried (``/rename``, the
@@ -1288,7 +1288,7 @@ class ClaudeSession:
         detector entirely — found live in review 2026-08-20. The legacy
         "esc to interrupt" hint stays exempt (see is_working_progressing) —
         but only for STATIC_TRUST_WINDOW seconds of a genuinely frozen pane
-        (backlog item 13): the hint lives in a footer this CLI shows whenever
+: the hint lives in a footer this CLI shows whenever
         anything at all is interruptible, so trusting it forever left the hang
         detector disarmed in exactly the UNKNOWN-state corner it exists for.
         The window is reset by EITHER real signal — a chrome change or
@@ -1732,7 +1732,7 @@ class ClaudeSession:
         busy — the exact shape ``long_run.py``/the busy-active classification
         exists to describe. ``chat.py`` uses this so a user's stop-word can
         reach the interrupt path even when the lock-based ``is_turn_active``
-        says nothing is in flight (Step D, agent-infra-backlog item 22)."""
+        says nothing is in flight (Step D,)."""
         return is_main_turn_active(self.capture_text())
 
     def is_steerable_turn(self) -> bool:
@@ -1848,9 +1848,9 @@ class ClaudeSession:
 
         Reproduced live on Claude Code 2.1.278 (isolated tmux server): a
         31-line paste, 0.3-0.5 s, Enter — and the prompt just sat in the
-        input box; the next prompt was then pasted on top of it (the
-        2026-09-19 incident: five glued, unsent prompts). A second Enter
-        sent it. An extra Enter on an already-sent, empty box is a no-op
+        input box; the next prompt was then pasted on top of it (seen live
+        once: five glued, unsent prompts). A second Enter sent it. An extra
+        Enter on an already-sent, empty box is a no-op
         both while idle and during a running turn (live: no empty user
         record in the transcript, the turn not disturbed).
 
@@ -1882,7 +1882,7 @@ class ClaudeSession:
             )
             self._send_enter()
 
-    # ── the reply source (backlog item 32) ──────────────────────────────
+    # ── the reply source ──────────────────────────────
 
     def _open_reply_tail(
         self, rid: str, log_id: str
@@ -2007,7 +2007,7 @@ class ClaudeSession:
                 self._inflight.unlink(missing_ok=True)
                 return AskResult("logged_out")
             if not is_main_turn_active(pre_cap) and is_working(pre_cap):
-                # Defect B (backlog item 10, 2026-08-21): background-agent
+                # Defect B (-08-21): background-agent
                 # list rows alone make bare is_working() True forever (their
                 # elapsed counter ticks every second), which used to refuse
                 # to type at all — the busy-wait below would burn its whole
@@ -2046,7 +2046,7 @@ class ClaudeSession:
                 # turns' text in one pane (found in review 2026-08-20).
                 cap = pre_cap
 
-                # B3 fast path (agent-infra-backlog item 22): the watchdog
+                # B3 fast path: the watchdog
                 # may already have evidence, from its own independent
                 # polling, that this is a live/progressing unattended long
                 # run — see long_run.py's module docstring for the marker
@@ -2141,7 +2141,7 @@ class ClaudeSession:
                     self._sleep(self._poll_interval)
                     new_cap = self._capture()
                     log_size = self._pane_log_size()
-                    # Backlog item 13: last_real_progress_ts is already the
+                    # last_real_progress_ts is already the
                     # exact "real signal" tracker this needs (chrome change OR
                     # log growth, no static-hint exemption), so the trust
                     # window rides on it — nothing new to track here. Read
@@ -2168,9 +2168,9 @@ class ClaudeSession:
                     self._inflight.unlink(missing_ok=True)
                     busy_seconds = self._clock() - busy_wait_start
                     if saw_progress:
-                        # Progress-aware classification (agent-infra-backlog
-                        # item 22): the pane made a REAL, RECENT change —
-                        # a live turn, not a latched static signature.
+                        # Progress-aware classification: the pane made a
+                        # REAL, RECENT change — a live turn, not a latched
+                        # static signature.
                         # Distinct status ("busy_active") so ask_health
                         # treats this as neutral rather than a delivery
                         # failure — see that module's docstring.
@@ -2194,7 +2194,7 @@ class ClaudeSession:
                     # with someone else's long-running turn — chat_session.py
                     # maps this to a distinct, friendlier MESSAGE than
                     # "❌ Ошибка сессии", which misled the owner into thinking
-                    # something had crashed at 04:27 UTC when the session was
+                    # something had crashed when the session was
                     # simply still working. B3 fix (2026-08-22): "busy" DOES
                     # count in ask_health.FAILURE_STATUSES now — the original
                     # exclusion assumed a busy pane is never evidence the
@@ -2218,7 +2218,7 @@ class ClaudeSession:
             # (steerable from here on) right before typing anything into it.
             self._inflight.write_text(f"{log_id}\n{self._clock()}\n")
 
-            # THE reply source for this turn (backlog item 32), anchored
+            # THE reply source for this turn, anchored
             # BEFORE the prompt is typed so nothing the model writes in answer
             # to it can land ahead of the anchor — the rid is fresh, so
             # records left over from an earlier turn cannot match it either.
@@ -2243,7 +2243,7 @@ class ClaudeSession:
             last_active = self._clock()
             last_cap = pre_cap
             last_log_size = self._pane_log_size()
-            # Backlog item 13: last REAL movement of the pane (chrome change
+            # last REAL movement of the pane (chrome change
             # OR pane.log growth), with no static-hint exemption — the clock
             # the STATIC_TRUST_WINDOW runs on for this loop. Separate from
             # last_active above, which by design DOES take the static hint as
@@ -2263,7 +2263,7 @@ class ClaudeSession:
             ever_saw_r_marker = False
             idle_streak = 0
             rate_limited_streak = 0
-            # ── salvage/ceiling tracking state (backlog item 10) ──────────
+            # ── salvage/ceiling tracking state ──────────
             # send_time: fixed anchor for "how long have we waited" logging
             # below — unlike last_active/last_main_turn_active, this never
             # moves.
@@ -2284,7 +2284,7 @@ class ClaudeSession:
             # the first poll the salvage WINDOW is open (last_main_turn_active
             # is at least salvage_stable seconds old) but the salvage
             # condition as a whole still refuses — closing the "salvage
-            # refusal path logs nothing at all" gap (checklist item 5 + 7,
+            # refusal path logs nothing at all" gap (checklist + 7,
             # 2026-08-22 plan): before this, the only way to know WHY a given
             # turn missed salvage and rode the ceiling instead was a fresh
             # forensic pass over pane.log.
@@ -2333,7 +2333,7 @@ class ClaudeSession:
                 # orphan poller. That is the 2026-08-20 double-message bug.
                 #
                 # "Complete" is now the CLOSING MARKER IN THE TRANSCRIPT, not
-                # on the pane (backlog item 32): a reply longer than the
+                # on the pane: a reply longer than the
                 # capture window pushes its own opening marker out of frame,
                 # so the pane can show a finished answer that no parser can
                 # recognise. An unclosed span is deliberately NOT delivered
@@ -2455,15 +2455,15 @@ class ClaudeSession:
                     self._sleep(self._poll_interval)
                     continue
 
-                # ── salvage / no-main-turn ceiling (backlog item 10) ───────
+                # ── salvage / no-main-turn ceiling ───────
                 # Scoped to wrap=True: there is no closing-marker concept for
                 # wrap=False turns (those complete on two idle polls, above),
                 # so neither salvage nor the ceiling applies to them.
                 #
                 # The candidate is the transcript's UNCLOSED span for this rid
-                # (backlog item 32) — the model opened the pair and wrote an
+                # — the model opened the pair and wrote an
                 # answer but never emitted `<<<E:rid>>>` (~3% of turns,
-                # backlog item 11). Two rules decide whether to deliver it:
+                #). Two rules decide whether to deliver it:
                 # the PANE must say the main turn is over, and the BODY must
                 # have stopped growing. Both are needed — the pane alone can
                 # false-negative on a live turn, and a body that is still
@@ -2746,7 +2746,7 @@ class ClaudeSession:
                 # as ongoing liveness forever — found in review 2026-08-20.
                 log_size = self._pane_log_size()
                 # Bound how long the static "esc to interrupt" hint alone may
-                # stand in for liveness (backlog item 13): a pane that has not
+                # stand in for liveness: a pane that has not
                 # changed a byte AND whose log has not grown for
                 # STATIC_TRUST_WINDOW is frozen, not quiet, and the hint stops
                 # being accepted as evidence. Both halves matter — a streamed

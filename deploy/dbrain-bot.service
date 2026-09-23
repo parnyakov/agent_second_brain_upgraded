@@ -21,7 +21,7 @@ SuccessExitStatus=143 SIGTERM
 # instance over the live one. Bounded it must stay — but the bound now has to
 # agree with the application's own.
 #
-# Since 2026-09-22 (backlog item 33 step 3) SIGTERM no longer cuts the bot
+# Since 2026-09-22 SIGTERM no longer cuts the bot
 # off: it stops taking new work and gives the turns already in flight
 # DBRAIN_SHUTDOWN_GRACE (default 300s) to finish, then one bounded outbox
 # drain (shutdown.FINAL_DRAIN_TIMEOUT, 10s) and a hard exit. 360s = 300 + 10

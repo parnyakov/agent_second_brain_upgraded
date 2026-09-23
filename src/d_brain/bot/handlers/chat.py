@@ -128,7 +128,7 @@ async def _dispatch_text(
         and text.strip().lower() in _STOP_WORDS
         and manager.is_pane_turn_active()
     ):
-        # Step D (agent-infra-backlog item 22): during an unattended long
+        # Step D: during an unattended long
         # cascade the ask-lock is free (nothing called ask() for this turn)
         # while the PANE itself is genuinely busy — classify_concurrent_input
         # only ever sees the lock-based is_turn_active(), so a stop-word here
@@ -149,7 +149,7 @@ async def _dispatch_text(
             # Maintenance turn (nightly pipeline / doctor / startup) holds
             # the session — injecting user text would contaminate it. Falls
             # through to the ordinary path, which parks it in the per-chat
-            # queue (item 33, step 5); the "held by maintenance" check lives
+            # queue; the "held by maintenance" check lives
             # at that single choke point so voice and media get it too (the
             # F6 lesson), not here.
             await _process_and_reply(bot, chat_id, user_id, text, message_id=message_id)
@@ -355,7 +355,7 @@ async def _process_and_reply(
     message_id: int | None = None,
 ) -> None:
     """THE choke point every input path funnels through — and therefore the
-    place the per-chat lane is taken (item 33, step 5).
+    place the per-chat lane is taken.
 
     One live runner per chat. A message that arrives while that lane is
     taken, or while the chat already has something waiting, is parked on disk
@@ -506,7 +506,7 @@ async def _run_turn(
             if await _main_is_busy(manager):
                 return _Later()
         typing_task = asyncio.create_task(_typing_loop(bot, chat_id))
-        # Живая карточка прогресса (backlog item 33, шаг 4). Открывается ДО
+        # Живая карточка прогресса. Открывается ДО
         # отправки промпта, потому что её курсор по стенограмме встаёт на
         # конец файла в момент создания — иначе первые события хода
         # окажутся позади курсора и человек их не увидит.
@@ -630,7 +630,7 @@ async def _stop_progress_card(card: Any | None, card_task: asyncio.Task | None) 
     # и вернётся штатно — то есть отмена хода будет поглощена здесь. Это
     # осознанно оставлено: цена ограничена одним тиком (POLL_SECONDS), а
     # исход — ход доигрывает и ответ доходит, ровно то, ради чего сделана
-    # мягкая остановка (item 33, шаг 3); `cancel_turns` всё равно ждёт
+    # мягкая остановка; `cancel_turns` всё равно ждёт
     # стрегглеров под своим `wait_for`.
     if card_task is not None:
         card_task.cancel()
@@ -727,7 +727,7 @@ def build_media_prompt(
     instruction that ``media_prep`` decided is safe for this file.
 
     Stays a pure function: ``prep`` is a plain value object, all the I/O
-    happened before the call (agent-infra-backlog item 21, step 5).
+    happened before the call.
     """
     prep = prep or MediaPrep()
     name_part = f" (имя файла: {original_name})" if original_name else ""
@@ -778,7 +778,7 @@ def build_album_prompt(items: list[dict[str, Any]]) -> str:
     )
 
 
-# --- Busy guard for the media path (agent-infra-backlog item 21, step 1) ---
+# --- Busy guard for the media path ---
 
 
 def build_busy_media_reply(rel_paths: list[str]) -> str:
@@ -817,7 +817,7 @@ def build_busy_media_reply(rel_paths: list[str]) -> str:
 # every dispatch path. It sits just above the hardest turn budget
 # (DEFAULT_TIMEOUT) so a legitimate hour-long turn never has its claim
 # stolen, while a claim leaked by some path we did not anticipate expires
-# instead of wedging the media path permanently (items 22/23: never let one
+# instead of wedging the media path permanently (/23: never let one
 # bug become a standing outage).
 MEDIA_CLAIM_TTL = DEFAULT_TIMEOUT + 300
 
@@ -869,7 +869,7 @@ async def reject_media_if_busy(bot: Bot, chat_id: int, rel_paths: list[str]) -> 
       is idempotent, and nothing in this process ever takes the claim while
       a queue is configured). The lane is the claim now; see below.
 
-    WITH THE PER-CHAT QUEUE (item 33, step 5) THERE IS NOTHING LEFT TO
+    WITH THE PER-CHAT QUEUE THERE IS NOTHING LEFT TO
     GUARD. This whole function is an earlier, weaker version of the lane in
     ``_process_and_reply``: the same synchronous, await-free claim, taken at
     the same point, against the same race (two heavy documents landing in
@@ -1088,7 +1088,7 @@ async def handle_chat_media(message: Message, bot: Bot) -> None:
 
         group_id = getattr(message, "media_group_id", None)
 
-        # Step 1 (agent-infra-backlog item 21): the universal busy guard,
+        # Step 1: the universal busy guard,
         # BEFORE anything can reach ask(). The file is already saved above,
         # so bailing out here loses nothing — and, unlike a "busy" result
         # from ask(), it never increments the ask_health fail-streak.

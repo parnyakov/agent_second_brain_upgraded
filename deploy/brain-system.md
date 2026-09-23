@@ -66,8 +66,8 @@ session cannot tell the difference from a marker/timing signature alone.
 Closing turns promptly keeps that signal honest.
 
 **Never resume a completed `isolation: worktree` agent via SendMessage for
-further write-work.**
-The harness deletes an isolated agent's worktree when that agent's own turn
+further write-work.** Confirmed in practice:
+the harness deletes an isolated agent's worktree when that agent's own turn
 completes, and a SendMessage resume does not recreate it — the resumed agent
 silently finds itself back in the shared checkout on `main`, indistinguishable
 from its own isolation unless it happens to check. If a completed worktree

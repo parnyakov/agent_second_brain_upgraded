@@ -93,7 +93,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ── multi-instance parameterization (C1, multi-instance plan) ──
+    # ── multi-instance parameterization (C1, second-instance rollout plan) ──
     # Every field here defaults to EXACTLY today's single-instance behavior.
     # Setting none of them must be a byte-for-byte no-op.
     project_root: Path | None = Field(
@@ -103,7 +103,7 @@ class Settings(BaseSettings):
             "tmux.conf and mcp-config.json live. Empty → vault_path.parent, "
             "which is exactly what the code derived before this field "
             "existed. A second instance whose vault lives OUTSIDE the "
-            "checkout (e.g. /var/lib/dbrain-second/vault) sets "
+            "checkout (e.g. /var/lib/dbrain-<instance>/vault) sets "
             "PROJECT_ROOT to the shared checkout instead."
         ),
     )
@@ -112,7 +112,7 @@ class Settings(BaseSettings):
         description=(
             "systemd unit the DeliveryGuard restarts and that operator "
             "messages name. Default is today's hardcoded unit name; a "
-            "templated instance sets e.g. dbrain-bot@second.service."
+            "templated instance sets e.g. dbrain-bot@<instance>.service."
         ),
     )
     systemd_scope: Literal["user", "system"] = Field(
@@ -131,14 +131,14 @@ class Settings(BaseSettings):
             "cache_creation_input_tokens + input_tokens, B2 fix 2026-08-22 — "
             "cache_read alone undercounts on cache-rewrite turns) on the "
             "latest transcript record — the measured marker-drop rate jumps "
-            "~10x above this (1.3% below vs ~12% above, incident registry "
-            "2026-08-22)."
+            "~10x above this (1.3% below vs ~12% above, per a prior "
+            "production incident)."
         ),
     )
     long_run_alert_seconds: float = Field(
         default=900.0,
         description=(
-            "agent-infra-backlog item 22 (2026-09): how long an UNATTENDED "
+            "How long an UNATTENDED "
             "long turn (pane's main turn active, ask-lock free — the shape "
             "of a multi-level autonomous agent cascade) runs before the "
             "watchdog sends one heads-up notice and writes the long-run.json "
@@ -163,7 +163,7 @@ class Settings(BaseSettings):
     long_run_max_seconds: float = Field(
         default=1800.0,
         description=(
-            "agent-infra-backlog item 29 (2026-09): HARD cap on how long an "
+            "HARD cap on how long an "
             "UNATTENDED turn of the main session may run before the watchdog "
             "closes it automatically (one interrupt() per run) and tells the "
             "owner why. The owner's rule: a long background job belongs to "
@@ -179,7 +179,7 @@ class Settings(BaseSettings):
 
     # ── engine selection (Codex-engine plan, phase 1) ────────────────
     # PER-SESSION on purpose, not one global switch: the pilot runs Codex on
-    # the isolated cron session while the main chat brain stays on Claude Code
+    # the isolated cron session while the owner's chat brain stays on Claude Code
     # the whole time. Both default to "claude", so leaving them unset is a
     # byte-for-byte no-op — today's only supported production configuration.
     # Env names are DBRAIN_-prefixed (unlike the older fields) because they
@@ -251,7 +251,7 @@ class Settings(BaseSettings):
         description="Retry delay for a failed one-shot ('at') job",
     )
 
-    # ── durable inbox (agent-infra-backlog item 33, step 2) ──────────
+    # ── durable inbox ──────────
     inbox_replay_max_age: float = Field(
         default=3600.0,
         validation_alias=AliasChoices(
@@ -269,7 +269,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ── graceful stop (agent-infra-backlog item 33, step 3) ──────────
+    # ── graceful stop ──────────
     shutdown_grace_seconds: float = Field(
         default=300.0,
         validation_alias=AliasChoices(
@@ -291,7 +291,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ── per-chat queue (agent-infra-backlog item 33, step 5) ─────────
+    # ── per-chat queue ─────────
     chat_queue_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("DBRAIN_CHAT_QUEUE", "chat_queue_enabled"),
@@ -332,7 +332,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ── duty session (agent-infra-backlog items 29–30) ───────────────
+    # ── duty session ───────────────
     # The THIRD engine session, modelled on the cron one: same persona, same
     # vault, own session name and own runtime dir. It exists for exactly one
     # case — a Telegram message arriving while the main brain is mid

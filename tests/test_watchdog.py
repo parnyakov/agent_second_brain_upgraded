@@ -94,7 +94,7 @@ def test_healthy_does_nothing(tmp_path):
 
 
 def test_tick_delivers_session_notices_once(tmp_path):
-    """agent-infra-backlog item 28: parking at bot start-up or in
+    """agent-infra: parking at bot start-up or in
     force_recover() has no chat reply to ride on — the tick delivers it."""
     sess = FakeSession()
     pending = ["⚠️ Контекст разговора сброшен: … отложена как parked_x"]
@@ -354,19 +354,17 @@ def test_idle_ready_with_orphan_inflight_not_killed(tmp_path):
     assert not (tmp_path / "inflight").exists()  # orphan cleared
 
 
-# ── Fix C (agent-infra-backlog item 23): READY must not erase a LIVE
-# inflight marker ──────────────────────────────────────────────────────
+# ── Fix C: READY must not erase a LIVE inflight marker ────────────────────
 #
-# 03.09 incident: a READY tick that lands in a "pane looks briefly idle"
-# window mid-turn (the pane can render this way even while a real ask() is
-# in progress — see the item's diagnosis) used to unconditionally delete
-# inflight ("clear any orphan marker"). That erased a LIVE hold's marker,
-# which made is_steerable_turn() see "lock held, no inflight" and bounce
-# the user's next message with the "🔧 background maintenance" message
-# instead of steering it into the running turn — the user's text never
-# reached the pane at all (confirmed by grep'ing pane.log, see the
-# backlog item). The fix: only clear inflight when is_turn_active() says
-# no ask() actually holds the lock.
+# A READY tick that lands in a "pane looks briefly idle" window mid-turn
+# (the pane can render this way even while a real ask() is in progress)
+# used to unconditionally delete inflight ("clear any orphan marker"). That
+# erased a LIVE hold's marker, which made is_steerable_turn() see "lock
+# held, no inflight" and bounce the user's next message with the "🔧
+# background maintenance" message instead of steering it into the running
+# turn — the user's text never reached the pane at all (confirmed by
+# grep'ing pane.log). The fix: only clear inflight when is_turn_active()
+# says no ask() actually holds the lock.
 
 
 def test_ready_tick_with_live_turn_leaves_inflight_in_place(tmp_path):
@@ -708,7 +706,7 @@ def test_recovering_from_a_limit_rearms_the_next_one(tmp_path):
     assert sess.nudges == []
 
 
-# ── unattended long-run tracking (agent-infra-backlog item 22) ────────────
+# ── unattended long-run tracking ────────────
 
 _ACTIVE_PANE = "✻ Working…  (esc to interrupt)\n"
 _IDLE_PANE = "❯\n"
@@ -912,7 +910,7 @@ def test_long_run_nudge_enabled_fires_exactly_once_past_threshold(tmp_path):
     assert len(sess.steered) == 1
 
 
-# ── item 29: hard cap on an unattended turn ────────────────────────────────
+# ── hard cap on an unattended turn ────────────────────────────────
 
 
 class CapFakeSession(LongRunFakeSession):

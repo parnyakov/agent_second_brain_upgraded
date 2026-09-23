@@ -33,7 +33,7 @@ now; only the user-facing WORDING stays distinct (friendly "still working,
 try again shortly" instead of "❌ Ошибка сессии") — see
 chat_session._STATUS_MESSAGES.
 
-`busy_active` → neutral (agent-infra-backlog item 22, 2026-09): added
+`busy_active` → neutral (agent-infra, 2026-09): added
 alongside plain `busy` when claude_session.ask()'s busy-wait branch can show
 the pane made DEMONSTRABLE PROGRESS across the entire wait (the shared
 "is_working_progressing() OR pane.log growth" signal, sampled on every poll
@@ -68,7 +68,7 @@ FILENAME = "ask-health.json"
 # added 2026-08-22 (B3 fix) — see the module docstring for why a "friendly"
 # status still needs to count toward the delivery_guard restart backstop.
 # `busy_active` is DELIBERATELY absent — see the module docstring's
-# "busy_active → neutral" note (2026-09, agent-infra-backlog item 22).
+# "busy_active → neutral" note (2026-09,).
 FAILURE_STATUSES = frozenset({"timeout", "error", "busy"})
 # Only this proves the whole path worked end to end.
 SUCCESS_STATUS = "ok"

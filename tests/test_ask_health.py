@@ -51,7 +51,7 @@ def test_busy_counts_as_a_failure(tmp_path):
 
 
 def test_busy_active_is_neutral(tmp_path):
-    """agent-infra-backlog item 22: 'busy_active' (a leftover turn that
+    """agent-infra: 'busy_active' (a leftover turn that
     demonstrably kept progressing across the whole busy-wait) must NOT feed
     the restart backstop the way plain 'busy' does — it is a live turn, not
     evidence of a wedged pane."""

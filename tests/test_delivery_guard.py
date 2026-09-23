@@ -64,7 +64,7 @@ def test_threshold_triggers_one_restart(tmp_path):
 
 
 def test_busy_active_run_never_triggers_a_restart(tmp_path):
-    """agent-infra-backlog item 22: a health ledger built entirely from
+    """agent-infra: a health ledger built entirely from
     'busy_active' outcomes (a live, progressing pane during an unattended
     agent cascade) must never look like a delivery outage — decide() stays
     'none' regardless of how many such turns are recorded."""
@@ -327,7 +327,8 @@ def test_guard_restarts_the_configured_unit(tmp_path):
 
 
 def test_escalate_text_user_scope_unchanged(tmp_path):
-    """Default scope keeps the exact operator instructions the owner knows."""
+    """Default scope keeps the exact operator instructions the runbook
+    documents."""
     from d_brain.services.delivery_guard import (
         ESCALATE_MSG,
         _journal_flag,

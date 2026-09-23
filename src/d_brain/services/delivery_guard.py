@@ -1,6 +1,6 @@
 """Automatic recovery when the delivery path keeps failing.
 
-Background (a real outage, see an internal incident note):
+Background (after a real production outage):
 the bot kept polling Telegram and kept "handling" updates, systemd kept
 reporting `active (running)`, and the user still got nothing back for hours.
 Every existing health signal was a liveness signal, and liveness was fine.
@@ -9,7 +9,7 @@ The only thing that was broken was the outcome of the work.
 So this guard watches outcomes, not liveness. It reads the ledger the bot
 writes (`ask_health`) and, on N consecutive delivered-nothing turns inside a
 short window, restarts `dbrain-bot.service` — the single action that actually
-ended the outage on 2026-08-20, and the same action a human would take first.
+ended that outage, and the same action a human would take first.
 
 Deliberately NOT automated: rolling code back. A restart is idempotent,
 bounded, loses at most one in-flight turn, and needs no judgement about which
@@ -67,7 +67,8 @@ DEFAULT_MAX_RESTARTS = 2
 
 # C4: the unit name and the systemctl flavour used to be baked into these
 # strings. They are now filled from the guard's own `_unit`/`_scope`, so a
-# templated instance tells the operator to inspect ITS unit, not the default one.
+# templated instance tells the operator to inspect ITS unit, not the
+# owner's default one.
 # With the defaults (dbrain-bot.service / "user") the rendered text is
 # byte-for-byte what it was before this change.
 RESTART_MSG = (
@@ -190,11 +191,11 @@ class DeliveryGuard:
         # Never spend another restart — or escalate — without a turn having
         # actually been attempted and failed SINCE the last restart. The
         # ledger only moves when a turn ends, so after a restart with nobody
-        # writing in (night, or the user gave up and went to do something else)
-        # it holds exactly the same bytes that triggered the restart. Judging
-        # a restart by re-reading its own trigger is how the guard would come
-        # to announce "не восстановилась после 2 перезапусков" having never
-        # once seen the channel tried.
+        # writing in (night, or the owner gave up and went to do something
+        # else) it holds exactly the same bytes that triggered the restart.
+        # Judging a restart by re-reading its own trigger is how the guard
+        # would come to announce "не восстановилась после 2 перезапусков"
+        # having never once seen the channel tried.
         if self._restarts and health.last_ts <= self._last_restart_ts:
             return GuardDecision("none", "no failed turn since the last restart")
 

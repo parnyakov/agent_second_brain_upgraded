@@ -1,4 +1,4 @@
-"""``/work`` command handler — "what is running right now" (item 29).
+"""``/work`` command handler — "what is running right now".
 
 A pure READ of state that other components already maintain on disk or in
 the engine: the session's own busy flags, the watchdog's ``long-run.json``
@@ -241,7 +241,7 @@ def _main_session_lines(settings: Settings, *, now: float) -> list[str]:
 def _duty_session_lines(settings: Settings) -> list[str]:
     """The duty session's line — printed only if this build HAS one.
 
-    The duty session arrives on a separate branch (item 29's point 2). The
+    The duty session arrives on a separate branch ('s point 2). The
     lookup is deliberately a ``getattr`` rather than an import so this file
     works identically before and after that branch lands: no line at all in
     a build without it, no import error, no merge conflict between the two.
@@ -410,7 +410,7 @@ def _inbox_lines(settings: Settings, *, now: float) -> list[str]:
 
 
 def _chat_queue_lines(settings: Settings, *, now: float) -> list[str]:
-    """The per-chat queue (item 33, step 5): what has been acknowledged with
+    """The per-chat queue: what has been acknowledged with
     "отвечу следом" and is still waiting for its turn.
 
     Reads the LIVE queue when there is one — only it knows which chats have a

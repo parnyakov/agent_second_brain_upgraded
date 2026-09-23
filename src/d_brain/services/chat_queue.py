@@ -1,7 +1,6 @@
 """Per-chat work queue: one turn at a time, everything else waits on disk.
 
-Step 5 — the last — of the reliability plan
-(``thoughts/projects/agent-infra-backlog.md`` item 33). The four before it
+Step 5 — the last — of the reliability plan. The four before it
 each closed one hole: a reply that was born could not be lost on the way out
 (outbox), a message that arrived could not be lost on the way in (inbox), a
 restart no longer cuts a live turn off (shutdown), and a long turn now shows
@@ -18,8 +17,9 @@ Until now that message had three possible fates, and all three were bad:
 * or, on the voice and media paths, nothing at all for minutes while
   ``ask()`` sat on the process-wide ask-lock waiting its turn in silence.
 
-The owner's rule, verbatim: «отвечать мне должна основная сессия в 99%
-случаев, у неё есть контекст». So busyness must lead to a QUEUE, and the
+The owner's rule, in short: the main session should be the one answering the
+overwhelming majority of the time, since it is the one with context. So
+busyness must lead to a QUEUE, and the
 duty session goes back to being what it was meant to be — the emergency
 path, used only when the main brain shows signs of being WEDGED.
 

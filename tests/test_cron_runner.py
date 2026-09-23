@@ -98,7 +98,7 @@ def _runner(store, session, *, deliver=None, alert=None, clock=None, **over):
 
 async def test_tick_alerts_cron_session_notices(tmp_path):
     """The watchdog only watches the main brain; a parked cron pane
-    (agent-infra-backlog item 28) is announced by the cron loop itself."""
+ is announced by the cron loop itself."""
     sess = FakeSession()
     pending = ["⚠️ кроновая сессия <x> отложена"]
     sess.pop_notices = lambda: [pending.pop()] if pending else []
@@ -274,7 +274,7 @@ async def test_rate_limited_skips_without_recover_or_count(tmp_path):
     assert "/clear" not in session.controls
 
 
-# ── rate-limit self-recovery (Fix A/B, agent-infra-backlog item 23) ───
+# ── rate-limit self-recovery (Fix A/B) ────────────────────────────────────
 #
 # 2026-08-28 incident: the cron pane got permanently parked at a stale
 # rate-limit banner for 6 days — nothing ever sent it input to re-check

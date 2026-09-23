@@ -1,4 +1,4 @@
-"""Tests for the /resend command handler (backlog item 14).
+"""Tests for the /resend command handler.
 
 Covers the five honest, distinct statuses last_reply_for_resend() can
 return, and the 5s in-memory anti-spam cooldown. The ChatSessionManager

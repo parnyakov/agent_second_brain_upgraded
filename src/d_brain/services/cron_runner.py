@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 SILENT_MARKER = "[SILENT]"
 
-# agent-infra-backlog item 23 (2026-09): the cron pane has no watchdog of its
+# (2026-09): the cron pane has no watchdog of its
 # own (see runtime.py — a separate tmux pane + runtime_dir from the main
 # session's watchdog target). Claude Code never re-checks a rate limit on its
 # own — only on new input — so a stale RATE_LIMITED banner left the cron
@@ -88,7 +88,7 @@ class CronRunner:
         self.retry_seconds = retry_seconds
         self.clock = clock or (lambda: datetime.now(UTC))
         self._warned_dormant: set[str] = set()
-        # Fix A/B state (agent-infra-backlog item 23): persisted in
+        # Fix A/B state: persisted in
         # cron_dir so it survives a bot restart while the pane is still
         # parked at the same banner. In-memory-only cooldown counters below
         # cost at most one extra /clear after a restart, never a correctness
@@ -286,7 +286,7 @@ class CronRunner:
         self.store.mutate(fn)
         return disabled
 
-    # ── rate-limit self-recovery (Fix A/B, agent-infra-backlog item 23) ──
+    # ── rate-limit self-recovery (Fix A/B,) ──
 
     def _read_limited_since(self) -> float | None:
         try:
@@ -351,7 +351,7 @@ class CronRunner:
 
     async def _limit_recovery(self) -> None:
         """Fix A: self-healing for the cron pane's own dedicated failure
-        mode (agent-infra-backlog item 23). Unlike the main session, no
+        mode. Unlike the main session, no
         watchdog targets the cron runtime_dir at all (see runtime.py) — and
         Claude Code only ever re-checks a rate limit on new input, so once
         ask() sees RATE_LIMITED it refuses to type anything at all
@@ -402,7 +402,7 @@ class CronRunner:
 
     async def _deliver_notices(self) -> None:
         """Forward the cron brain's owner notices (e.g. its pane was parked
-        off a background task's view — agent-infra-backlog item 28). The
+        off a background task's view —). The
         watchdog only watches the main brain, so the cron loop does this
         for its own session. Best-effort, never breaks the tick."""
         pop = getattr(self.session, "pop_notices", None)

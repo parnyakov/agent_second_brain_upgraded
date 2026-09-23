@@ -262,7 +262,7 @@ DAILY_FILE = {
     "2026-03-01.md": (
         "# Memory 2026-03-01\n\n"
         "Met with @alice_m and @bob_dev today.\n\n"
-        "**Сергей Иванов** presented the new roadmap.\n\n"
+        "**Руководитель проекта** presented the new roadmap.\n\n"
         "Discussed [[projects/alpha]] budget: $5,000.\n\n"
         "Decided: approved the Q2 plan.\n\n"
         "Events: launched v2.0\n"

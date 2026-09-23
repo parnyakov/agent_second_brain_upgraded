@@ -97,7 +97,7 @@ def test_send_message_returns_reply_on_ok(tmp_path):
 
 
 def test_send_message_prepends_parking_notice_once(tmp_path):
-    """agent-infra-backlog item 28: a turn that had to park the pane tells the
+    """agent-infra: a turn that had to park the pane tells the
     owner, on that very reply, that the conversation context is gone."""
     m = _manager(tmp_path, AskResult("ok", reply="привет"))
     pending = ["⚠️ Контекст разговора сброшен: «<night>» отложена"]
@@ -125,10 +125,9 @@ def test_send_message_maps_rate_limited(tmp_path):
 
 
 def test_send_message_maps_busy_to_an_honest_non_error_message(tmp_path):
-    """Busy-panel UX finding (2026-08-22): a legitimately busy panel must
-    NOT read as '❌ Ошибка сессии' — that misled the owner on 2026-08-22 04:27
-    UTC into thinking something had crashed when nothing was actually
-    wrong."""
+    """Busy-panel UX finding: a legitimately busy panel must NOT read as
+    '❌ Ошибка сессии' — that misled an operator into thinking something
+    had crashed when nothing was actually wrong."""
     m = _manager(
         tmp_path, AskResult("busy", detail="pane still busy with a previous turn")
     )
@@ -138,7 +137,7 @@ def test_send_message_maps_busy_to_an_honest_non_error_message(tmp_path):
 
 
 def test_send_message_returns_busy_for_a_live_progressing_turn(tmp_path):
-    """Item 33, step 5: ``busy_active`` means the pane is busy with work that
+    """``busy_active`` means the pane is busy with work that
     demonstrably kept progressing — healthy, not wedged. It is no longer an
     outcome the user hears about at all: the manager hands back ``Busy`` and
     the caller parks the message in the per-chat queue, so the MAIN session
@@ -227,7 +226,7 @@ def test_send_message_keeps_generic_timeout_message_for_ordinary_timeouts(tmp_pa
 
 
 def test_send_message_turn_limit_timeout_says_the_turn_is_still_running(tmp_path):
-    """backlog item 30: the chat path now caps a main turn at
+    """the chat path now caps a main turn at
     chat_turn_timeout, and ask()'s tail return ("no reply in Ns") leaves the
     request IN FLIGHT (rid not marked handled) — the watchdog's orphan path
     still delivers a late reply. "Попробуй ещё раз" would be a lie that
@@ -407,7 +406,7 @@ def test_force_recover_returns_false_when_session_reports_busy(tmp_path):
     assert session.force_recover_calls == 1
 
 
-# ── resend_last_reply (backlog item 14: /resend) ──────────────────────────
+# ── resend_last_reply (/resend) ──────────────────────────
 
 
 def _resend_manager(tmp_path, resend_result: tuple[str, str | None]):
@@ -434,7 +433,7 @@ def test_resend_last_reply_passes_through_each_status(tmp_path):
 
 
 # ── duty session: answering while the main brain is busy
-#    (agent-infra-backlog items 29-30) ─────────────────────────────────────
+# ─────────────────────────────────────
 
 
 def _duty_settings(tmp_path, **over):
@@ -487,7 +486,7 @@ def test_duty_header_mentions_minutes_only_when_known():
 
 
 def test_a_wedged_main_session_is_answered_by_the_duty_session(tmp_path):
-    """The duty session's remaining job after item 33 step 5, and its only
+    """The duty session's remaining job after and its only
     one: plain ``busy`` means the pane showed NO real progress across the
     whole busy-wait budget — failure class B3, the wedge signature. Queueing
     behind a wedge would be a promise nobody can keep, so the stand-in
@@ -509,8 +508,8 @@ def test_a_wedged_main_session_is_answered_by_the_duty_session(tmp_path):
 
 
 def test_a_busy_but_progressing_session_never_reaches_the_duty_session(tmp_path):
-    """The owner's rule, verbatim: «отвечать мне должна основная сессия в 99%
-    случаев, у неё есть контекст». Simple busyness must not spend a
+    """The product rule: the main session should answer almost every time,
+    since it holds the context. Simple busyness must not spend a
     context-less stand-in turn any more."""
     from d_brain.services.chat_session import Busy
 
@@ -615,7 +614,7 @@ def test_duty_empty_ok_reply_is_also_reported(tmp_path):
 
 
 def test_duty_notices_are_delivered_with_the_reply(tmp_path):
-    """The duty session has its own owner notices (item 28) and no watchdog
+    """The duty session has its own owner notices and no watchdog
     watching it — same treatment send_message gives the main session's."""
     m, duty = _duty_manager(tmp_path, AskResult("busy"), AskResult("ok", reply="ответ"))
     pending = ["⚠️ <контекст> сброшен"]
@@ -626,7 +625,7 @@ def test_duty_notices_are_delivered_with_the_reply(tmp_path):
 
 
 def test_main_session_notices_still_ride_on_a_duty_reply(tmp_path):
-    """Item 28's notices are about the user's own conversation — they must
+    """'s notices are about the user's own conversation — they must
     not be swallowed just because the stand-in answered this round."""
     m, duty = _duty_manager(tmp_path, AskResult("busy"), AskResult("ok", reply="ответ"))
     pending = ["⚠️ контекст основной сессии сброшен"]

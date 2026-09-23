@@ -1,6 +1,6 @@
 """Prepare a saved attachment so the brain can read it cheaply and safely.
 
-Background (agent-infra-backlog item 21): Telegram hands `document`
+Background: Telegram hands `document`
 attachments over UNCOMPRESSED — a phone camera original is ~12x bigger and
 3-4x higher resolution than the same picture sent as a `[photo]` (Telegram
 downscales those to ~1280px itself). Handing such a file to the brain "as
@@ -19,9 +19,9 @@ open for a given attachment:
 
 Two hard rules:
 
-1. The original in ``attachments/`` is NEVER mutated. The owner's rule
-   (2026-08-30) requires untouched
-   originals for AI photo sessions.
+1. The original in ``attachments/`` is NEVER mutated. This follows the
+   owner's rule that AI photo-session workflows require untouched
+   originals.
 2. Any failure degrades to today's behavior (original path + the generic
    instruction) — never to an exception.
 """

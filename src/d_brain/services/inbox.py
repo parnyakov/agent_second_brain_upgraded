@@ -1,9 +1,8 @@
 """Durable inbox: an incoming message is on disk BEFORE any work starts.
 
-Step 2 of the reliability plan (``thoughts/projects/agent-infra-backlog.md``
-item 33). Step 1 made sure a reply that was BORN could not be lost on the
-way out. This one makes sure a message that ARRIVED cannot be lost on the
-way in.
+Step 2 of a five-step reliability plan. Step 1 made sure a reply that was
+BORN could not be lost on the way out. This one makes sure a message that
+ARRIVED cannot be lost on the way in.
 
 The pain, in the owner's words: he restarts the bot several times a day. Until
 now an incoming update lived only in RAM — ``handle_chat_text`` &co read it

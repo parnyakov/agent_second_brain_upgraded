@@ -739,7 +739,7 @@ def test_is_working_progressing_legacy_hint_exempt_from_change():
     assert is_working_progressing(static, None) is True
 
 
-# ── trust_static: bounded trust in the legacy hint (backlog item 13) ─────
+# ── trust_static: bounded trust in the legacy hint ─────
 #
 # "esc to interrupt" lives in a footer this CLI shows whenever ANYTHING is
 # interruptible (measured: 99.6% of its occurrences on a real pane.log), so
@@ -750,7 +750,7 @@ def test_is_working_progressing_legacy_hint_exempt_from_change():
 
 
 def test_is_working_progressing_static_untrusted_needs_change():
-    """Regression (item 13): with trust_static=False a byte-identical STATIC
+    """Regression: with trust_static=False a byte-identical STATIC
     frame is no longer liveness — it must obey the same "chrome changed"
     rule the PROGRESS signatures already live under."""
     from d_brain.services.tmux_parse import is_working_progressing
@@ -865,7 +865,7 @@ def test_unmarked_reset_banner_none_when_banner_has_no_time():
 
 # ── reset_epoch: shared anchoring math for watchdog + cron_runner ────────
 #
-# agent-infra-backlog item 23: the cron pane's own recovery (cron_runner
+# agent-infra: the cron pane's own recovery (cron_runner
 # .CronRunner._limit_recovery) needs the exact same "bare wall-clock time →
 # instant" anchoring watchdog._reset_deadline already had, so this helper is
 # the one implementation both callers delegate to.
@@ -879,7 +879,7 @@ def _epoch(day: str, hhmm: str) -> float:
 
 def test_reset_epoch_real_incident_banner_has_no_utc_marker_returns_none():
     """The REAL banner that caused the 2026-08-28 6-day cron deadlock
-    (agent-infra-backlog item 23): "resets 4am (Europe/Amsterdam)" — a
+: "resets 4am (Europe/Amsterdam)" — a
     timezone name, not the "(UTC)"/"UTC" marker parse_reset_time requires
     on the same line. This is not a hypothetical fixture; it's the literal
     text captured live off the parked pane. reset_epoch must return None
@@ -1036,7 +1036,7 @@ def test_extract_reply_delivers_an_unwrapped_paragraph():
     assert body is not None and "\n" not in body
 
 
-# ── is_main_turn_active / main_turn_finished (backlog item 10, 2026-08-21) ─
+# ── is_main_turn_active / main_turn_finished (-08-21) ─
 #
 # ask()'s stall loop never escapes when a background-agent list row is on
 # screen — is_working()/is_working_progressing() are (correctly) True
@@ -1050,7 +1050,7 @@ _FOOTER_LINE = "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
 # real summary lines in ~/.dbrain/pane.log: Worked 53, Brewed 42, Baked 39,
 # Cooked 34, Crunched 33, Churned 31, Cogitated 26. A fixture hardcoding only
 # "Worked for" encodes the same idealisation the production bug was hiding
-# behind (backlog item 12) — every test below that depends on the
+# behind — every test below that depends on the
 # turn-summary line is parametrized over all seven measured verbs.
 _SUMMARY_VERBS = (
     "Worked",
@@ -1136,7 +1136,7 @@ def test_main_turn_finished_false_on_pure_absence_without_positive_signal():
     assert main_turn_finished(pane) is False
 
 
-# ── extract_open_reply (backlog item 10, salvage extraction) ──────────────
+# ── extract_open_reply (salvage extraction) ──────────────
 
 _BOX_RULE = "─" * 20
 
@@ -1253,7 +1253,7 @@ def test_extract_open_reply_ignores_the_marker_instruction_echo():
     assert extract_open_reply(pane, rid) == "Real salvaged answer."
 
 
-# ── golden fixture (backlog item 12, T3): a hand-constructed but
+# ── golden fixture (T3): a hand-constructed but
 # byte-faithful reconstruction of a real incident pane shape — a long
 # (~239-line) reply transcript ending at a turn-summary line with NO closing
 # marker, followed by the real 11-line bottom chrome (box rule, agent rows,
@@ -1496,7 +1496,7 @@ def test_turn_auth_error_not_under_wrapped_or_nested_tool_headers():
     assert not turn_auth_error(model_after, "ab12")
 
 
-# ── foreign view (agent-infra-backlog item 28, 2026-09-19) ─────────────────
+# ── foreign view (agent-infra, 2026-09-19) ─────────────────
 #
 # Frames transcribed from ~/.dbrain/pane.log: the main pane switched to the
 # background task `night-second-brain` via the "← N agents" view. It still
@@ -1824,7 +1824,7 @@ def test_real_single_column_captures_detect_no_column():
         assert strip_right_column(frame) == frame
 
 
-# ── main_area_working (the salvage safety net, backlog item 32) ───────────
+# ── main_area_working (the salvage safety net) ─────────────────────────────
 
 _MAW_BOX = "─" * 80
 _MAW_FOOTER = (
@@ -1876,7 +1876,7 @@ def test_main_area_working_ignores_agent_rows_drawn_above_the_footer():
 
 def test_main_area_working_ignores_the_footers_own_esc_to_interrupt():
     """99.6% of real "esc to interrupt" occurrences are the persistent
-    footer with the main turn long finished (backlog item 12)."""
+    footer with the main turn long finished."""
     pane = f"⏺ some reply text\n{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
     assert main_area_working(pane) is False
 
