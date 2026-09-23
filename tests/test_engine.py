@@ -105,8 +105,12 @@ def _expected_kwargs(settings, *, session_name, runtime_dir):
         mcp_config=None,  # mcp-config.json does not exist under tmp_path
         system_prompt_file=settings.project_root / "deploy" / "brain-system.md",
         model=settings.claude_model or None,
-        transcript_shadow_mode=settings.transcript_shadow_mode,
         tmux_config=None,  # deploy/tmux.conf does not exist under tmp_path
+        # Pane geometry became settable 2026-09-20; the defaults are the
+        # values that used to be hardcoded in claude_session.py, so the
+        # session this builds is still the pre-seam one.
+        pane_width=settings.pane_width,
+        pane_height=settings.pane_height,
     )
 
 

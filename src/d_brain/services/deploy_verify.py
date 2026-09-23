@@ -52,10 +52,22 @@ DELIVERY_CRITICAL_PATHS = (
     "src/d_brain/services/delivery_guard.py",
     "src/d_brain/services/runtime.py",
     "src/d_brain/services/long_run.py",
+    # The durable-delivery modules (backlog item 33). A reply now lives in
+    # the outbox, an incoming message in the inbox, a message waiting for a
+    # busy session in the chat queue, and the stop decides which of them
+    # survives a restart — a bug in any of them is a lost message that no
+    # unit test sees, which is this list's whole criterion.
+    "src/d_brain/services/outbox.py",
+    "src/d_brain/services/inbox.py",
+    "src/d_brain/services/chat_queue.py",
+    "src/d_brain/services/shutdown.py",
     "src/d_brain/bot/handlers/chat.py",
     "src/d_brain/bot/formatters.py",
     "src/d_brain/bot/main.py",
     "deploy/dbrain-bot.service",
+    # The unit that is actually live on this server (the --user one above is
+    # the legacy fallback); its TimeoutStopSec is what bounds the stop.
+    "deploy/systemd/dbrain-bot@.service",
     "deploy/dbrain-watchdog.service",
     "deploy/brain-system.md",
 )

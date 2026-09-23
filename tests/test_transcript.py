@@ -6,11 +6,12 @@ df4f87ef, 9dd35326): `<<<R:id>>>` + text + end of message, no `<<<E:id>>>`.
 """
 
 import json
+import re
 from pathlib import Path
 
 from d_brain.services.transcript import (
+    ReplyTail,
     TranscriptTail,
-    extract_reply_from_record,
     latest_context_tokens,
     latest_reply,
     transcript_path,
@@ -40,70 +41,269 @@ def _assistant_record(
 # ── transcript_path ───────────────────────────────────────────────────────
 
 
-def test_transcript_path_slug_convention(tmp_path):
+def test_transcript_path_slug_convention(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     work_dir = tmp_path / "some" / "vault"
     work_dir.mkdir(parents=True)
     p = transcript_path(work_dir, "abc-123")
-    slug = str(work_dir.resolve()).replace("/", "-")
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(work_dir.resolve()))
     assert p == Path.home() / ".claude" / "projects" / slug / "abc-123.jsonl"
 
 
-# ── extract_reply_from_record ────────────────────────────────────────────
+def test_transcript_path_replaces_every_non_alphanumeric_char(tmp_path, monkeypatch):
+    """Live-verified 2026-09-22: `_` and `.` become `-` too, not just `/`.
+    A cwd like /tmp/x_y/.claude used to resolve to a directory that simply
+    does not exist — and with the reply read from this file, that is a total
+    delivery failure, not a degraded diagnostic."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    work_dir = tmp_path / "dbrain-smoke-tfgw_84x" / "work"
+    work_dir.mkdir(parents=True)
+    p = transcript_path(work_dir, "abc-123")
+    assert "_" not in p.parent.name
+    assert p.parent.name.endswith("-dbrain-smoke-tfgw-84x-work")
 
 
-def test_extract_reply_from_record_closed_pair():
-    rec = _assistant_record("<<<R:rid1>>>\nHello there.\n<<<E:rid1>>>\n")
-    reply = extract_reply_from_record(rec, "rid1")
+def test_transcript_path_finds_the_pinned_id_when_the_slug_is_wrong(
+    tmp_path, monkeypatch
+):
+    """Belt and braces for a future slug-rule change: the session id is a
+    UUID, so if the computed directory holds nothing, the file named after
+    the pinned id is looked up wherever it actually is."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    work_dir = tmp_path / "vault"
+    work_dir.mkdir()
+    elsewhere = home / ".claude" / "projects" / "some-other-slug"
+    elsewhere.mkdir(parents=True)
+    real = elsewhere / "abc-123.jsonl"
+    real.write_text("")
+    assert transcript_path(work_dir, "abc-123") == real
+
+
+def test_transcript_path_falls_back_to_the_computed_path_when_nothing_exists(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    work_dir = tmp_path / "vault"
+    work_dir.mkdir()
+    p = transcript_path(work_dir, "abc-123")
+    assert p.name == "abc-123.jsonl" and not p.exists()
+
+
+# ── ReplyTail (THE reply source, backlog item 32) ─────────────────────────
+
+
+def _append(path: Path, *records: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
+
+
+def _tail(tmp_path, rid: str = "rid1") -> tuple[ReplyTail, Path]:
+    """A ReplyTail anchored at the end of an empty transcript — exactly how
+    ask() opens one just before typing the prompt."""
+    path = tmp_path / "session.jsonl"
+    path.write_text("")
+    return ReplyTail(path, rid), path
+
+
+def test_reply_tail_closed_pair(tmp_path):
+    tail, path = _tail(tmp_path)
+    _append(path, _assistant_record("<<<R:rid1>>>\nHello there.\n<<<E:rid1>>>\n"))
+    reply = tail.poll()
     assert reply is not None
     assert reply.closed is True
     assert reply.body == "Hello there."
 
 
-def test_extract_reply_from_record_open_span_no_closing_marker():
+def test_reply_tail_open_span_no_closing_marker(tmp_path):
     """The real shape of the three named incidents (bfbe3335, df4f87ef,
     9dd35326): <<<R:id>>>, full reply text, end of message, no <<<E:id>>>."""
-    rec = _assistant_record("<<<R:bfbe3335>>>\nThe full answer text.\nend of turn.")
-    reply = extract_reply_from_record(rec, "bfbe3335")
+    tail, path = _tail(tmp_path, "bfbe3335")
+    _append(path, _assistant_record("<<<R:bfbe3335>>>\nThe full answer text.\nend."))
+    reply = tail.poll()
     assert reply is not None
     assert reply.closed is False
-    assert reply.body == "The full answer text.\nend of turn."
+    assert reply.body == "The full answer text.\nend."
 
 
-def test_extract_reply_from_record_none_for_wrong_rid():
-    rec = _assistant_record("<<<R:rid1>>>\nHello.\n<<<E:rid1>>>\n")
-    assert extract_reply_from_record(rec, "other-rid") is None
+def test_reply_tail_none_for_wrong_rid(tmp_path):
+    tail, path = _tail(tmp_path, "other-rid")
+    _append(path, _assistant_record("<<<R:rid1>>>\nHello.\n<<<E:rid1>>>\n"))
+    assert tail.poll() is None
 
 
-def test_extract_reply_from_record_rejects_sidechain():
+def test_reply_tail_rejects_sidechain(tmp_path):
     """A background subagent's own text must never be mistaken for the main
     turn's reply (explicit audit risk note)."""
-    rec = _assistant_record(
-        "<<<R:rid1>>>\nSubagent text.\n<<<E:rid1>>>\n", is_sidechain=True
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        _assistant_record(
+            "<<<R:rid1>>>\nSubagent text.\n<<<E:rid1>>>\n", is_sidechain=True
+        ),
     )
-    assert extract_reply_from_record(rec, "rid1") is None
+    assert tail.poll() is None
 
 
-def test_extract_reply_from_record_ignores_non_assistant_records():
-    rec = {
-        "type": "user",
-        "message": {"content": "<<<R:rid1>>>\nnot a reply\n<<<E:rid1>>>\n"},
-    }
-    assert extract_reply_from_record(rec, "rid1") is None
+def test_reply_tail_ignores_non_assistant_records(tmp_path):
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        {
+            "type": "user",
+            "message": {"content": "<<<R:rid1>>>\nnot a reply\n<<<E:rid1>>>\n"},
+        },
+    )
+    assert tail.poll() is None
 
 
-def test_extract_reply_from_record_none_when_no_open_marker():
-    rec = _assistant_record("just a normal reply, no markers")
-    assert extract_reply_from_record(rec, "rid1") is None
+def test_reply_tail_none_when_no_open_marker(tmp_path):
+    tail, path = _tail(tmp_path)
+    _append(path, _assistant_record("just a normal reply, no markers"))
+    assert tail.poll() is None
 
 
-def test_extract_reply_from_record_handles_string_content():
-    rec = {
-        "type": "assistant",
-        "isSidechain": False,
-        "message": {"content": "<<<R:rid1>>>\nplain string content\n<<<E:rid1>>>\n"},
-    }
-    reply = extract_reply_from_record(rec, "rid1")
+def test_reply_tail_handles_string_content(tmp_path):
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        {
+            "type": "assistant",
+            "isSidechain": False,
+            "message": {
+                "content": "<<<R:rid1>>>\nplain string content\n<<<E:rid1>>>\n"
+            },
+        },
+    )
+    reply = tail.poll()
     assert reply is not None and reply.body == "plain string content"
+
+
+def test_reply_tail_joins_a_pair_split_across_records(tmp_path):
+    """The model opened the pair, stopped to call a tool (which closes the
+    assistant record), then finished. Both halves must be joined, or a
+    perfectly complete reply reads as 'still open'."""
+    tail, path = _tail(tmp_path)
+    _append(path, _assistant_record("<<<R:rid1>>>\nFirst half."))
+    assert tail.poll().closed is False
+    _append(
+        path,
+        {"type": "user", "message": {"content": "tool result"}},
+        _assistant_record("Second half.\n<<<E:rid1>>>"),
+    )
+    reply = tail.poll()
+    assert reply.closed is True
+    assert reply.body == "First half.\nSecond half."
+
+
+def test_reply_tail_ignores_text_written_before_the_anchor(tmp_path):
+    """Anchored at send time: an earlier turn's records are invisible even
+    when they carry (impossibly) the same rid."""
+    path = tmp_path / "session.jsonl"
+    path.write_text("")
+    _append(path, _assistant_record("<<<R:rid1>>>\nOld answer.\n<<<E:rid1>>>"))
+    tail = ReplyTail(path, "rid1")
+    assert tail.poll() is None
+    _append(path, _assistant_record("<<<R:rid1>>>\nNew answer.\n<<<E:rid1>>>"))
+    assert tail.poll().body == "New answer."
+
+
+def test_reply_tail_skips_synthetic_records(tmp_path):
+    """Claude Code's own meta entries (compaction notices) are not the model
+    talking and must never be spliced into a delivered reply."""
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        _assistant_record("<<<R:rid1>>>\nReal answer."),
+        _assistant_record("Compacted conversation.", model="<synthetic>"),
+        _assistant_record("<<<E:rid1>>>"),
+    )
+    reply = tail.poll()
+    assert reply.closed is True
+    assert reply.body == "Real answer."
+
+
+def test_reply_tail_takes_the_newest_pair_when_a_turn_emits_two(tmp_path):
+    """Documented rule: last open marker, first close after it — the newest
+    complete answer, never a splice of both."""
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        _assistant_record(
+            "<<<R:rid1>>>\nfirst answer\n<<<E:rid1>>>\n"
+            "<<<R:rid1>>>\nsecond answer\n<<<E:rid1>>>"
+        ),
+    )
+    reply = tail.poll()
+    assert reply.closed is True
+    assert reply.body == "second answer"
+
+
+def test_reply_tail_ignores_markers_inside_a_thinking_block(tmp_path):
+    """Only `text` blocks are the model talking to the user."""
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        {
+            "type": "assistant",
+            "isSidechain": False,
+            "message": {
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "<<<R:rid1>>>\nnot the answer\n<<<E:rid1>>>",
+                    }
+                ]
+            },
+        },
+    )
+    assert tail.poll() is None
+
+
+def test_reply_tail_skips_a_record_whose_message_is_not_a_dict(tmp_path):
+    """Schema drift must be skipped, never raised out of a live turn."""
+    tail, path = _tail(tmp_path)
+    _append(
+        path,
+        {"type": "assistant", "isSidechain": False, "message": "surprise"},
+        _assistant_record("<<<R:rid1>>>\nGood.\n<<<E:rid1>>>"),
+    )
+    assert tail.poll().body == "Good."
+
+
+def test_reply_tail_reports_an_opening_marker_with_an_empty_body(tmp_path):
+    """`saw_open` must not hinge on the reply being non-empty: the caller
+    uses it to say whether the model started answering at all."""
+    tail, path = _tail(tmp_path)
+    _append(path, _assistant_record("<<<R:rid1>>>"))
+    assert tail.poll() is None
+    assert tail.saw_open is True
+
+
+def test_reply_tail_survives_a_missing_file(tmp_path):
+    tail = ReplyTail(tmp_path / "nope.jsonl", "rid1")
+    assert tail.poll() is None
+
+
+def test_reply_tail_skips_malformed_lines(tmp_path):
+    tail, path = _tail(tmp_path)
+    with path.open("a", encoding="utf-8") as f:
+        f.write("{not json at all\n")
+    _append(path, _assistant_record("<<<R:rid1>>>\nGood.\n<<<E:rid1>>>"))
+    assert tail.poll().body == "Good."
+
+
+def test_reply_tail_never_returns_a_partially_written_line(tmp_path):
+    """A record still being appended must not be parsed half-written."""
+    tail, path = _tail(tmp_path)
+    rec = json.dumps(_assistant_record("<<<R:rid1>>>\nDone.\n<<<E:rid1>>>"))
+    with path.open("a", encoding="utf-8") as f:
+        f.write(rec[: len(rec) // 2])  # no trailing newline yet
+    assert tail.poll() is None
+    with path.open("a", encoding="utf-8") as f:
+        f.write(rec[len(rec) // 2 :] + "\n")
+    assert tail.poll().body == "Done."
 
 
 # ── TranscriptTail ────────────────────────────────────────────────────────

@@ -96,6 +96,19 @@ def _runner(store, session, *, deliver=None, alert=None, clock=None, **over):
 # ── ticker semantics ─────────────────────────────────────────────────
 
 
+async def test_tick_alerts_cron_session_notices(tmp_path):
+    """The watchdog only watches the main brain; a parked cron pane
+    (agent-infra-backlog item 28) is announced by the cron loop itself."""
+    sess = FakeSession()
+    pending = ["⚠️ кроновая сессия <x> отложена"]
+    sess.pop_notices = lambda: [pending.pop()] if pending else []
+    alert = Recorder()
+    runner = _runner(_store(tmp_path), sess, alert=alert)
+    await runner.tick()
+    await runner.tick()
+    assert alert.calls == [("⚠️ кроновая сессия &lt;x&gt; отложена",)]
+
+
 async def test_due_job_runs_and_delivers(tmp_path):
     store = _store(tmp_path)
     _add_job(store, "j1")

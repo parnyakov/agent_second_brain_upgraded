@@ -2,8 +2,13 @@
 
 import asyncio
 import html
+import logging
 import re
 from typing import Any
+
+from d_brain.services import outbox
+
+logger = logging.getLogger(__name__)
 
 # Allowed HTML tags in Telegram
 ALLOWED_TAGS = {"b", "i", "code", "pre", "a", "s", "u"}
@@ -216,22 +221,69 @@ def format_empty_daily() -> str:
 MAX_RESPONSE_LENGTH = 4096
 
 
-async def send_response(bot: Any, chat_id: int, text: str) -> None:
-    """Send a Claude reply: sanitize HTML, split to 4096-char chunks,
-    fall back to plain text when Telegram rejects the markup."""
+async def send_response(
+    bot: Any, chat_id: int, text: str, *, reply_to: int | None = None
+) -> None:
+    """Deliver a Claude reply: sanitize HTML, split to 4096-char chunks,
+    then hand every chunk to the durable outbox and drain it right away.
+
+    ``reply_to`` threads the answer under the message it answers — used by
+    the per-chat queue (item 33 step 5), where the question may be many
+    minutes old by the time this runs. Only the FIRST chunk carries it: a
+    long answer should look like one reply, not like five quotes of the same
+    line. Never load-bearing — see ``outbox.send_one``.
+
+    The queue-then-send order is the whole point (2026-09-22): the reply is
+    on disk before the first API call, so a network blip, a 429 or the
+    process dying mid-send no longer turns "ответ родился" into "ответ не
+    дошёл" — the outbox worker retries it, and gives up only into the dead
+    queue where ``/work`` can see it.
+
+    Nothing changes for a healthy reply: the drain happens inline, in this
+    same await, so the message leaves at the same instant it always did.
+    Failures stop propagating, though — a send that did not work is now a
+    queued retry, not an exception for the caller to apologize about.
+
+    Outside the bot process (unit tests, one-off scripts) there is no
+    runtime dir to queue into, so the chunks go out through the same
+    ``send_one`` directly — one sending function either way, just nothing
+    on disk behind it. A queue that cannot be WRITTEN takes the same route:
+    durability is an upgrade over sending, never a precondition for it
+    (blind review B2 — a full disk used to mean the reply was lost before a
+    single byte reached Telegram, which is the exact failure this feature
+    exists to prevent).
+    """
     sanitized = sanitize_telegram_html(text)
     if not validate_telegram_html(sanitized):
         sanitized = html.escape(text)
 
     chunks = split_text(sanitized, MAX_RESPONSE_LENGTH)
-    for i, chunk in enumerate(chunks):
+
+    head = int(reply_to or 0)
+    box = outbox.current()
+    queued = 0
+    if box is not None:
         try:
-            await bot.send_message(chat_id, chunk)
-        except Exception:
-            # Fallback: send without HTML
-            await bot.send_message(chat_id, chunk, parse_mode=None)
-        if i < len(chunks) - 1:
-            await asyncio.sleep(0.3)
+            for chunk in chunks:
+                box.enqueue(chat_id, chunk, reply_to=head if queued == 0 else 0)
+                queued += 1
+        except OSError:
+            logger.exception(
+                "outbox: could not queue %d of %d chunks — sending the rest "
+                "straight out",
+                len(chunks) - queued,
+                len(chunks),
+            )
+        # Whatever DID get queued goes out first, so the chunks the fallback
+        # below sends still land after the ones they follow.
+        await outbox.drain(bot, box)
+
+    for i, chunk in enumerate(chunks[queued:]):
+        await outbox.send_one(
+            bot, chat_id, chunk, reply_to=head if queued == 0 and i == 0 else 0
+        )
+        if i < len(chunks) - queued - 1:
+            await asyncio.sleep(outbox.SEND_SPACING)
 
 
 def split_text(text: str, max_len: int) -> list[str]:

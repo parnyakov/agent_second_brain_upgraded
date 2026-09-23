@@ -8,6 +8,7 @@ and stall detection are deterministic and fast.
 
 import json
 import logging
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -25,7 +26,13 @@ from d_brain.services.claude_session import (
     AskResult,
     ClaudeSession,
 )
-from d_brain.services.tmux_parse import is_main_turn_active
+from d_brain.services.tmux_parse import (
+    extract_open_reply,
+    extract_reply,
+    is_main_turn_active,
+    open_reply_rids,
+    reply_rids,
+)
 
 READY = (
     "────────────────────\n❯\n────────────────────\n"
@@ -56,7 +63,17 @@ def _inline_echo(rid: str) -> str:
 
 
 class FakeTmux:
-    """Callable stand-in for subprocess.run over `tmux ...`."""
+    """Callable stand-in for subprocess.run over `tmux ...`.
+
+    Also MIRRORS the pane into the session's JSONL transcript: whatever reply
+    (complete pair or unterminated span) a scripted capture shows, the model
+    demonstrably said — so the transcript Claude Code writes has it too. That
+    invariant is what lets the existing pane-shaped fixtures keep describing
+    real turns now that ask() reads the reply from the transcript instead of
+    the screen (backlog item 32). Tests for the case the two DISAGREE — a
+    reply too long for the capture window, the exact bug this change fixes —
+    write the transcript themselves and leave the pane without it.
+    """
 
     def __init__(
         self,
@@ -71,6 +88,57 @@ class FakeTmux:
         # the default is already the wanted geometry, so tests that don't care
         # see no resize traffic.
         self.window_size = window_size
+        # Set by the autouse _mirror_pane_into_transcript fixture below.
+        self.session = None
+        self.mirror_enabled = True
+        self._mirrored: set[tuple[str, bool, str]] = set()
+        # Mirroring starts only once a prompt has actually been pasted into
+        # the pane: the model cannot have answered a prompt it has not been
+        # given, and a fixture that shows a finished reply in its PRE-send
+        # frame would otherwise put that reply in the transcript ahead of the
+        # turn's anchor — where a live turn could never find it either.
+        self._armed = False
+
+    def _mirror(self, pane: str) -> None:
+        """Append to the transcript whatever reply the pane is showing."""
+        if self.session is None or not self.mirror_enabled or not self._armed:
+            return
+        if not pane:
+            return
+        path = self.session.current_transcript_path()
+        if path is None:
+            return
+        found: list[tuple[str, bool, str]] = []
+        for rid in sorted(reply_rids(pane)):
+            body = extract_reply(pane, rid)
+            if body is not None:
+                found.append((rid, True, body))
+        for rid in sorted(open_reply_rids(pane)):
+            body = extract_open_reply(pane, rid)
+            if body is not None:
+                found.append((rid, False, body))
+        for key in found:
+            if key in self._mirrored:
+                continue
+            self._mirrored.add(key)
+            rid, closed, body = key
+            text = (
+                f"<<<R:{rid}>>>\n{body}\n<<<E:{rid}>>>"
+                if closed
+                else f"<<<R:{rid}>>>\n{body}"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "isSidechain": False,
+                            "message": {"content": [{"type": "text", "text": text}]},
+                        }
+                    )
+                    + "\n"
+                )
 
     @staticmethod
     def _subcommand(args: list[str]) -> str:
@@ -93,12 +161,15 @@ class FakeTmux:
             self.exists = True
         elif sub == "display-message":
             out = self.window_size + "\n"
+        elif sub == "paste-buffer":
+            self._armed = True
         elif sub == "capture-pane":
             out = (
                 self._captures.pop(0)
                 if len(self._captures) > 1
                 else (self._captures[0] if self._captures else "")
             )
+            self._mirror(out)
         return subprocess.CompletedProcess(args, rc, stdout=out, stderr="")
 
     def sent_subcommands(self) -> list[str]:
@@ -114,6 +185,44 @@ class FakeTmux:
 @pytest.fixture
 def clock():
     return {"now": 0.0}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """transcript_path() resolves under ``~``; keep every test's transcript
+    inside its own tmp dir (and out of the real home)."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+
+
+@pytest.fixture(autouse=True)
+def _mirror_pane_into_transcript(monkeypatch):
+    """Wire every ClaudeSession built in this module to its FakeTmux.
+
+    ask() reads the reply from the session transcript (backlog item 32), so a
+    pane-only fixture would describe a turn that never answered. Rather than
+    restate every scripted pane as a JSONL fixture, the fake keeps the two in
+    sync (see FakeTmux._mirror) — and a session id is pinned so there IS a
+    transcript path to write to, exactly as a live session has one.
+    """
+    original = ClaudeSession.__init__
+
+    def patched(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        runner = getattr(self, "_runner", None)
+        if isinstance(runner, FakeTmux):
+            runner.session = self
+            # A session that already exists never re-pins an id (that only
+            # happens when a `claude` process is actually started), so give
+            # it the pin a live one would already have. A session the test
+            # lets the code create gets its real pinned id from
+            # _new_session_id(), and must keep looking un-pinned until then.
+            sid_file = self.runtime_dir / "session_id"
+            if runner.exists and not sid_file.exists():
+                sid_file.write_text("test-sid\n")
+
+    monkeypatch.setattr(ClaudeSession, "__init__", patched)
 
 
 def make_session(
@@ -225,6 +334,49 @@ def test_new_session_pins_session_id_via_session_id_flag(tmp_path, clock):
     assert f"--session-id {sid}" in start_command
 
 
+def test_pane_geometry_defaults_to_the_previously_hardcoded_200x50(tmp_path, clock):
+    fake = FakeTmux([READY], exists=False)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    call = next(c for c in fake.calls if len(c) > 1 and c[1] == "new-session")
+    assert call[call.index("-x") + 1] == "200"
+    assert call[call.index("-y") + 1] == "50"
+
+
+def test_pane_geometry_is_configurable_for_both_create_and_resize(tmp_path, clock):
+    """The immediate mitigation for the 2026-09-20 two-column incident: an
+    instance can be moved onto a narrower pane without a code change. It has
+    to reach BOTH tmux paths — `new-session -x/-y` only sizes the pane at
+    birth, and an existing session is only ever resized by _enforce_geometry."""
+    fake = FakeTmux([READY], exists=False, window_size="200x50")
+    s = ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / ".dbrain",
+        runner=fake,
+        sleep_fn=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        clock_fn=lambda: clock["now"],
+        rid_factory=lambda: "rid00001",
+        poll_interval=1.0,
+        startup_timeout=30.0,
+        stall_timeout=10.0,
+        pane_width=160,
+        pane_height=50,
+    )
+    s.ensure_session()
+    call = next(c for c in fake.calls if len(c) > 1 and c[1] == "new-session")
+    assert call[call.index("-x") + 1] == "160"
+    assert call[call.index("-y") + 1] == "50"
+
+    # Now the same session already exists at the OLD size: it must be resized.
+    fake.exists = True
+    fake.calls.clear()
+    s.ensure_session()
+    resize = next(c for c in fake.calls if len(c) > 1 and c[1] == "resize-window")
+    assert resize[resize.index("-x") + 1] == "160"
+    assert resize[resize.index("-y") + 1] == "50"
+
+
 def test_history_limit_is_set_globally_before_new_session(tmp_path, clock):
     """R4 fix: history-limit must be applied via `-g` BEFORE `new-session` —
     the previous per-session `-t` call AFTER new-session was a verified
@@ -234,13 +386,9 @@ def test_history_limit_is_set_globally_before_new_session(tmp_path, clock):
     s.ensure_session()
     calls = [c for c in fake.calls if len(c) > 1 and c[0] == "tmux"]
     set_opt_idx = next(
-        i
-        for i, c in enumerate(calls)
-        if c[1] == "set-option" and "history-limit" in c
+        i for i, c in enumerate(calls) if c[1] == "set-option" and "history-limit" in c
     )
-    new_session_idx = next(
-        i for i, c in enumerate(calls) if "new-session" in c
-    )
+    new_session_idx = next(i for i, c in enumerate(calls) if "new-session" in c)
     assert set_opt_idx < new_session_idx
     assert "-g" in calls[set_opt_idx]
 
@@ -447,146 +595,6 @@ def test_send_control_non_clear_does_not_resync(tmp_path, clock, monkeypatch):
     assert (tmp_path / ".dbrain" / "session_id").read_text().strip() == "old-id"
 
 
-# ── R1 shadow mode (diagnostic-only, Fable audit) ─────────────────────────
-
-
-def _shadow_record(rid: str, text: str, *, is_sidechain: bool = False) -> str:
-    import json
-
-    return (
-        json.dumps(
-            {
-                "type": "assistant",
-                "isSidechain": is_sidechain,
-                "message": {"content": [{"type": "text", "text": text}]},
-            }
-        )
-        + "\n"
-    )
-
-
-def _make_shadow_session(
-    tmp_path, fake, clock, rid, transcript_file, monkeypatch, **kw
-):
-    from d_brain.services.transcript import TranscriptTail
-
-    monkeypatch.setattr(
-        "d_brain.services.claude_session.transcript_path",
-        lambda work_dir, sid: transcript_file,
-    )
-    # Anchor the tail at the START of the (pre-written) fixture file rather
-    # than its real end — lets a test pre-seed the exact record ask() should
-    # see without racing real file-append timing inside a synchronous call.
-    monkeypatch.setattr(TranscriptTail, "at_end", classmethod(lambda cls, p: cls(p)))
-    (tmp_path / ".dbrain").mkdir(parents=True, exist_ok=True)
-    (tmp_path / ".dbrain" / "session_id").write_text("sid-1\n")
-    return ClaudeSession(
-        session_name="dbrain_test",
-        work_dir=tmp_path / "vault",
-        runtime_dir=tmp_path / ".dbrain",
-        runner=fake,
-        sleep_fn=lambda secs: clock.__setitem__("now", clock["now"] + secs),
-        clock_fn=lambda: clock["now"],
-        rid_factory=lambda: rid,
-        poll_interval=1.0,
-        startup_timeout=30.0,
-        transcript_shadow_mode=True,
-        **kw,
-    )
-
-
-def test_shadow_mode_logs_agreement_between_panel_and_transcript(
-    tmp_path, clock, caplog, monkeypatch
-):
-    rid = "shadow01"
-    transcript_file = tmp_path / "shadow.jsonl"
-    transcript_file.write_text(
-        _shadow_record(rid, f"<<<R:{rid}>>>\nHello world\n<<<E:{rid}>>>\n")
-    )
-    fake = FakeTmux([READY, _complete(rid, "Hello world")], exists=True)
-    s = _make_shadow_session(tmp_path, fake, clock, rid, transcript_file, monkeypatch)
-    with caplog.at_level(logging.INFO):
-        res = s.ask("ping", timeout=60)
-    assert res.status == "ok"
-    assert any(
-        "shadow mode: panel and transcript agree" in r.message for r in caplog.records
-    )
-
-
-def test_shadow_mode_logs_mismatch_when_text_differs(
-    tmp_path, clock, caplog, monkeypatch
-):
-    rid = "shadow02"
-    transcript_file = tmp_path / "shadow.jsonl"
-    transcript_file.write_text(
-        _shadow_record(
-            rid, f"<<<R:{rid}>>>\nDifferent transcript text\n<<<E:{rid}>>>\n"
-        )
-    )
-    fake = FakeTmux([READY, _complete(rid, "Panel text")], exists=True)
-    s = _make_shadow_session(tmp_path, fake, clock, rid, transcript_file, monkeypatch)
-    with caplog.at_level(logging.WARNING):
-        res = s.ask("ping", timeout=60)
-    assert res.status == "ok"
-    assert res.reply == "Panel text"  # shadow mode NEVER changes delivery
-    assert any(
-        "shadow mode: panel/transcript MISMATCH" in r.message for r in caplog.records
-    )
-
-
-def test_shadow_mode_rejects_sidechain_records(tmp_path, clock, caplog, monkeypatch):
-    """A background subagent's own text (isSidechain) must never be treated
-    as a match, even if it happens to carry the same rid/text."""
-    rid = "shadow03"
-    transcript_file = tmp_path / "shadow.jsonl"
-    transcript_file.write_text(
-        _shadow_record(
-            rid, f"<<<R:{rid}>>>\nHello world\n<<<E:{rid}>>>\n", is_sidechain=True
-        )
-    )
-    fake = FakeTmux([READY, _complete(rid, "Hello world")], exists=True)
-    s = _make_shadow_session(tmp_path, fake, clock, rid, transcript_file, monkeypatch)
-    with caplog.at_level(logging.WARNING):
-        s.ask("ping", timeout=60)
-    assert any(
-        "transcript path found no matching record" in r.message for r in caplog.records
-    )
-
-
-def test_shadow_mode_logs_consistent_f2_when_neither_side_has_a_marker(
-    tmp_path, clock, caplog, monkeypatch
-):
-    """R1 step 4: when the panel shows no R marker at all (F2) AND the
-    transcript shows none either, log this distinctly as 'consistent with
-    F2 (nothing to compare)' rather than a mismatch warning."""
-    rid = "shadow04"
-    transcript_file = tmp_path / "shadow.jsonl"
-    transcript_file.write_text("")
-    pane = (
-        "Worked for 2m 22s · 0 background tasks still running\n"
-        f"{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
-    )
-    fake = FakeTmux([READY, pane], exists=True)
-    s = _make_shadow_session(
-        tmp_path,
-        fake,
-        clock,
-        rid,
-        transcript_file,
-        monkeypatch,
-        no_main_turn_ceiling=5.0,
-        salvage_stable=5.0,
-        stall_timeout=1e6,
-    )
-    with caplog.at_level(logging.INFO):
-        res = s.ask("ping", timeout=20)
-    assert res.status == "timeout"
-    assert any(
-        "consistent with the F2 class" in r.message for r in caplog.records
-    )
-
-
 # ── sending (buffer) ─────────────────────────────────────────────────────
 
 
@@ -665,9 +673,7 @@ def test_ask_detects_rate_limit_without_hanging(tmp_path, clock):
     assert not res.ok
 
 
-def test_ask_ignores_a_transient_rate_limit_looking_frame_before_send(
-    tmp_path, clock
-):
+def test_ask_ignores_a_transient_rate_limit_looking_frame_before_send(tmp_path, clock):
     """2026-08-20 review, reproduced live: raw tool output (Read/grep/cat) or
     an open, unterminated marker span is never stripped by
     strip_reply_bodies(), so a single poll landing on text that merely
@@ -708,9 +714,7 @@ def test_ask_returns_rate_limited_once_it_persists_after_send(tmp_path, clock):
     assert res.status == "rate_limited"
 
 
-def test_ask_rate_limit_streak_resets_on_a_transient_mid_turn_frame(
-    tmp_path, clock
-):
+def test_ask_rate_limit_streak_resets_on_a_transient_mid_turn_frame(tmp_path, clock):
     """A single RATE-looking poll mid-turn that then reverts must not add up
     with an unrelated later occurrence — the streak counts CONSECUTIVE polls
     only."""
@@ -1096,8 +1100,6 @@ def test_kill_sends_kill_session(tmp_path, clock):
     assert "kill-session" in fake.sent_subcommands()
 
 
-
-
 # ── optional markers (wrap=False) + idle-based completion ──────────────────
 
 
@@ -1261,29 +1263,29 @@ def test_is_steerable_turn_distinguishes_chat_from_maintenance(tmp_path, clock):
         fh.close()
 
 
-def test_inflight_claimed_before_session_startup(tmp_path, clock):
+@pytest.mark.parametrize("request_id", ["maint-process", "chat-0001"])
+def test_inflight_claimed_before_session_startup(tmp_path, clock, request_id):
     # A stale inflight left by a timed-out chat turn must not misrepresent
     # the new holder to the steering gate while session startup (up to
-    # startup_timeout) is still running.
+    # startup_timeout) is still running — and the claim itself is a maint
+    # placeholder even for a chat turn: nothing of ours is in the pane yet.
     inflight = tmp_path / ".dbrain" / "inflight"
     seen = {}
 
     class Spy(FakeTmux):
         def __call__(self, args, **kwargs):  # noqa: ANN001
             if len(args) > 1 and args[1] == "new-session":
-                seen["at_startup"] = (
-                    inflight.read_text() if inflight.exists() else None
-                )
+                seen["at_startup"] = inflight.read_text() if inflight.exists() else None
             return super().__call__(args, **kwargs)
 
     fake = Spy([READY, READY, _complete("rid00001")], exists=False)
     s = make_session(tmp_path, fake, clock)
     inflight.write_text("stale-chat-rid\n0.0\n")  # leftover from a timeout
 
-    s.ask("nightly run", request_id="maint-process")
+    s.ask("nightly run", request_id=request_id)
 
     assert seen["at_startup"] is not None
-    assert seen["at_startup"].startswith("maint-process")
+    assert seen["at_startup"].startswith(f"{MAINT_PREFIX}pending-{request_id}\n")
 
 
 def test_ask_dismisses_feedback_survey_instead_of_stalling(tmp_path, clock):
@@ -1294,8 +1296,9 @@ def test_ask_dismisses_feedback_survey_instead_of_stalling(tmp_path, clock):
         "● How is Claude doing this session? (optional)\n"
         "  1: Bad    2: Fine   3: Good   0: Dismiss\n" + READY
     )
+    # The 2nd READY is the post-Enter look at the input box (_confirm_submitted).
     fake = FakeTmux(
-        [READY, survey, THINKING, _complete("rid00001")], exists=True
+        [READY, READY, survey, THINKING, _complete("rid00001")], exists=True
     )
     s = make_session(tmp_path, fake, clock)
     res = s.ask("привет")
@@ -2241,20 +2244,23 @@ def test_salvage_refuses_early_but_ceiling_salvages_when_region_has_a_working_si
     on a live main turn whose spinner is rendered WITHOUT the paren anchor
     _MAIN_SPINNER_RE requires (a real CLI shape, not hypothetical — reviewer
     demonstrated '✢ Razzle-dazzling…  44s · ↓1.8k tokens' with no parens).
-    The FAST 120s salvage path still refuses this (the _WORKING_RE conjunct
-    is a hard gate there — see the ceiling-salvage comment in ask() for why):
-    a TRUNCATED, still-generating reply must never be marked delivered THAT
-    early, since the real full answer would then be permanently blocked by
-    handled_rids.
+    The FAST 120s salvage path still refuses this: a TRUNCATED, still-
+    generating reply must never be marked delivered THAT early, since the
+    real full answer would then be permanently blocked by handled_rids.
 
-    R2b (Fable audit, 2026-08-22) changes what happens AFTER the full
+    Backlog item 32 moved the reply itself to the transcript, so the check
+    that refuses here is no longer `_WORKING_RE` against a scraped pane
+    region but `main_area_working()` against the frame (same scope, same
+    purpose — see that function's docstring).
+
+    R2b (Fable audit, 2026-08-22) governs what happens AFTER the full
     DEFAULT_NO_MAIN_TURN_CEILING with still no closing marker: at that point
     the audit explicitly judges a possibly-truncated delivery better than
-    permanent loss, so ask() now delivers the open span regardless of the
-    working-signature conjunct — this is an ACCEPTED, STATED risk (see the
-    comment in ask()), not an oversight. This fixture — an ambiguous,
-    ultimately-static frame — proves the ceiling reaches that branch and
-    delivers rather than timing out."""
+    permanent loss, so ask() delivers the open span regardless of the
+    working signature — an ACCEPTED, STATED risk (see the comment in ask()),
+    not an oversight. This fixture — an ambiguous, ultimately-static frame —
+    proves the ceiling reaches that branch and delivers rather than timing
+    out."""
     rid = "spin0001"
     pane = (
         f"⏺ <<<R:{rid}>>>\n"
@@ -2283,7 +2289,8 @@ def test_salvage_refuses_early_but_ceiling_salvages_when_region_has_a_working_si
     )
     res = s.ask("please answer", timeout=DEFAULT_TIMEOUT)
 
-    # Ceiling salvage (R2b): delivered, marked salvaged, NOT a bare timeout.
+    # Ceiling salvage (R2b): delivered, marked salvaged, NOT a bare timeout —
+    # and NOT at the fast salvage window, which must refuse this frame.
     assert res.status == "ok"
     assert res.salvaged is True
     assert res.reply is not None and "real answer text" in res.reply
@@ -2291,9 +2298,7 @@ def test_salvage_refuses_early_but_ceiling_salvages_when_region_has_a_working_si
     handled = handled_path.read_text().split() if handled_path.exists() else []
     assert rid in handled
     assert (
-        DEFAULT_NO_MAIN_TURN_CEILING
-        <= clock["now"]
-        <= DEFAULT_NO_MAIN_TURN_CEILING + 5
+        DEFAULT_NO_MAIN_TURN_CEILING <= clock["now"] <= DEFAULT_NO_MAIN_TURN_CEILING + 5
     )
     assert not any(c[-1] == "Escape" for c in fake.sent_keys())
     assert not any(c[-1] == "C-c" for c in fake.sent_keys())
@@ -2425,8 +2430,7 @@ def test_ask_salvages_when_only_footer_esc_to_interrupt_present(tmp_path, clock)
     assert res.status == "ok"
     assert res.salvaged is True
     assert (
-        res.reply
-        == "This is the real answer text that never got its closing marker."
+        res.reply == "This is the real answer text that never got its closing marker."
     )
     assert DEFAULT_SALVAGE_STABLE <= clock["now"] <= DEFAULT_SALVAGE_STABLE + 5
 
@@ -2582,9 +2586,7 @@ def test_ask_ceiling_fires_when_no_marker_and_no_main_turn_activity(
     assert res.status == "timeout"
     assert res.detail is not None and "no reply markers ever appeared" in res.detail
     assert (
-        DEFAULT_NO_MAIN_TURN_CEILING
-        <= clock["now"]
-        <= DEFAULT_NO_MAIN_TURN_CEILING + 5
+        DEFAULT_NO_MAIN_TURN_CEILING <= clock["now"] <= DEFAULT_NO_MAIN_TURN_CEILING + 5
     )
     assert not any(c[-1] == "Escape" for c in fake.sent_keys())
     assert not any(c[-1] == "C-c" for c in fake.sent_keys())
@@ -2600,31 +2602,24 @@ def test_ask_ceiling_fires_when_no_marker_and_no_main_turn_activity(
     assert s.pop_orphan_replies() == []
 
 
-def test_ceiling_gives_the_generic_detail_when_r_marker_was_seen_but_lost(
-    tmp_path, clock
+def test_ceiling_gives_the_generic_detail_when_the_transcript_is_lost_mid_turn(
+    tmp_path, clock, caplog
 ):
-    """Distinguishes the two F2-adjacent ceiling outcomes (R2c): when the R
-    marker WAS seen at some point (here: present, then scrolls out of the
-    capture window before the ceiling) the detail stays the pre-existing
-    generic wording, not the "never appeared" honest message — that message
-    is reserved for the case where the marker is truly never seen."""
+    """`/clear` mid-wait re-keys the session: the transcript this turn was
+    being read from stops growing and a reply already seen open in it can no
+    longer be completed or salvaged. The turn must end honestly — the generic
+    "no closing marker" detail, NOT the "markers never appeared" one (the
+    model did start answering) — with the rid left unhandled for the orphan
+    poller, and it must say in the journal that the id changed."""
     rid = "ceil0002"
-    with_marker = (
+    pane = (
         f"⏺ <<<R:{rid}>>>\nsome text\n"
-        f"Worked for 2m 22s · 0 background tasks still running\n"
-        f"{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
-    )
-    without_marker = (
         "Worked for 2m 22s · 0 background tasks still running\n"
         f"{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
         "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
     )
-    # _WORKING_RE would otherwise let the ceiling-salvage branch (R2b) fire
-    # since main_turn_finished is True throughout — but fresh_open is None
-    # once the marker has scrolled out, so it correctly falls through to the
-    # "nothing to salvage" branch this test targets.
-    fake = FakeTmux([READY, with_marker, without_marker], exists=True)
+    # The 2nd READY is the post-Enter look at the input box (_confirm_submitted).
+    fake = FakeTmux([READY, READY, pane], exists=True)
     s = ClaudeSession(
         session_name="dbrain_test",
         work_dir=tmp_path / "vault",
@@ -2639,9 +2634,39 @@ def test_ceiling_gives_the_generic_detail_when_r_marker_was_seen_but_lost(
         salvage_stable=DEFAULT_SALVAGE_STABLE,
         no_main_turn_ceiling=DEFAULT_NO_MAIN_TURN_CEILING,
     )
-    res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
+    # Re-pin the session id the moment the open span has been seen once —
+    # exactly what send_control("/clear") does to a turn already in flight.
+    sid_file = tmp_path / ".dbrain" / "session_id"
+    original_capture = s._capture
+
+    seen = {"n": 0}
+
+    def capture_then_clear():
+        out = original_capture()
+        # One poll later than the frame that first shows the span, so the
+        # turn genuinely observes an open reply before its transcript goes.
+        if f"<<<R:{rid}>>>" in out:
+            seen["n"] += 1
+            if seen["n"] == 3:
+                sid_file.write_text("sid-after-clear\n")
+        return out
+
+    s._capture = capture_then_clear
+
+    with caplog.at_level(logging.ERROR):
+        res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
     assert res.status == "timeout"
     assert res.detail == "no closing marker and no active main turn"
+    assert any("session id changed mid-turn" in r.message for r in caplog.records)
+    # A tail dropped MID-TURN must not fall back to the pane: by then the
+    # screen belongs to a different conversation.
+    assert not any("delivering" in r.message and "PANE" in r.message
+                   for r in caplog.records)
+    handled_path = tmp_path / ".dbrain" / "handled_rids"
+    handled = handled_path.read_text().split() if handled_path.exists() else []
+    assert rid not in handled  # still recoverable by the orphan poller
 
 
 def test_defect_b_idle_pane_with_background_rows_is_not_treated_as_busy_on_presend(
@@ -2705,9 +2730,7 @@ def test_defect_b_pre_send_background_rows_never_set_maintenance_placeholder(
 
     assert res.status == "ok"
     assert seen_inflight_first_lines  # the prompt WAS sent
-    assert all(
-        not line.startswith(MAINT_PREFIX) for line in seen_inflight_first_lines
-    )
+    assert all(not line.startswith(MAINT_PREFIX) for line in seen_inflight_first_lines)
 
 
 # ── last_reply_for_resend (backlog item 14: /resend) ─────────────────────
@@ -2958,3 +2981,1278 @@ def test_start_command_pins_claude_config_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR")
     plain = s._start_command("00000000-0000-0000-0000-000000000000")
     assert "CLAUDE_CONFIG_DIR" not in plain
+
+
+# ── exact tmux addressing (agent-infra-backlog item 28, 2026-09-19) ─────────
+#
+# tmux resolves a bare `-t dbrain_X` by PREFIX. With the main session gone
+# and `dbrain_X_cron` alive, has-session said "exists" and the chat brain
+# silently typed into the cron brain's pane for hours. These tests pin the
+# exact form (`=name:`) on every call, and — with a real, isolated tmux
+# server — that a prefix sibling is never mistaken for the main session.
+
+
+def _t_values(fake: FakeTmux) -> list[str]:
+    return [c[c.index("-t") + 1] for c in fake.calls if "-t" in c]
+
+
+def test_every_tmux_target_is_exact_match(tmp_path, clock):
+    """Create, ask, interrupt, resize, force_recover, kill: no call may
+    address the session by a bare (prefix-matching) name."""
+    rid = "rid00001"
+    fake = FakeTmux([READY, _inline_echo(rid), _complete(rid)], exists=False)
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    s.ensure_session()
+    assert s.ask("ping").status == "ok"
+    s.interrupt()
+    fake.window_size = "80x23"  # force the geometry path (set-option/resize)
+    fake._captures = [READY]
+    s.ensure_session()
+    s.force_recover()
+    s.kill()
+    targets = _t_values(fake)
+    assert targets, "expected tmux calls with -t"
+    assert set(targets) == {"=dbrain_test:"}, targets
+    for sub in (
+        "has-session",
+        "kill-session",
+        "set-option",
+        "resize-window",
+        "display-message",
+        "capture-pane",
+        "send-keys",
+        "paste-buffer",
+        "pipe-pane",
+    ):
+        assert sub in fake.sent_subcommands(), sub
+
+
+def test_new_session_is_named_plainly(tmp_path, clock):
+    """`-s` is a NAME, not a target: `=` there would become part of the name."""
+    fake = FakeTmux([READY], exists=False)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    new = next(c for c in fake.calls if "new-session" in c)
+    assert new[new.index("-s") + 1] == "dbrain_test"
+
+
+_HAS_TMUX = shutil.which("tmux") is not None
+
+
+@pytest.fixture
+def isolated_tmux(tmp_path):
+    """A private tmux server (`-S` socket under tmp_path), so the test never
+    sees or touches the live `dbrain_*` sessions on the default socket."""
+    sock = str(tmp_path / "tmux.sock")
+
+    def run(args, **kwargs):  # noqa: ANN001
+        assert args[0] == "tmux"
+        return subprocess.run(["tmux", "-S", sock, *args[1:]], **kwargs)
+
+    yield run
+    subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+def test_prefix_sibling_is_not_the_main_session_real_tmux(
+    tmp_path, clock, isolated_tmux
+):
+    """The exact incident shape on real tmux: only `<name>_cron` exists."""
+    isolated_tmux(
+        ["tmux", "new-session", "-d", "-s", "dbrain_test_cron", "sleep 600"],
+        capture_output=True,
+        check=True,
+    )
+    # Sanity: the bug is real on this tmux — a bare name prefix-matches.
+    bare = isolated_tmux(
+        ["tmux", "has-session", "-t", "dbrain_test"], capture_output=True
+    )
+    assert bare.returncode == 0
+
+    s = make_session(tmp_path, FakeTmux([READY]), clock)
+    s._runner = isolated_tmux
+    assert s.is_healthy() is False
+
+    # Once the main session really exists, the exact form finds IT, not cron.
+    isolated_tmux(
+        ["tmux", "new-session", "-d", "-s", "dbrain_test", "sleep 600"],
+        capture_output=True,
+        check=True,
+    )
+    assert s.is_healthy() is True
+    name = s._tmux(
+        "display-message", "-p", "-t", s._target, "#{session_name}"
+    ).stdout.strip()
+    assert name == "dbrain_test"
+
+    # kill() takes down the main session only; the cron sibling survives.
+    s.kill()
+    assert s.is_healthy() is False
+    cron = isolated_tmux(
+        ["tmux", "has-session", "-t", "=dbrain_test_cron:"], capture_output=True
+    )
+    assert cron.returncode == 0
+
+
+# ── engine switch Codex → Claude: stale pane in a foreign view ──────────────
+#
+# While the bot ran on Codex the Claude tmux session stayed alive (warm
+# standby) and was used by hand; its TUI was left on the background task
+# `night-second-brain`. On the switch back the bot reused that pane, and all
+# seven prompts timed out with ever_saw_r_marker=False
+# (agent-infra-backlog item 28).
+#
+# Conservative order, each step verified live on Claude Code 2.1.278:
+# 1. a label that is one of the pinned conversation's own titles (/rename)
+#    is the bot's own conversation — untouched;
+# 2. otherwise Left (opens the "← N agents" list) then Escape ("esc returns
+#    to it") brings the pane back to its own conversation — reused;
+# 3. only if that visibly fails is the session parked and the owner told.
+
+_WIDE = "─" * 196
+_AGENTS_FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents"
+
+
+def _box(
+    label: str | None = None, body: str = " ✻ Baked for 1m 12s", draft: str = ""
+) -> str:
+    top = f" {'─' * 150} {label} ─" if label else f" {_WIDE}"
+    return f"{body}\n{top}\n ❯ {draft}\n {_WIDE}\n  {_AGENTS_FOOTER}\n"
+
+
+_FOREIGN = _box("night-second-brain")
+_AGENTS_LIST = (
+    " Needs input\n"
+    " ✻ current session                send a prompt to start      2s\n"
+    " ✻ night-second-brain             send test message           2d\n"
+    f" {_WIDE}\n"
+    " ❯ describe a task for a new session\n"
+    f" {_WIDE}\n"
+    "  ⏵⏵ bypass permissions · enter to open · space to reply · "
+    "ctrl+x to delete · ? for shortcuts\n"
+)
+
+
+def _agents_list_with_draft(draft: str) -> str:
+    """The list with text typed into its input (verified live, 2.1.278): the
+    placeholder is gone and the footer turns into "enter to create · esc to
+    clear" — Escape now only clears the draft, Enter would spawn a task."""
+    return (
+        " Needs input\n"
+        " ✻ night-second-brain             send test message           2d\n"
+        f" {_WIDE}\n"
+        f" ❯ {draft}\n"
+        f" {_WIDE}\n"
+        "  enter to create · esc to clear\n"
+    )
+
+
+class ViewFake(FakeTmux):
+    """A pane whose view reacts to Left/Escape the way Claude Code 2.1.278
+    does (verified live in an isolated tmux server): Left on the input opens
+    the agents list, Escape in the list returns to the session's own
+    conversation. Before the return / a fresh session, captures show the
+    current view; after it, the ordinary FakeTmux capture script plays."""
+
+    def __init__(
+        self,
+        view: str,
+        script: list[str] | None = None,
+        *,
+        foreign_frame: str = _FOREIGN,
+        keys_work: bool = True,
+        rename_rc: int = 0,
+        kill_rc: int = 0,
+        pipe_close_rc: int = 0,
+        sessions: tuple[str, ...] = (),
+        escape_works: bool = True,
+        escape_lag: int = 0,
+        draft: str = "",
+        clear_works: bool = True,
+        clear_steps: list[str] | None = None,
+        first_left_swallowed: bool = False,
+    ) -> None:
+        super().__init__(script or [READY], exists=True)
+        self.view = view  # "foreign" | "list" | "main"
+        self.foreign_frame = foreign_frame
+        self.keys_work = keys_work
+        self.rename_rc, self.kill_rc = rename_rc, kill_rc
+        self.pipe_close_rc = pipe_close_rc
+        self.sessions = ["dbrain_test", *sessions]
+        # Escape swallowed (the list stays) / taking `escape_lag` captures
+        # to show. A draft in the input box: C-k + C-u clear it (when
+        # clear_works); while it is there Left only moves the cursor and
+        # Escape in the list only clears it — all as seen live on 2.1.278.
+        self.escape_works = escape_works
+        self.escape_lag = escape_lag
+        self._escape_pending: int | None = None
+        self.draft = draft
+        self.clear_works = clear_works
+        # Drafts after each C-u when a round clears only part of the box.
+        self.clear_steps = clear_steps
+        # Live, 2.1.278: after any edit of the box the first Left on the
+        # emptied box is swallowed; the second opens the list.
+        self.left_swallow = first_left_swallowed
+        self.paste_views: list[str] = []  # the view each paste landed in
+
+    @property
+    def frames(self) -> dict[str, str]:
+        if self.draft:
+            return {
+                "foreign": self.foreign_frame.replace(" ❯ \n", f" ❯ {self.draft}\n"),
+                "list": _agents_list_with_draft(self.draft),
+            }
+        return {"foreign": self.foreign_frame, "list": _AGENTS_LIST}
+
+    def _done(self, args, rc: int = 0, out: str = ""):
+        self.calls.append(args)
+        return subprocess.CompletedProcess(args, rc, stdout=out, stderr="")
+
+    def __call__(self, args, **kwargs):  # noqa: ANN001
+        sub = self._subcommand(args)
+        if sub == "capture-pane" and self._escape_pending is not None:
+            if self._escape_pending == 0:
+                self.view, self._escape_pending = "main", None
+            else:
+                self._escape_pending -= 1
+        if sub == "capture-pane" and self.view in self.frames:
+            return self._done(args, out=self.frames[self.view])
+        if sub == "paste-buffer":
+            self.paste_views.append(self.view)
+        if sub == "send-keys" and args[-1] in ("C-k", "C-u"):
+            before = self.draft
+            if self.clear_steps is not None:
+                if args[-1] == "C-u":
+                    self.draft = self.clear_steps.pop(0) if self.clear_steps else ""
+            elif self.clear_works and self.view in self.frames:
+                self.draft = ""
+            if self.draft != before:
+                self.left_swallow = True
+            return self._done(args)
+        if sub == "send-keys" and args[-1] == "Left" and self.left_swallow:
+            if not self.draft:
+                self.left_swallow = False
+            return self._done(args)
+        if sub == "send-keys" and args[-1] in ("Left", "Escape"):
+            if self.draft and self.view in self.frames:
+                if args[-1] == "Escape" and self.view == "list":
+                    self.draft = ""  # "esc to clear" — and the list stays
+                return self._done(args)
+            if self.keys_work:
+                if args[-1] == "Left" and self.view in ("foreign", "main"):
+                    self.view = "list"
+                elif args[-1] == "Escape" and self.view == "list" and self.escape_works:
+                    if self.escape_lag:
+                        self._escape_pending = self.escape_lag
+                    else:
+                        self.view = "main"
+            return self._done(args)
+        if sub == "rename-session":
+            if self.rename_rc == 0:
+                self.exists = False
+                self.sessions.remove("dbrain_test")
+                self.sessions.append(args[-1])
+            return self._done(args, rc=self.rename_rc)
+        if sub == "kill-session":
+            if self.kill_rc == 0 and args[-1] == "=dbrain_test:":
+                self.exists = False
+            return self._done(args, rc=self.kill_rc)
+        if sub == "pipe-pane" and len(args) == 4:  # no command = close the pipe
+            return self._done(args, rc=self.pipe_close_rc)
+        if sub == "list-sessions":
+            return self._done(args, out="\n".join(self.sessions) + "\n")
+        if sub == "new-session":
+            self.view = "main"
+        return super().__call__(args, **kwargs)
+
+    def view_keys(self) -> list[str]:
+        return [c[-1] for c in self.sent_keys() if c[-1] in ("Left", "Escape")]
+
+
+def _pin_transcript(tmp_path, monkeypatch, sid: str, *records: dict) -> None:
+    """Pinned session id + its JSONL transcript under a private HOME."""
+    from d_brain.services.transcript import transcript_path
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / ".dbrain").mkdir(exist_ok=True)
+    (tmp_path / ".dbrain" / "session_id").write_text(sid + "\n")
+    path = transcript_path(tmp_path / "vault", sid)
+    path.parent.mkdir(parents=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+
+def test_return_from_codex_goes_back_to_main_and_delivers(tmp_path, clock):
+    """The incident shape: pane left on a background task. The bot presses
+    Left, sees the agents list, presses Escape, sees its own conversation —
+    and asks there. Nothing parked, context and pinned session id kept."""
+    rid = "rid00001"
+    fake = ViewFake("foreign", [READY, _inline_echo(rid), _complete(rid, "HELLO")])
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    (tmp_path / ".dbrain" / "session_id").write_text("keep-me\n")
+    # Leftovers of the Codex period in the SAME runtime dir must not matter.
+    (tmp_path / ".dbrain" / "thread_id").write_text("codex-thread\n")
+
+    r = s.ask("ping")
+
+    assert r.status == "ok" and r.reply == "HELLO"
+    assert fake.view_keys() == ["Left", "Escape"]
+    subs = fake.sent_subcommands()
+    assert not {"rename-session", "kill-session", "new-session"} & set(subs)
+    assert (tmp_path / ".dbrain" / "session_id").read_text().strip() == "keep-me"
+    assert s.pop_notices() == []  # nothing lost, nothing to announce
+
+
+def test_labelled_main_reached_by_return_is_not_round_tripped_again(tmp_path, clock):
+    """After a human visited the agents list, the CLI re-keys the main
+    conversation (verified live: new transcript id, pinned id stale) and it
+    shows a label the pinned transcript does not know. The label found after
+    a verified return is the session's own: the next turn sends no keys."""
+    fake = ViewFake("foreign", [_box("Организация мыслей")])
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.view_keys() == ["Left", "Escape"]
+    s.ensure_session()
+    assert fake.view_keys() == ["Left", "Escape"]  # unchanged
+
+
+def test_agents_list_view_needs_only_escape(tmp_path, clock):
+    """Pane left on the "← N agents" list itself: anything typed there
+    would spawn a new background session. Escape alone returns."""
+    fake = ViewFake("list")
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.view_keys() == ["Escape"]
+    assert "rename-session" not in fake.sent_subcommands()
+
+
+def test_renamed_main_conversation_is_left_alone(tmp_path, clock, monkeypatch):
+    """`/rename probe-two` in the bot's own conversation draws the same
+    labelled border as a background task (verified live, 2.1.278) and
+    appends custom-title/agent-name records to the pinned transcript. That
+    match is enough: no keys, no parking, session id kept."""
+    sid = "11111111-2222-4333-8444-555555555555"
+    _pin_transcript(
+        tmp_path,
+        monkeypatch,
+        sid,
+        {"type": "custom-title", "customTitle": "probe-two", "sessionId": sid},
+        {"type": "agent-name", "agentName": "probe-two", "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content": "hi"}},
+    )
+    fake = ViewFake("foreign", foreign_frame=_box("probe-two"))
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.sent_keys() == []
+    assert not {"rename-session", "kill-session", "new-session"} & set(
+        fake.sent_subcommands()
+    )
+    assert (tmp_path / ".dbrain" / "session_id").read_text().strip() == sid
+
+
+def test_truncated_auto_title_of_main_is_left_alone(tmp_path, clock, monkeypatch):
+    sid = "11111111-2222-4333-8444-555555555555"
+    title = "Организация мыслей и восстановление спокойствия"
+    _pin_transcript(
+        tmp_path,
+        monkeypatch,
+        sid,
+        {"type": "ai-title", "aiTitle": title, "sessionId": sid},
+    )
+    fake = ViewFake("foreign", foreign_frame=_box("Организация мыслей и…"))
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.sent_keys() == []
+
+
+def test_model_text_shaped_like_a_label_is_not_a_foreign_view(tmp_path, clock):
+    """The model's own "─── Итог ─" heading followed by a quoted "❯ …" line
+    sits in the transcript; only the border above the real input counts."""
+    body = (
+        " ● Разбор.\n"
+        f" {'─' * 40} Итог ─\n"
+        " ❯ цитата пользовательского промпта\n"
+        "   ещё строка ответа"
+    )
+    fake = ViewFake("foreign", foreign_frame=_box(None, body=body))
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.sent_keys() == []
+    assert "rename-session" not in fake.sent_subcommands()
+
+
+def test_park_when_return_fails_and_owner_is_told(tmp_path, clock):
+    """Left does not open the list (e.g. a CLI whose keys changed): only now
+    is the session parked — renamed, pipe closed — and a fresh one started.
+    The owner gets an explicit notice, once."""
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign", [READY, _inline_echo(rid), _complete(rid, "HELLO")], keys_work=False
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    old_id = "11111111-1111-1111-1111-111111111111"
+    (tmp_path / ".dbrain" / "session_id").write_text(old_id + "\n")
+
+    r = s.ask("ping")
+
+    assert r.status == "ok" and r.reply == "HELLO"
+    # A second Left only after the first visibly failed; Escape only after
+    # the list showed — so never here.
+    assert fake.view_keys() == ["Left", "Left"]
+    rename = next(c for c in fake.calls if "rename-session" in c)
+    assert rename[rename.index("-t") + 1] == "=dbrain_test:"
+    parked = rename[-1]
+    assert parked.startswith("parked_dbrain_test_")
+    assert ["tmux", "pipe-pane", "-t", f"={parked}:"] in fake.calls
+    subs = fake.sent_subcommands()
+    assert "kill-session" not in subs
+    assert subs.index("rename-session") < subs.index("new-session")
+    assert (tmp_path / ".dbrain" / "session_id").read_text().strip() != old_id
+    assert (tmp_path / ".dbrain" / "ready").exists()
+    notices = s.pop_notices()
+    assert len(notices) == 1
+    assert "Контекст разговора сброшен" in notices[0]
+    assert "night-second-brain" in notices[0] and parked in notices[0]
+    assert s.pop_notices() == []  # handed out once
+
+
+def test_parked_session_is_killed_when_its_pipe_cannot_be_closed(tmp_path, clock):
+    """Its output would keep growing pane.log and mask a stall of the fresh
+    session — so a parked pane that cannot be un-piped is killed."""
+    fake = ViewFake("foreign", keys_work=False, pipe_close_rc=1)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    parked = next(c for c in fake.calls if "rename-session" in c)[-1]
+    kills = [c for c in fake.calls if "kill-session" in c]
+    assert kills and kills[0][-1] == f"={parked}:"
+    subs = fake.sent_subcommands()
+    assert subs.index("kill-session") < subs.index("new-session")
+    (notice,) = s.pop_notices()
+    assert "закрыта" in notice
+
+
+def test_foreign_view_falls_back_to_kill_when_rename_fails(tmp_path, clock):
+    fake = ViewFake("foreign", keys_work=False, rename_rc=1)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    subs = fake.sent_subcommands()
+    assert subs.index("rename-session") < subs.index("kill-session")
+    assert subs.index("kill-session") < subs.index("new-session")
+    (notice,) = s.pop_notices()
+    assert "Контекст разговора сброшен" in notice
+
+
+def test_neither_rename_nor_kill_is_an_explicit_error(tmp_path, clock):
+    """Double failure: the stuck pane is still there. No new session, the
+    pinned session id is NOT overwritten, the pane is not called ready, and
+    ask() reports an error instead of typing into the foreign view."""
+    fake = ViewFake("foreign", keys_work=False, rename_rc=1, kill_rc=1)
+    s = make_session(tmp_path, fake, clock)
+    (tmp_path / ".dbrain" / "session_id").write_text("keep-me\n")
+    (tmp_path / ".dbrain" / "ready").write_text("ready\n")
+
+    with pytest.raises(RuntimeError, match="neither parked nor killed"):
+        s.ensure_session()
+
+    assert "new-session" not in fake.sent_subcommands()
+    assert (tmp_path / ".dbrain" / "session_id").read_text().strip() == "keep-me"
+    assert not (tmp_path / ".dbrain" / "ready").exists()
+    (notice,) = s.pop_notices()
+    assert notice.startswith("🔴")
+
+    r = s.ask("ping")
+    assert r.status == "error"
+    assert "load-buffer" not in fake.sent_subcommands()  # nothing typed
+    assert (tmp_path / ".dbrain" / "session_id").read_text().strip() == "keep-me"
+
+
+def test_parked_sessions_are_capped_oldest_killed(tmp_path, clock):
+    fake = ViewFake(
+        "foreign",
+        keys_work=False,
+        sessions=(
+            "parked_dbrain_test_20260101-000000",
+            "parked_dbrain_test_20260102-000000",
+            "parked_dbrain_test_20260103-000000",
+            "dbrain_test_cron",
+            "parked_dbrain_test_cron_20250101-000000",  # the sibling's: never
+        ),
+    )
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    killed = [c[-1] for c in fake.calls if "kill-session" in c]
+    assert killed == [
+        "=parked_dbrain_test_20260101-000000:",
+        "=parked_dbrain_test_20260102-000000:",
+    ]
+
+
+def test_main_view_session_is_reused_untouched(tmp_path, clock):
+    """The normal restart case (same engine, main conversation on screen):
+    no keys, no parking, no new process, pinned session id kept."""
+    fake = FakeTmux([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    (tmp_path / ".dbrain" / "session_id").write_text("keep-me\n")
+    s.ensure_session()
+    subs = fake.sent_subcommands()
+    assert "rename-session" not in subs and "new-session" not in subs
+    assert "send-keys" not in subs
+    assert (tmp_path / ".dbrain" / "session_id").read_text().strip() == "keep-me"
+
+
+def test_existing_session_without_pane_pipe_is_repiped(tmp_path, clock):
+    """A session someone started by hand has no pane.log pipe — the growth
+    signal every stall/liveness check relies on."""
+
+    class _NoPipe(FakeTmux):
+        def __call__(self, args, **kwargs):  # noqa: ANN001
+            if args[-1] == "#{pane_pipe}":
+                self.calls.append(args)
+                return subprocess.CompletedProcess(args, 0, stdout="0\n", stderr="")
+            return super().__call__(args, **kwargs)
+
+    fake = _NoPipe([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    subs = fake.sent_subcommands()
+    assert "pipe-pane" in subs and "new-session" not in subs
+
+
+def test_existing_piped_session_is_not_repiped(tmp_path, clock):
+    class _Piped(FakeTmux):
+        def __call__(self, args, **kwargs):  # noqa: ANN001
+            if args[-1] == "#{pane_pipe}":
+                self.calls.append(args)
+                return subprocess.CompletedProcess(args, 0, stdout="1\n", stderr="")
+            return super().__call__(args, **kwargs)
+
+    fake = _Piped([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert "pipe-pane" not in fake.sent_subcommands()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+def test_return_from_codex_end_to_end_real_tmux(tmp_path, isolated_tmux):
+    """Real tmux, fake `claude`: main pane stuck in a foreign view next to a
+    live cron sibling. ensure_session() must park the old one, start a fresh
+    main session by the normal path, and leave the cron session alone."""
+    work = tmp_path / "vault"
+    work.mkdir()
+    frame = tmp_path / "foreign.txt"
+    frame.write_text(_FOREIGN)
+    fake_claude = tmp_path / "fake-claude"
+    fake_claude.write_text(f"#!/bin/sh\nprintf '%s' '{READY}'\nexec sleep 600\n")
+    fake_claude.chmod(0o755)
+    for name, cmd in (
+        ("dbrain_test_cron", "sleep 600"),
+        ("dbrain_test", f"cat {frame}; exec sleep 600"),
+    ):
+        isolated_tmux(
+            ["tmux", "new-session", "-d", "-s", name, "-x", "200", "-y", "50", cmd],
+            capture_output=True,
+            check=True,
+        )
+    s = ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=work,
+        runtime_dir=tmp_path / ".dbrain",
+        claude_bin=str(fake_claude),
+        runner=isolated_tmux,
+        poll_interval=0.1,
+        paste_settle=0.0,
+        startup_timeout=10.0,
+        view_switch_timeout=0.5,
+    )
+    deadline = time.monotonic() + 5
+    while "night-second-brain" not in s.capture_text():
+        assert time.monotonic() < deadline, "foreign frame never rendered"
+        time.sleep(0.05)
+    s._tmux("pipe-pane", "-t", s._target, f"cat >> {tmp_path / '.dbrain' / 'pane.log'}")
+
+    s.ensure_session()
+
+    names = isolated_tmux(
+        ["tmux", "list-sessions", "-F", "#{session_name}:#{pane_pipe}"],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    parked = [n for n in names if n.startswith("parked_dbrain_test_")]
+    assert len(parked) == 1 and parked[0].endswith(":0"), names  # pipe closed
+    assert "dbrain_test:1" in names  # fresh main, piped
+    assert "dbrain_test_cron:0" in names  # sibling untouched
+    assert "night-second-brain" not in s.capture_text()
+    assert (tmp_path / ".dbrain" / "ready").exists()
+
+
+# ── review 2026-09-19: return-to-main hardening ────────────────────────────
+
+
+def test_steering_is_refused_while_returning_to_main(tmp_path, clock):
+    """While _ensure_locked() drives the pane through the agents list, an
+    owner message must not be steered in: in the list it would land in the
+    "describe a task for a new session" box and spawn a background session.
+    inflight holds a maint placeholder until the prompt is actually typed."""
+    rid = "rid00001"
+    seen: dict[str, bool] = {}
+
+    class Spy(ViewFake):
+        def __call__(self, args, **kwargs):  # noqa: ANN001
+            sub = self._subcommand(args)
+            if sub == "send-keys" and args[-1] in ("Left", "Escape"):
+                seen.setdefault(f"at_{args[-1]}", s.is_steerable_turn())
+            if sub == "paste-buffer":
+                seen.setdefault("at_paste", s.is_steerable_turn())
+            return super().__call__(args, **kwargs)
+
+    fake = Spy("foreign", [READY, _inline_echo(rid), _complete(rid, "HELLO")])
+    s = make_session(tmp_path, fake, clock, rid=rid)
+
+    r = s.ask("ping", request_id="chat-42")
+
+    assert r.status == "ok" and r.reply == "HELLO"
+    assert seen == {"at_Left": False, "at_Escape": False, "at_paste": True}
+
+
+def test_steering_is_refused_while_a_fresh_session_starts(tmp_path, clock):
+    """Same gate when the stuck pane is parked and a new session boots."""
+    rid = "rid00001"
+    seen: list[bool] = []
+
+    class Spy(ViewFake):
+        def __call__(self, args, **kwargs):  # noqa: ANN001
+            if self._subcommand(args) in ("rename-session", "new-session"):
+                seen.append(s.is_steerable_turn())
+            return super().__call__(args, **kwargs)
+
+    fake = Spy(
+        "foreign", [READY, _inline_echo(rid), _complete(rid, "HELLO")], keys_work=False
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    assert s.ask("ping", request_id="chat-42").status == "ok"
+    assert seen == [False, False]
+
+
+def test_swallowed_escape_parks_instead_of_prompting_the_list(tmp_path, clock):
+    """Left opened the list, but the Escape never took effect (the TUI can
+    swallow it — e.g. with a draft there it only clears it). The session
+    must be parked; the prompt must never be pasted while the list shows.
+    Catches a return that trusts an instant capture after Escape instead of
+    waiting for the list to go away."""
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign",
+        [READY, _inline_echo(rid), _complete(rid, "HELLO")],
+        escape_works=False,
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+
+    r = s.ask("ping")
+
+    assert r.status == "ok" and r.reply == "HELLO"
+    assert fake.view_keys() == ["Left", "Escape"]
+    assert "list" not in fake.paste_views
+    subs = fake.sent_subcommands()
+    assert subs.index("rename-session") < subs.index("new-session")
+    (notice,) = s.pop_notices()
+    assert "Контекст разговора сброшен" in notice
+
+
+def test_slow_escape_is_waited_for_not_parked(tmp_path, clock):
+    """Escape that takes a couple of polls to show is still a success:
+    the return waits for the list to go away, then reuses the pane."""
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign", [READY, _inline_echo(rid), _complete(rid, "HELLO")], escape_lag=2
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+
+    r = s.ask("ping")
+
+    assert r.status == "ok" and r.reply == "HELLO"
+    assert fake.paste_views == ["main"]
+    assert not {"rename-session", "new-session"} & set(fake.sent_subcommands())
+
+
+def test_draft_in_foreign_view_is_cleared_before_left(tmp_path, clock):
+    """With text in the box, Left only moves the cursor (live, 2.1.278).
+    The draft is cleared with C-k + C-u (never Escape: in a task view that
+    interrupts the task) — only then Left, Escape, reuse."""
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign",
+        [READY, _inline_echo(rid), _complete(rid, "HELLO")],
+        draft="черновик человека",
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+
+    r = s.ask("ping")
+
+    assert r.status == "ok" and r.reply == "HELLO"
+    keys = [c[-1] for c in fake.sent_keys() if c[-1] != "Enter"]
+    assert keys[:2] == ["C-k", "C-u"]
+    assert keys.index("C-u") < keys.index("Left") < keys.index("Escape")
+    # The first Left after the clearing is swallowed (live); the second works.
+    assert fake.view_keys() == ["Left", "Left", "Escape"]
+    assert fake.paste_views == ["main"]
+    assert "rename-session" not in fake.sent_subcommands()
+
+
+def test_multi_row_draft_is_cleared_row_by_row_to_the_end(tmp_path, clock):
+    """Live, 2.1.278, two-row draft, cursor mid-row: one C-k + C-u round
+    empties the last row, the next removes that now-empty row, the next
+    clears the first row. A comparison that ignores the empty row sees "no
+    change" after round two and presses Left with a draft still there —
+    which only moves the cursor, so the session got parked."""
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign",
+        [READY, _inline_echo(rid), _complete(rid, "HELLO")],
+        draft="human line one\n  human line two",
+        clear_steps=["human line one\n  ", "human line one", ""],
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+
+    assert s.ask("ping").status == "ok"
+    assert fake.view_keys() == ["Left", "Left", "Escape"]
+    assert "rename-session" not in fake.sent_subcommands()
+    assert fake.paste_views == ["main"]
+
+
+def test_box_edited_by_a_human_needs_a_second_left(tmp_path, clock):
+    """Text typed and deleted again by a human leaves an empty box whose
+    first Left is swallowed (live, 2.1.278). One failed Left must not park
+    the session: the second opens the list."""
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign",
+        [READY, _inline_echo(rid), _complete(rid, "HELLO")],
+        first_left_swallowed=True,
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    assert s.ask("ping").status == "ok"
+    assert fake.view_keys() == ["Left", "Left", "Escape"]
+    assert "rename-session" not in fake.sent_subcommands()
+
+
+def test_draft_in_agents_list_is_cleared_before_escape(tmp_path, clock):
+    """A draft typed into the list hides both list signs the old check used
+    (placeholder, "ctrl+x to delete") and makes Escape only clear it."""
+    fake = ViewFake("list", draft="new task idea")
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    keys = [c[-1] for c in fake.sent_keys()]
+    assert keys.index("C-u") < keys.index("Escape")
+    assert fake.view == "main"
+    assert "rename-session" not in fake.sent_subcommands()
+
+
+def test_draft_that_cannot_be_cleared_parks_and_never_types_into_it(tmp_path, clock):
+    rid = "rid00001"
+    fake = ViewFake(
+        "foreign",
+        [READY, _inline_echo(rid), _complete(rid, "HELLO")],
+        draft="stuck draft",
+        clear_works=False,
+    )
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    assert s.ask("ping").status == "ok"
+    assert fake.view_keys() == ["Left", "Left"]  # cursor moves only; no Escape
+    assert "foreign" not in fake.paste_views
+    assert "rename-session" in fake.sent_subcommands()
+
+
+def test_parked_session_that_cannot_be_killed_is_not_called_closed(tmp_path, clock):
+    """Pipe close fails AND the fallback kill fails: the notice must not
+    claim the session was closed."""
+    fake = ViewFake("foreign", keys_work=False, pipe_close_rc=1, kill_rc=1)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    (notice,) = s.pop_notices()
+    assert "закрыта" not in notice
+    assert "закрыть её не удалось" in notice
+    assert "parked_dbrain_test_" in notice
+
+
+def test_reused_frame_is_taken_after_the_resize(tmp_path, clock):
+    """A resize re-renders the TUI: the frame used for the view check and as
+    ask()'s pre-send frame must be taken after it, not before."""
+    fake = FakeTmux([READY], exists=True, window_size="80x23")
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    subs = fake.sent_subcommands()
+    assert subs.index("resize-window") < subs.index("capture-pane")
+
+
+# ── lost Enter (incident 2026-09-19: five glued, unsent prompts) ────────────
+
+
+def _unsent_box(text: str) -> str:
+    """The input box still holding a pasted prompt after Enter (live shape:
+    rule, ❯ + first row, wrapped rows, rule)."""
+    rows = text.split("\n")
+    body = "\n".join([f"❯ {rows[0]}", *(f"  {r}" for r in rows[1:])])
+    return (
+        f"● earlier answer\n{_WIDE}\n{body}\n{_WIDE}\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+
+
+def test_lost_enter_is_pressed_again(tmp_path, clock, caplog):
+    rid = "rid00001"
+    unsent = _unsent_box(f"ping\nfiller\nend with <<<E:{rid}>>>. The reply is")
+    fake = FakeTmux([READY, unsent, READY, _complete(rid, "HELLO")], exists=True)
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    with caplog.at_level(logging.WARNING):
+        r = s.ask("ping")
+    assert r.status == "ok" and r.reply == "HELLO"
+    assert fake.enter_count() == 2
+    assert "Enter lost" in caplog.text
+
+
+def test_collapsed_paste_left_in_the_box_is_sent(tmp_path, clock):
+    rid = "rid00001"
+    unsent = _unsent_box("[Pasted text #1 +200 lines]")
+    fake = FakeTmux([READY, unsent, READY, _complete(rid, "HELLO")], exists=True)
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    assert s.ask("ping").status == "ok"
+    assert fake.enter_count() == 2
+
+
+def test_enter_retries_are_capped_at_two(tmp_path, clock, caplog):
+    rid = "rid00001"
+    unsent = _unsent_box(f"ping <<<E:{rid}>>>")
+    fake = FakeTmux([READY, unsent, unsent, unsent, _complete(rid)], exists=True)
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    with caplog.at_level(logging.WARNING):
+        s.ask("ping", timeout=30)
+    assert fake.enter_count() == 3  # the first + two retries, never more
+    assert "still unsent" in caplog.text
+
+
+def test_marker_in_the_transcript_echo_is_not_an_unsent_prompt(tmp_path, clock):
+    """After a good Enter the echo of the prompt (also starting with ❯ and
+    carrying the marker) sits above an EMPTY box: no second Enter."""
+    rid = "rid00001"
+    sent = (
+        f"❯ ping, wrap between <<<R:{rid}>>> and <<<E:{rid}>>>\n"
+        f"{THINKING}{_WIDE}\n❯ \n{_WIDE}\n"
+    )
+    fake = FakeTmux([READY, sent, _complete(rid, "HELLO")], exists=True)
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    assert s.ask("ping").status == "ok"
+    assert fake.enter_count() == 1
+
+
+def test_unwrapped_prompt_left_as_collapsed_paste_is_sent(tmp_path, clock):
+    fake = FakeTmux(
+        [READY, _unsent_box("[Pasted text #3 +40 lines]"), READY, READY, READY],
+        exists=True,
+    )
+    s = make_session(tmp_path, fake, clock)
+    s.ask("x" * 10, wrap=False, timeout=30)
+    assert fake.enter_count() == 2
+
+
+def test_requeued_notices_go_back_in_front_of_newer_ones(tmp_path, clock):
+    s = make_session(tmp_path, FakeTmux([READY]), clock)
+    s._queue_notice("old-1")
+    s._queue_notice("old-2")
+    popped = s.pop_notices()
+    s._queue_notice("newer")  # raised while the send of old-* was failing
+    s.requeue_notices(popped)
+    assert s.pop_notices() == ["old-1", "old-2", "newer"]
+    assert s.pop_notices() == []
+
+
+# ── the reply comes from the transcript, not the screen (item 32) ─────────
+
+
+def _write_record(session, text: str, *, is_sidechain: bool = False) -> None:
+    """Append one assistant record to the session's real transcript path."""
+    path = session.current_transcript_path()
+    assert path is not None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "isSidechain": is_sidechain,
+                    "message": {"content": [{"type": "text", "text": text}]},
+                }
+            )
+            + "\n"
+        )
+
+
+def _answers_when_asked(session, text=None, *, is_sidechain: bool = False):
+    """Make the model write `text` to the transcript the moment the prompt is
+    typed — the earliest point a real answer can exist, and (deliberately)
+    after ask() has anchored its reader. `text` may be a callable taking the
+    turn's rid."""
+    original = session._send_prompt
+
+    def send(prompt, rid, *, wrap=True):
+        original(prompt, rid, wrap=wrap)
+        body = text(rid) if callable(text) else text
+        if body is not None:
+            _write_record(session, body, is_sidechain=is_sidechain)
+
+    session._send_prompt = send
+
+
+def _finished_pane(body: str = "") -> str:
+    """A pane whose main turn is over, with `body` above the chrome."""
+    return (
+        f"{body}"
+        "Worked for 6m 52s · 0 background tasks still running\n"
+        f"{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
+        "  hello | Opus 4.8 (1M context) | ~/p\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+
+
+def _transcript_session(tmp_path, fake, clock, rid, **kw):
+    kw.setdefault("stall_timeout", DEFAULT_STALL_TIMEOUT)
+    kw.setdefault("salvage_stable", DEFAULT_SALVAGE_STABLE)
+    kw.setdefault("no_main_turn_ceiling", DEFAULT_NO_MAIN_TURN_CEILING)
+    return ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / ".dbrain",
+        runner=fake,
+        sleep_fn=lambda secs: clock.__setitem__("now", clock["now"] + secs),
+        clock_fn=lambda: clock["now"],
+        rid_factory=lambda: rid,
+        poll_interval=1.0,
+        startup_timeout=30.0,
+        **kw,
+    )
+
+
+def test_reply_too_long_for_the_capture_window_is_still_delivered(tmp_path, clock):
+    """THE regression test for backlog item 32 (live case, 22.09).
+
+    The answer is longer than the 200-line capture window, so by the time the
+    turn ends the pane holds only its TAIL: the closing `<<<E:rid>>>` is on
+    screen, the opening `<<<R:rid>>>` has scrolled out. Every pane-based
+    parser returns None for that frame — which is exactly how a ready answer
+    used to turn into "⌛ Превышено время ожидания" after 412 seconds. Read
+    from the transcript, the same turn delivers the WHOLE reply, immediately.
+    """
+    rid = "long0001"
+    body = "\n".join(f"line {i} of a very long answer" for i in range(400))
+    pane = _finished_pane(f"...{body.splitlines()[-1]}\n<<<E:{rid}>>>\n")
+    fake = FakeTmux([READY, READY, pane], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, rid)
+    # The pane genuinely offers nothing: no complete pair, no open span.
+    assert extract_reply(pane, rid) is None
+    assert extract_open_reply(pane, rid) is None
+    _answers_when_asked(s, f"<<<R:{rid}>>>\n{body}\n<<<E:{rid}>>>")
+
+    res = s.ask("write me something long", timeout=DEFAULT_TIMEOUT)
+
+    assert res.status == "ok"
+    assert res.salvaged is False
+    assert res.reply == body
+    # Delivered on the first poll after the send, not after a salvage window
+    # and nowhere near the ceiling that used to swallow this turn.
+    assert clock["now"] < DEFAULT_SALVAGE_STABLE
+    handled = (tmp_path / ".dbrain" / "handled_rids").read_text().split()
+    assert rid in handled
+
+
+def test_pane_text_is_never_the_reply_even_when_the_pane_has_a_pair(tmp_path, clock):
+    """One source, not two: if the screen and the transcript disagree, what
+    the model actually wrote (the transcript) is what gets delivered."""
+    rid = "src00001"
+    fake = FakeTmux([READY, READY, _complete(rid, "PANE TEXT")], exists=True)
+    fake.mirror_enabled = False  # the fixtures deliberately disagree here
+    s = _transcript_session(tmp_path, fake, clock, rid)
+    _answers_when_asked(s, f"<<<R:{rid}>>>\nTRANSCRIPT TEXT\n<<<E:{rid}>>>")
+
+    res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
+    assert res.status == "ok"
+    assert res.reply == "TRANSCRIPT TEXT"
+
+
+def test_half_written_reply_is_not_delivered_until_it_is_closed(tmp_path, clock):
+    """An unclosed span is NOT an answer: while the model is still writing,
+    nothing may be delivered — and once the closing marker lands, the whole
+    reply is, not the half that was visible first."""
+    rid = "half0001"
+    fake = FakeTmux([READY, READY, _finished_pane()], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, rid)
+    _answers_when_asked(s, f"<<<R:{rid}>>>\nFirst half of the answer.")
+
+    polls = {"n": 0}
+    original_capture = s._capture
+
+    def capture_and_grow():
+        polls["n"] += 1
+        # Still writing for the first few polls (well inside the salvage
+        # window), then the model finishes the reply properly.
+        if polls["n"] == 3:
+            _write_record(s, "Second half of the answer.")
+        if polls["n"] == 5:
+            _write_record(s, f"<<<E:{rid}>>>")
+        return original_capture()
+
+    s._capture = capture_and_grow
+
+    res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
+    assert res.status == "ok"
+    assert res.salvaged is False
+    assert res.reply == "First half of the answer.\nSecond half of the answer."
+    # Never rode the salvage window: closed properly, so it went out at once.
+    assert clock["now"] < DEFAULT_SALVAGE_STABLE
+
+
+def test_a_static_body_during_a_long_tool_call_is_not_salvaged_as_the_answer(
+    tmp_path, clock
+):
+    """The protection the `_WORKING_RE` conjunct used to give, restated for
+    the transcript source (blind review, 2026-09-22).
+
+    The model opens the pair, writes a preamble, then spends minutes inside
+    ONE tool call: no new transcript records, so the body is byte-identical
+    for the whole salvage window, while the pane renders the non-paren
+    spinner that is_main_turn_active() does not recognise. Salvaging there
+    would hand the owner a fragment AND mark the rid handled, permanently
+    blocking the real answer that lands a minute later. The turn must wait
+    and deliver the complete reply."""
+    rid = "tool0001"
+    live = (
+        "⏺ preamble on screen\n"
+        "✢ Razzle-dazzling…  44s · ↓1.8k tokens\n"
+        "Worked for 2m 22s · 1 background task still running\n"
+        f"{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    assert is_main_turn_active(live) is False  # the false negative, live
+    fake = FakeTmux([READY, READY, live], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, rid)
+    _answers_when_asked(s, f"<<<R:{rid}>>>\nHere is what I found so far:")
+
+    polls = {"n": 0}
+    original_capture = s._capture
+
+    def capture_then_finish():
+        polls["n"] += 1
+        # Long after the salvage window, the tool returns and the model
+        # writes the real answer.
+        if polls["n"] == int(DEFAULT_SALVAGE_STABLE) + 30:
+            _write_record(s, f"The real, complete answer.\n<<<E:{rid}>>>")
+        return original_capture()
+
+    s._capture = capture_then_finish
+
+    res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
+    assert res.status == "ok"
+    assert res.salvaged is False
+    assert res.reply == "Here is what I found so far:\nThe real, complete answer."
+    # Waited past the fast salvage window instead of firing at it.
+    assert clock["now"] > DEFAULT_SALVAGE_STABLE
+
+
+def test_a_stale_pin_is_named_even_when_the_turn_never_reaches_the_ceiling(
+    tmp_path, clock, caplog
+):
+    """A turn whose main spinner keeps reading as active never reaches the
+    no-main-turn ceiling; it exits on the hard deadline instead. If its
+    transcript received nothing at all for the whole turn, that is the
+    stale-pin shape and must be said out loud there too — otherwise this is
+    the one path that times out with nothing in the journal explaining why
+    (blind review, round 2)."""
+    rid = "stal0001"
+    working = f"{THINKING}{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
+    fake = FakeTmux([READY, READY, working], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, rid, stall_timeout=1e6)
+
+    with caplog.at_level(logging.ERROR):
+        res = s.ask("ping", timeout=30)
+
+    assert res.status == "timeout"
+    assert res.detail == "no reply in 30s"
+    assert any(
+        "received NOTHING for the whole of" in r.message for r in caplog.records
+    )
+
+
+def test_a_rule_in_the_reply_does_not_defeat_the_live_turn_guard(tmp_path, clock):
+    """Same scenario as the test above with ONE line added: the model's own
+    markdown `---`, which the TUI renders as exactly the box-rule shape.
+
+    Second blind-review round, 2026-09-22: the guard first looked for the
+    prompt box from the TOP of the chrome, so a rule inside the (unclosed,
+    therefore un-stripped) reply cut the search short above the live spinner
+    and the fragment went out at 120.0s with the rid marked handled. The box
+    is found from the BOTTOM now — see main_area_working()."""
+    rid = "rule0001"
+    live = (
+        "⏺ preamble on screen\n"
+        "Here is the summary:\n" + "─" * 40 + "\n"
+        "More to check.\n"
+        "✢ Razzle-dazzling…  44s · ↓1.8k tokens\n"
+        "Worked for 2m 22s · 1 background task still running\n"
+        f"{_INCIDENT_BOX}\n❯\n{_INCIDENT_BOX}\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    assert is_main_turn_active(live) is False
+    fake = FakeTmux([READY, READY, live], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, rid)
+    _answers_when_asked(s, f"<<<R:{rid}>>>\nHere is what I found so far:")
+
+    polls = {"n": 0}
+    original_capture = s._capture
+
+    def capture_then_finish():
+        polls["n"] += 1
+        if polls["n"] == int(DEFAULT_SALVAGE_STABLE) + 30:
+            _write_record(s, f"The real, complete answer.\n<<<E:{rid}>>>")
+        return original_capture()
+
+    s._capture = capture_then_finish
+
+    res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
+    assert res.salvaged is False
+    assert res.reply == "Here is what I found so far:\nThe real, complete answer."
+
+
+def test_no_pinned_session_id_falls_back_to_the_pane(tmp_path, clock, caplog):
+    """Degraded mode: a session whose transcript cannot be resolved at all
+    must still deliver what the pane shows, loudly — timing out every turn
+    against a healthy pane would be worse than the bug this change fixes."""
+    rid = "nosid001"
+    fake = FakeTmux([READY, READY, _complete(rid, "pane answer")], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, rid)
+    (tmp_path / ".dbrain" / "session_id").unlink()
+
+    with caplog.at_level(logging.WARNING):
+        res = s.ask("ping", timeout=DEFAULT_TIMEOUT)
+
+    assert res.status == "ok"
+    assert res.reply == "pane answer"
+    assert any(
+        "delivering" in r.message and "PANE" in r.message for r in caplog.records
+    )
+    handled = (tmp_path / ".dbrain" / "handled_rids").read_text().split()
+    assert rid in handled
+
+
+def test_an_opening_marker_with_no_body_is_not_reported_as_no_markers(
+    tmp_path, clock
+):
+    """The model opened the pair and wrote nothing after it. That is not
+    "no reply markers ever appeared" — the honest detail is the generic one,
+    and chat_session.py keys its user-facing wording off exactly that."""
+    rid = "empt0001"
+    fake = FakeTmux([READY, READY, _finished_pane()], exists=True)
+    s = _transcript_session(
+        tmp_path, fake, clock, rid, no_main_turn_ceiling=5.0, salvage_stable=5.0
+    )
+    _answers_when_asked(s, f"<<<R:{rid}>>>")
+
+    res = s.ask("ping", timeout=60)
+
+    assert res.status == "timeout"
+    assert res.detail == "no closing marker and no active main turn"
+
+
+def test_two_turns_in_a_row_each_get_their_own_reply(tmp_path, clock):
+    """Back-to-back asks: each turn reads only its own rid, and the second
+    never re-delivers the first one's text (its reader starts at its own
+    send)."""
+    rids = iter(["seq00001", "seq00002"])
+    fake = FakeTmux([READY, READY, _finished_pane()], exists=True)
+    s = _transcript_session(tmp_path, fake, clock, "unused")
+    s._rid_factory = lambda: next(rids)
+    _answers_when_asked(
+        s, lambda rid: f"<<<R:{rid}>>>\nanswer for {rid}\n<<<E:{rid}>>>"
+    )
+
+    first = s.ask("one", timeout=DEFAULT_TIMEOUT)
+    second = s.ask("two", timeout=DEFAULT_TIMEOUT)
+
+    assert first.reply == "answer for seq00001"
+    assert second.reply == "answer for seq00002"
+    handled = (tmp_path / ".dbrain" / "handled_rids").read_text().split()
+    assert "seq00001" in handled and "seq00002" in handled
+
+
+def test_a_subagents_own_text_is_never_delivered_as_the_reply(tmp_path, clock):
+    """isSidechain records are a background subagent talking, not this turn's
+    answer — they must not end the wait."""
+    rid = "side0001"
+    fake = FakeTmux([READY, READY, _finished_pane()], exists=True)
+    s = _transcript_session(
+        tmp_path, fake, clock, rid, no_main_turn_ceiling=5.0, salvage_stable=5.0
+    )
+    _answers_when_asked(
+        s, f"<<<R:{rid}>>>\nsubagent text\n<<<E:{rid}>>>", is_sidechain=True
+    )
+
+    res = s.ask("ping", timeout=60)
+
+    assert res.status == "timeout"
+    assert "no reply markers ever appeared" in (res.detail or "")
+
+
+def test_reply_finished_after_the_wait_gave_up_still_reaches_the_owner(
+    tmp_path, clock
+):
+    """The orphan route is intact: a turn whose transcript never produced a
+    reply leaves its rid UNHANDLED, and the reply the model eventually put on
+    the pane is still handed out by the poller afterwards."""
+    rid = "orph0001"
+    fake = FakeTmux([READY, READY, _finished_pane()], exists=True)
+    s = _transcript_session(
+        tmp_path, fake, clock, rid, no_main_turn_ceiling=5.0, salvage_stable=5.0
+    )
+
+    res = s.ask("ping", timeout=60)
+    assert res.status == "timeout"
+    handled_path = tmp_path / ".dbrain" / "handled_rids"
+    handled = handled_path.read_text().split() if handled_path.exists() else []
+    assert rid not in handled
+
+    # The turn finishes later, the pane shows the pair, nobody is waiting.
+    fake._captures = [_complete(rid, "late answer")]
+    assert s.pop_orphan_replies() == ["late answer"]
+
+
+def test_a_broken_transcript_ends_the_turn_honestly_and_keeps_the_rid(
+    tmp_path, clock, caplog
+):
+    """Schema drift / an unreadable transcript must not raise out of ask():
+    the turn ends as an honest timeout with the rid left for the poller."""
+    rid = "brok0001"
+    fake = FakeTmux([READY, READY, _finished_pane()], exists=True)
+    s = _transcript_session(
+        tmp_path, fake, clock, rid, no_main_turn_ceiling=5.0, salvage_stable=5.0
+    )
+
+    def boom():
+        raise RuntimeError("transcript schema drifted")
+
+    original_open = s._open_reply_tail
+
+    def open_and_break(r, log_id):
+        tail, sid = original_open(r, log_id)
+        tail.poll = boom
+        return tail, sid
+
+    s._open_reply_tail = open_and_break
+
+    with caplog.at_level(logging.ERROR):
+        res = s.ask("ping", timeout=60)
+
+    assert res.status == "timeout"
+    assert any("transcript poll failed" in r.message for r in caplog.records)
+    handled_path = tmp_path / ".dbrain" / "handled_rids"
+    handled = handled_path.read_text().split() if handled_path.exists() else []
+    assert rid not in handled

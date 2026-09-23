@@ -9,6 +9,7 @@ warning) only when no pin is available.
 """
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -34,8 +35,13 @@ def mc(monkeypatch, tmp_path):
 
 
 def _candidate_dir(module, tmp_path) -> Path:
+    # Same slug rule the script uses (and d_brain.services.transcript
+    # documents): EVERY non-alphanumeric character becomes a dash. This test
+    # run is itself a case in point — a checkout under `.claude/worktrees/`
+    # has a dot in its path, and the slashes-only version of this helper
+    # pointed at a directory the script never looks in.
     vault_path = _SCRIPT.resolve().parent.parent / "vault"
-    slug = str(vault_path).replace("/", "-")
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(vault_path))
     return tmp_path / ".claude" / "projects" / slug
 
 

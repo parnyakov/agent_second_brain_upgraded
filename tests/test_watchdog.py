@@ -93,6 +93,84 @@ def test_healthy_does_nothing(tmp_path):
 # ── orphan reply delivery ────────────────────────────────────────────────
 
 
+def test_tick_delivers_session_notices_once(tmp_path):
+    """agent-infra-backlog item 28: parking at bot start-up or in
+    force_recover() has no chat reply to ride on — the tick delivers it."""
+    sess = FakeSession()
+    pending = ["⚠️ Контекст разговора сброшен: … отложена как parked_x"]
+    sess.pop_notices = lambda: [pending.pop()] if pending else []
+    alerts = []
+    wd = make_wd(tmp_path, sess, alerts=alerts)
+    wd.check_once()
+    wd.check_once()
+    assert alerts == ["⚠️ Контекст разговора сброшен: … отложена как parked_x"]
+
+
+class _NoticeQueue:
+    """pop_notices()/requeue_notices() the way ClaudeSession does them."""
+
+    def __init__(self, *texts: str) -> None:
+        self.items = list(texts)
+
+    def pop(self) -> list[str]:
+        out, self.items = self.items, []
+        return out
+
+    def requeue(self, texts: list[str]) -> None:
+        self.items = list(texts) + self.items
+
+
+def test_undelivered_notice_is_kept_for_the_next_tick(tmp_path):
+    """The alerter reports failure (returns False: no admin_chat_id, API
+    error) — the notice and every one after it go back to the queue, in
+    order, and the next tick that can send delivers them."""
+    sess = FakeSession()
+    q = _NoticeQueue("first", "second")
+    sess.pop_notices, sess.requeue_notices = q.pop, q.requeue
+    sent: list[str] = []
+    up = {"ok": False}
+
+    def alert(msg: str) -> bool:
+        if up["ok"]:
+            sent.append(msg)
+        return up["ok"]
+
+    wd = make_wd(tmp_path, sess)
+    wd._alert_fn = alert
+    wd.check_once()
+    assert sent == [] and q.items == ["first", "second"]
+    up["ok"] = True
+    wd.check_once()
+    assert sent == ["first", "second"] and q.items == []
+
+
+def test_notice_send_that_raises_is_requeued_from_that_point(tmp_path):
+    sess = FakeSession()
+    q = _NoticeQueue("a", "b", "c")
+    sess.pop_notices, sess.requeue_notices = q.pop, q.requeue
+    sent: list[str] = []
+
+    def alert(msg: str) -> None:
+        if msg == "b":
+            raise RuntimeError("network")
+        sent.append(msg)
+
+    wd = make_wd(tmp_path, sess)
+    wd._alert_fn = alert
+    assert wd.check_once() == "healthy"
+    assert sent == ["a"] and q.items == ["b", "c"]
+
+
+def test_tick_survives_a_failing_notice_source(tmp_path):
+    sess = FakeSession()
+
+    def boom():
+        raise OSError("disk")
+
+    sess.pop_notices = boom
+    assert make_wd(tmp_path, sess).check_once() == "healthy"
+
+
 def test_ready_tick_delivers_pending_orphan_reply(tmp_path):
     sess = FakeSession(orphan_reply="Landing page shipped to staging.")
     alerts = []
@@ -832,3 +910,176 @@ def test_long_run_nudge_enabled_fires_exactly_once_past_threshold(tmp_path):
         clock["now"] = t
         wd.check_once()
     assert len(sess.steered) == 1
+
+
+# ── item 29: hard cap on an unattended turn ────────────────────────────────
+
+
+class CapFakeSession(LongRunFakeSession):
+    """LongRunFakeSession + a recording ``interrupt()``.
+
+    The parent deliberately LACKS ``interrupt`` — that omission is itself a
+    test case below (a duck-typed session must not crash a tick), so the
+    method lives here instead of being pushed up.
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.interrupts = 0
+
+    def interrupt(self) -> None:
+        self.interrupts += 1
+
+
+def _cap_wd(tmp_path, sess, clock, alerts, *, cap=300.0, alert_after=60.0):
+    return Watchdog(
+        sess,
+        runtime_dir=tmp_path,
+        disk_free_fn=lambda: 10_000_000_000,
+        clock_fn=lambda: clock["now"],
+        alert_fn=alerts.append,
+        min_disk_bytes=500_000_000,
+        long_run_alert_seconds=alert_after,
+        long_run_max_seconds=cap,
+    )
+
+
+def test_long_run_cap_closes_the_turn_exactly_once(tmp_path):
+    """The owner's rule, enforced: an unattended turn that outlives the cap
+    is closed once and explained once — not re-interrupted every tick."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+
+    wd.check_once()  # started
+    clock["now"] = 1299.0
+    wd.check_once()  # one second short of the cap
+    assert sess.interrupts == 0
+
+    clock["now"] = 1301.0
+    wd.check_once()  # crosses the cap
+    assert sess.interrupts == 1
+    closed = [a for a in alerts if "закрыл его автоматически" in a]
+    assert len(closed) == 1
+    assert "~5 мин" in closed[0]
+
+    # Later ticks still see the same run: no second interrupt, and no
+    # second message until a whole cap has passed (escalation window).
+    for t in (1310.0, 1400.0, 1500.0):
+        clock["now"] = t
+        wd.check_once()
+    assert sess.interrupts == 1
+    assert len([a for a in alerts if "закрыл его автоматически" in a]) == 1
+
+
+def test_long_run_cap_escalates_at_most_once_per_cap_and_never_recovers(tmp_path):
+    """A turn that ignores the interrupt gets a rare reminder — never a
+    second interrupt and never force_recover (that would destroy the very
+    context holding the partial work)."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+
+    wd.check_once()
+    clock["now"] = 1301.0
+    wd.check_once()  # closed at 1301
+    for t in (1400.0, 1500.0, 1600.0):
+        clock["now"] = t
+        wd.check_once()
+    assert [a for a in alerts if "не закрылся" in a] == []
+
+    clock["now"] = 1601.0  # a full cap after the close
+    wd.check_once()
+    assert len([a for a in alerts if "не закрылся" in a]) == 1
+    for t in (1700.0, 1800.0, 1900.0):
+        clock["now"] = t
+        wd.check_once()
+    assert len([a for a in alerts if "не закрылся" in a]) == 1
+
+    clock["now"] = 1902.0  # another full cap later
+    wd.check_once()
+    assert len([a for a in alerts if "не закрылся" in a]) == 2
+    assert sess.interrupts == 1
+    assert sess.recovered == 0
+
+
+def test_long_run_cap_disabled_never_interrupts(tmp_path):
+    """0 is the rollback switch: the heads-up alert still works, the
+    auto-close never fires however long the run drags on."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=0.0)
+    for t in range(1000, 20000, 500):
+        clock["now"] = float(t)
+        wd.check_once()
+    assert sess.interrupts == 0
+    assert [a for a in alerts if "закрыл его автоматически" in a] == []
+    assert len([a for a in alerts if "занята уже" in a]) == 1  # alert unaffected
+
+
+def test_long_run_cap_never_closes_an_attended_turn(tmp_path):
+    """An ordinary chat turn (ask() holds the lock) is the user waiting on
+    their own answer — it is never tracked, so it is never closed, however
+    far past the cap it runs."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=True)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+    for t in range(1000, 8000, 250):
+        clock["now"] = float(t)
+        wd.check_once()
+    assert sess.interrupts == 0
+    assert alerts == []
+    # The marker file is written every tick, but always as the empty
+    # "nothing tracked" state — an attended turn is never a tracked run.
+    from d_brain.services import long_run as _long_run
+
+    assert _long_run.read(tmp_path).since == 0.0
+
+
+def test_long_run_cap_survives_a_session_without_interrupt(tmp_path):
+    """Duck-typed sessions (fakes, a driver missing the method) must not
+    crash a tick — and the owner is told honestly that the close FAILED
+    rather than being told the turn was closed when it was not."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    assert not hasattr(sess, "interrupt")
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+    wd.check_once()
+    clock["now"] = 1301.0
+    assert wd.check_once() == "healthy"  # tick survives
+    assert [a for a in alerts if "закрыл его автоматически" in a] == []
+    failed = [a for a in alerts if "закрыть его автоматически не получилось" in a]
+    assert len(failed) == 1
+
+
+def test_long_run_cap_relatches_for_the_next_run(tmp_path):
+    """The latch is per-RUN, not per-process: a NEW unattended run after
+    this one ends gets its own single interrupt."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+
+    wd.check_once()
+    clock["now"] = 1301.0
+    wd.check_once()
+    assert sess.interrupts == 1
+
+    sess.pane_text = _IDLE_PANE  # run ends
+    clock["now"] = 1400.0
+    wd.check_once()
+
+    sess.pane_text = _ACTIVE_PANE  # a brand-new run starts
+    clock["now"] = 1500.0
+    wd.check_once()
+    clock["now"] = 1700.0
+    wd.check_once()  # below the cap for THIS run
+    assert sess.interrupts == 1
+    clock["now"] = 1801.0
+    wd.check_once()
+    assert sess.interrupts == 2

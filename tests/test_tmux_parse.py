@@ -23,10 +23,14 @@ from d_brain.services.tmux_parse import (
     find_latest_reply,
     find_pending_replies,
     find_unhandled_replies,
+    foreign_view_label,
     has_marker,
+    input_box_text,
+    is_agents_list_view,
     is_complete,
     is_main_turn_active,
     is_working,
+    main_area_working,
     main_turn_finished,
     open_reply_rids,
     parse_reset_time,
@@ -34,6 +38,7 @@ from d_brain.services.tmux_parse import (
     reset_epoch,
     strip_open_reply_body,
     strip_reply_bodies,
+    strip_right_column,
     unwrap_soft_breaks,
 )
 
@@ -225,7 +230,7 @@ def test_find_latest_reply_none_on_dangling_open_marker():
 def test_find_latest_reply_skips_stray_end_marker_falling_back_to_real_pair():
     """A stray end marker for a rid that never opened must be skipped, not
     mistaken for a valid (rid, body) pair."""
-    text = "<<<E:orphan01>>>\n" "<<<R:real0001>>>\nactual reply\n<<<E:real0001>>>\n"
+    text = "<<<E:orphan01>>>\n<<<R:real0001>>>\nactual reply\n<<<E:real0001>>>\n"
     assert find_latest_reply(text) == ("real0001", "actual reply")
 
 
@@ -591,7 +596,7 @@ def test_real_limit_banner_outside_markers_still_detected():
 
 
 def test_soft_limit_warning_is_not_a_block():
-    """"Approaching your weekly limit" is a heads-up; the session still
+    """ "Approaching your weekly limit" is a heads-up; the session still
     works and must not be reported as exhausted."""
     text = "  Heads up: you are approaching your weekly limit.\n" + _FOOTER
     assert classify_state(text) == PaneState.READY
@@ -1090,8 +1095,7 @@ def test_is_main_turn_active_false_on_worked_for_summary_with_agent_rows(verb):
     pane = (
         f"{verb} for 2m 22s · 2 background tasks still running\n"
         "  ◯ general-purpose  Inspecting panes   54s · ↓ 79.7k tokens\n"
-        "  ◯ general-purpose  Reading files       12s · ↓ 8.1k tokens\n"
-        + _FOOTER_LINE
+        "  ◯ general-purpose  Reading files       12s · ↓ 8.1k tokens\n" + _FOOTER_LINE
     )
     assert is_main_turn_active(pane) is False
 
@@ -1116,8 +1120,7 @@ def test_main_turn_finished_false_while_main_turn_active():
 def test_main_turn_finished_true_on_worked_for_line(verb):
     pane = (
         f"{verb} for 2m 22s · 2 background tasks still running\n"
-        "  ◯ general-purpose  still going   54s · ↓ 79.7k tokens\n"
-        + _FOOTER_LINE
+        "  ◯ general-purpose  still going   54s · ↓ 79.7k tokens\n" + _FOOTER_LINE
     )
     assert main_turn_finished(pane) is True
 
@@ -1191,9 +1194,7 @@ def test_extract_open_reply_stops_at_paren_anchored_spinner():
     boundary keeps a live spinner out of a salvaged reply's text."""
     rid = "open0010"
     pane = (
-        f"<<<R:{rid}>>>\nBody text.\n"
-        "Warping… (2m 33s · ↓ 8.4k tokens)\n"
-        "trailing junk\n"
+        f"<<<R:{rid}>>>\nBody text.\nWarping… (2m 33s · ↓ 8.4k tokens)\ntrailing junk\n"
     )
     assert extract_open_reply(pane, rid) == "Body text."
 
@@ -1493,3 +1494,424 @@ def test_turn_auth_error_not_under_wrapped_or_nested_tool_headers():
     assert not turn_auth_error(nested, "ab12")
     model_after = _TURN_ECHO + _LONG_401 + "\n● Продолжаю\n" + _FOOTER
     assert not turn_auth_error(model_after, "ab12")
+
+
+# ── foreign view (agent-infra-backlog item 28, 2026-09-19) ─────────────────
+#
+# Frames transcribed from ~/.dbrain/pane.log: the main pane switched to the
+# background task `night-second-brain` via the "← N agents" view. It still
+# classifies READY, which is why nothing noticed; only the label on the
+# prompt box's top border tells it apart from the bot's own conversation.
+
+_WIDE_RULE = "─" * 200
+_AGENTS_FOOTER = (
+    " ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents · "
+    "gh auth login for PR status · 1 memory\n"
+)
+_FOREIGN_VIEW = (
+    " ✻ Baked for 1m 12s · done 5:21 PM\n"
+    f" {'─' * 180} night-second-brain ─\n"
+    " ❯ \n"
+    f" {_WIDE_RULE}\n" + _AGENTS_FOOTER
+)
+_MAIN_VIEW = (
+    " ✻ Baked for 1m 12s · done 5:21 PM\n"
+    f" {_WIDE_RULE}\n"
+    " ❯ \n"
+    f" {_WIDE_RULE}\n" + _AGENTS_FOOTER
+)
+
+
+def test_foreign_view_label_detects_background_task_view():
+    assert classify_state(_FOREIGN_VIEW) == PaneState.READY  # the trap
+    assert foreign_view_label(_FOREIGN_VIEW) == "night-second-brain"
+
+
+def test_foreign_view_label_multiword_and_cyrillic():
+    frame = _FOREIGN_VIEW.replace(
+        "night-second-brain", "Организация мыслей и восстановление спокойствия"
+    )
+    assert (
+        foreign_view_label(frame) == "Организация мыслей и восстановление спокойствия"
+    )
+
+
+def test_foreign_view_label_detects_typed_input_in_foreign_view():
+    frame = _FOREIGN_VIEW.replace(
+        " ❯ \n", " ❯ стрелка не сработала, перезапусти основную сессию бота\n"
+    )
+    assert foreign_view_label(frame) == "night-second-brain"
+
+
+def test_main_view_has_no_foreign_label():
+    assert foreign_view_label(_MAIN_VIEW) is None
+
+
+def test_new_message_divider_is_not_a_view_label():
+    """In-transcript divider: rules on both sides, never above the input."""
+    frame = (
+        f" {'─' * 90} 1 new message {'─' * 90}\n"
+        " ● Football done (50/50) — 2 of 11 in wave 1.\n" + _MAIN_VIEW
+    )
+    assert foreign_view_label(frame) is None
+
+
+def test_foreign_label_in_scrollback_only_does_not_count():
+    """The pane was switched back to the main conversation: the old
+    labelled border scrolled up out of the chrome region."""
+    frame = _FOREIGN_VIEW + "\n".join(f" line {i}" for i in range(40)) + "\n"
+    frame += _MAIN_VIEW
+    assert foreign_view_label(frame) is None
+
+
+def test_model_text_shaped_like_a_label_is_not_a_view_label():
+    """Review finding: the model's own "─── Итог ─" heading directly above a
+    quoted "❯ …" line looks exactly like a labelled input box. Only the
+    border above the BOTTOM-MOST ❯ line (the real input) may count."""
+    frame = (
+        " ● Разбор.\n"
+        f" {'─' * 40} Итог ─\n"
+        " ❯ цитата пользовательского промпта\n"
+        "   ещё строка ответа\n" + _MAIN_VIEW
+    )
+    assert foreign_view_label(frame) is None
+
+
+def test_rename_label_is_read_but_not_judged_here():
+    """Live frame, Claude Code 2.1.278, after `/rename probe-main-name` in
+    the MAIN conversation: the very same labelled border. The parser only
+    reads the label; ClaudeSession decides whether it is foreign."""
+    frame = (
+        " ❯ /rename probe-main-name\n"
+        "   ⎿  Session renamed to: probe-main-name\n"
+        f" {'─' * 180} probe-main-name ─\n"
+        " ❯ \n"
+        f" {_WIDE_RULE}\n"
+        "   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 4 agents\n"
+    )
+    assert foreign_view_label(frame) == "probe-main-name"
+
+
+# Live frame, Claude Code 2.1.278: the "← N agents" list itself.
+_AGENTS_LIST_VIEW = (
+    "Needs input\n"
+    " ✻ current session                                  send a prompt to start\n"
+    " ✻ night-second-brain                               send test message\n"
+    "Completed\n"
+    " ∙ night-independent-qa                             independent QA review\n"
+    f"{_WIDE_RULE}\n"
+    "❯ describe a task for a new session\n"
+    f"{_WIDE_RULE}\n"
+    "  ⏵⏵ bypass permissions · enter to open · space to reply · ctrl+x to "
+    "delete · ? for shortcuts\n"
+)
+
+
+def test_agents_list_view_is_recognised():
+    assert is_agents_list_view(_AGENTS_LIST_VIEW)
+    # Unlabelled input box: why the list needs a check of its own.
+    assert foreign_view_label(_AGENTS_LIST_VIEW) is None
+
+
+def test_agents_list_view_not_seen_in_session_views():
+    assert not is_agents_list_view(_MAIN_VIEW)
+    assert not is_agents_list_view(_FOREIGN_VIEW)
+
+
+def test_list_footer_hint_counts_only_in_the_last_lines():
+    """ "ctrl+x to delete" is the list's footer. The same words in the model's
+    text higher up (still inside the chrome window) must not turn the bot's
+    own conversation into "the agents list"."""
+    quoted = (
+        " ● In the agents list, press ctrl+x to delete a finished session.\n"
+        "   Anything else?\n" + _MAIN_VIEW
+    )
+    assert not is_agents_list_view(quoted)
+    footer_only = (
+        f"{_WIDE_RULE}\n❯ \n{_WIDE_RULE}\n  ctrl+x to delete · ? for shortcuts\n"
+    )
+    assert is_agents_list_view(footer_only)
+
+
+def test_agents_list_with_a_draft_is_still_the_list():
+    """Live, 2.1.278: text typed into the list's input replaces the
+    placeholder, and the footer becomes "enter to create · esc to clear"."""
+    frame = (
+        " ∙ night-independent-qa                             independent QA\n"
+        f"{_WIDE_RULE}\n"
+        "❯ draft in list\n"
+        f"{_WIDE_RULE}\n"
+        "  enter to create · esc to clear\n"
+    )
+    assert is_agents_list_view(frame)
+
+
+# ── input box (lost Enter, 2026-09-19) ──────────────────────────────────────
+
+
+def test_input_box_text_reads_a_wrapped_unsent_paste():
+    # Live shape (2.1.278): 31-line paste still in the box after Enter.
+    frame = (
+        "● earlier\n"
+        f"{_WIDE_RULE}\n"
+        "❯ filler line\n"
+        "  filler line\n"
+        "  end <<<E:abc123>>>\n"
+        f"{_WIDE_RULE}\n"
+        "  ⏸ manual mode on\n"
+    )
+    assert input_box_text(frame) == "filler line\nfiller line\nend <<<E:abc123>>>"
+
+
+def test_input_box_text_collapsed_paste_and_empty_box():
+    box = f"{_WIDE_RULE}\n❯ [Pasted text #2 +200 lines]\n{_WIDE_RULE}\n  paste again\n"
+    assert input_box_text(box) == "[Pasted text #2 +200 lines]"
+    assert input_box_text(_MAIN_VIEW) == ""
+    assert input_box_text(_FOREIGN_VIEW) == ""  # labelled top rule is fine
+
+
+def test_input_box_text_ignores_the_unboxed_transcript_echo():
+    # The echo of a SENT prompt also starts with ❯ and carries the marker,
+    # but has no rule directly above it; the empty box below is what counts.
+    frame = (
+        "❯ ping <<<R:abc>>> and <<<E:abc>>>\n"
+        "✻ Working… (esc to interrupt)\n"
+        f"{_WIDE_RULE}\n❯ \n{_WIDE_RULE}\n"
+    )
+    assert input_box_text(frame) == ""
+    echo_only = "● answer\n❯ ping <<<E:abc>>>\n  more\n"
+    assert input_box_text(echo_only) is None
+
+
+def test_input_box_text_keeps_an_emptied_last_row():
+    frame = f"{_WIDE_RULE}\n❯ human line one\n  \n{_WIDE_RULE}\n"
+    assert input_box_text(frame) == "human line one\n"
+
+
+def test_input_box_text_needs_the_closing_rule():
+    assert input_box_text(f"{_WIDE_RULE}\n❯ half a box <<<E:abc>>>\n") is None
+
+
+# ── two-column frames (2026-09-20 incident) ─────────────────────────────
+#
+# A pane rendered in two columns (transcript left, a file diff right) puts
+# text AFTER the `<<<E:id>>>` marker on its line. The marker regexes require
+# the marker at END of line — that is the ONLY thing separating a real answer
+# from the prompt echo — so every reply of the second instance parsed as
+# region=None and nothing reached its user. The rule is NOT relaxed here: the
+# right column is cut off and the same strict rule re-applied.
+
+_TWO_COL_RID = "dfca5573"
+
+
+def _two_column_frame() -> str:
+    return (_FIXTURES_DIR / "pane_two_column.txt").read_text(encoding="utf-8")
+
+
+def test_two_column_frame_still_finds_the_reply():
+    """The regression this whole change exists for."""
+    frame = _two_column_frame()
+    # Precondition: the end marker really is NOT at the end of its line — the
+    # fixture must reproduce the broken shape, not an already-clean frame.
+    # The LAST one — the first is the prompt echo's own mention of it.
+    marker_line = [ln for ln in frame.splitlines() if f"<<<E:{_TWO_COL_RID}>>>" in ln][
+        -1
+    ]
+    assert not marker_line.rstrip().endswith(">>>")
+    assert "+ЬКО" in marker_line  # the right column's diff text
+
+    body = extract_reply(frame, _TWO_COL_RID)
+    assert body is not None
+    assert "три отдельные правки" in body
+    assert is_complete(frame, _TWO_COL_RID)
+    assert has_marker(frame, _TWO_COL_RID, "R")
+    assert has_marker(frame, _TWO_COL_RID, "E")
+    assert reply_rids(frame) == {_TWO_COL_RID}
+    assert [r for r, _ in find_unhandled_replies(frame, set())] == [_TWO_COL_RID]
+    assert find_latest_reply(frame) == (_TWO_COL_RID, body)
+
+
+def test_two_column_reply_body_carries_no_right_column_text():
+    """Cutting every line at ONE fixed column leaks the first characters of
+    any cell that starts further left — the right column's own cells are
+    indented differently. Measured; it corrupted the body. Each line is cut
+    at its own gutter instead, and this is the regression test for it."""
+    body = extract_reply(_two_column_frame(), _TWO_COL_RID)
+    for leaked in ("+ЬКО", "+Полив", "Грунт", "+для растений"):
+        assert leaked not in body
+    assert "10" not in body and "12" not in body  # stray diff line numbers
+
+
+def test_two_column_frame_still_rejects_the_prompt_echo():
+    """The echo lives INSIDE the left column and keeps its own trailing text
+    after the marker, so cutting the right column must not promote it to a
+    deliverable reply. Without this the 'marker at end of line' rule would be
+    relaxed in effect, and every prompt would answer itself."""
+    lines = _two_column_frame().split("\n")
+    # Rows 10..16 are the model's real answer; drop them, keep the echo.
+    echo_only = "\n".join(lines[:10] + lines[17:])
+    assert f"<<<R:{_TWO_COL_RID}>>>" in echo_only  # the echo is still there
+    assert extract_reply(echo_only, _TWO_COL_RID) is None
+    assert extract_open_reply(echo_only, _TWO_COL_RID) is None
+    assert not is_complete(echo_only, _TWO_COL_RID)
+    assert find_unhandled_replies(echo_only, set()) == []
+    assert find_latest_reply(echo_only) is None
+    assert open_reply_rids(echo_only) == set()
+
+
+def test_two_column_open_span_is_salvaged_and_strippable():
+    """`region=None` was logged by the SALVAGE path: with text after it the
+    OPEN marker was not line-anchored either, so an unclosed answer had no
+    delivery path at all."""
+    lines = _two_column_frame().split("\n")
+    open_only = "\n".join(lines[:15] + lines[16:])  # drop the E marker row
+    assert extract_reply(open_only, _TWO_COL_RID) is None
+    body = extract_open_reply(open_only, _TWO_COL_RID)
+    assert body is not None and "три отдельные правки" in body
+    assert open_reply_rids(open_only) == {_TWO_COL_RID}
+
+    # …and that body must also be removable from the RAW frame, or the prose
+    # it delivers sits in the chrome window and can fake a RATE_LIMITED.
+    stripped = strip_open_reply_body(open_only, _TWO_COL_RID)
+    assert "три отдельные правки" not in stripped
+    assert f"<<<R:{_TWO_COL_RID}>>>" in stripped  # the marker row survives
+    assert "bypass permissions on" in stripped  # chrome below it survives
+
+
+def test_single_column_frames_are_left_exactly_as_they_are():
+    """The fallback must be invisible on a normal pane: no column detected,
+    so every marker function sees the raw capture, byte for byte."""
+    rid = "abcd1234"
+    normal = (
+        f"❯ reply and wrap it in <<<R:{rid}>>> and <<<E:{rid}>>> markers\n"
+        "✻ Working… (12s · ↓ 300 tokens)\n"
+        f"⏺ <<<R:{rid}>>>\n"
+        "  Готово, файл обновлён.\n"
+        f"  <<<E:{rid}>>>\n"
+        f"{_WIDE_RULE}\n❯ \n{_WIDE_RULE}\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    assert strip_right_column(normal) == normal
+    assert extract_reply(normal, rid) == "Готово, файл обновлён."
+
+
+def test_an_indented_block_is_not_mistaken_for_a_column():
+    """A diff body / code block is indented but has NOTHING to its left, and
+    that is exactly what separates an indent from a real second column.
+    Cutting it would delete the block."""
+    diff = (
+        "⏺ Update(sample.md)\n"
+        "  ⎿  Added 3 lines\n"
+        "      1  # Грунт\n"
+        "      2\n"
+        "      3  Мы используем европейский минеральный грунт\n"
+        "      4 +для растений в интерьере\n"
+        "      5 +и для оранжерей\n"
+        "      6 +и для зимних садов\n"
+    )
+    assert strip_right_column(diff) == diff
+
+
+def test_real_single_column_captures_detect_no_column():
+    """Guard on the detector's precision — the property the whole fallback
+    rests on, because a false positive TRUNCATES a reply instead of dropping
+    it. Checked against the real captures this suite already carries."""
+    for frame in (
+        READY_CAPTURE,
+        READY_NO_BYPASS_CAPTURE,
+        (_FIXTURES_DIR / "pane_salvage_incident.txt").read_text(encoding="utf-8"),
+    ):
+        assert strip_right_column(frame) == frame
+
+
+# ── main_area_working (the salvage safety net, backlog item 32) ───────────
+
+_MAW_BOX = "─" * 80
+_MAW_FOOTER = (
+    "  ⏵⏵ bypass permissions on · 2 background tasks · esc to interrupt · "
+    "← for agents · ↓ to manage\n"
+)
+
+
+def test_main_area_working_sees_the_non_paren_spinner_above_the_box():
+    """The shape is_main_turn_active() misses — this is the whole point."""
+    pane = (
+        "⏺ some reply text\n"
+        "✢ Razzle-dazzling…  44s · ↓1.8k tokens\n"
+        f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
+    )
+    assert is_main_turn_active(pane) is False
+    assert main_area_working(pane) is True
+
+
+def test_main_area_working_ignores_background_agent_rows_below_the_box():
+    """A listed background task must never read as "the main turn is still
+    writing" — that is Defect A/B, and the golden incident fixture has
+    exactly this shape."""
+    pane = (
+        "⏺ some reply text\n"
+        "Worked for 3m 41s · 1 background task still running\n"
+        f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n"
+        "  hello | Opus 4.8 (1M context) | ~/p\n"
+        f"{_MAW_FOOTER}"
+        "  ● main\n"
+        "  ◯ general-purpose  Reviewing salvage fix diff   3m 14s · ↓ 42.7k tokens\n"
+    )
+    assert main_area_working(pane) is False
+
+
+def test_main_area_working_ignores_agent_rows_drawn_above_the_footer():
+    """Same rows, the other measured layout (above the footer, still below
+    the prompt box) — the cut is the box, not the footer."""
+    pane = (
+        "⏺ some reply text\n"
+        "Worked for 2m 22s · 1 background task still running\n"
+        f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n"
+        "  ● main\n"
+        "  ◯ general-purpose  still going   12s · ↓ 12k tokens\n"
+        f"{_MAW_FOOTER}"
+    )
+    assert main_area_working(pane) is False
+
+
+def test_main_area_working_ignores_the_footers_own_esc_to_interrupt():
+    """99.6% of real "esc to interrupt" occurrences are the persistent
+    footer with the main turn long finished (backlog item 12)."""
+    pane = f"⏺ some reply text\n{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
+    assert main_area_working(pane) is False
+
+
+def test_main_area_working_sees_a_background_agent_wait_above_the_box():
+    pane = (
+        "⏺ some reply text\n"
+        "✻ Waiting for 1 background agent to finish\n"
+        f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
+    )
+    assert main_area_working(pane) is True
+
+
+def test_main_area_working_finds_the_box_from_the_bottom_not_the_top():
+    """A markdown rule in the model's own reply renders as the same box-rule
+    shape, and the reply is IN this window (only closed pairs are stripped).
+    Cutting at the first one from the top hid the live spinner below it —
+    the second-round review finding."""
+    pane = (
+        "⏺ some reply text\n"
+        "Here is the summary:\n"
+        f"{_MAW_BOX}\n"
+        "More to check.\n"
+        "✢ Razzle-dazzling…  44s · ↓1.8k tokens\n"
+        f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
+    )
+    assert main_area_working(pane) is True
+
+
+def test_main_area_working_survives_a_quoted_prompt_line_in_the_reply():
+    """Same trap via `_IDLE_BARE_RE`: the model quoting a bare ❯ line."""
+    pane = (
+        "⏺ some reply text\n"
+        "❯\n"
+        "✢ Razzle-dazzling…  44s · ↓1.8k tokens\n"
+        f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
+    )
+    assert main_area_working(pane) is True

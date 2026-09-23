@@ -44,7 +44,25 @@ fi
 
 faults=()
 
-unit_active() { systemctl "$SCOPE_FLAG" is-active --quiet "$1"; }
+# `is-active` is true only for active/reloading — a unit in `deactivating`
+# fails it. That used to be a window of a second or two; since 2026-09-22 a
+# graceful stop can hold `deactivating` for up to ~5.5 minutes (backlog item
+# 33 step 3: the bot lets the turn in flight finish before it exits), which
+# is LONGER than this check's own 5-minute timer. Keeping the shortcut would
+# have alerted "бот не активен" on both channels during essentially every
+# restart that paid the grace — cry-wolf, which this script's header forbids,
+# and about the bot doing exactly what it was told.
+#
+# So read the state instead: a unit that is on its way up or down is not a
+# fault. `failed`, `inactive` and `dead` still are.
+unit_active() {
+    local state
+    state="$(systemctl "$SCOPE_FLAG" show -p ActiveState --value "$1" 2>/dev/null)"
+    case "$state" in
+        active|reloading|activating|deactivating) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 unit_active "$BOT_UNIT" || faults+=("$BOT_UNIT не активен")
 unit_active "$WATCHDOG_UNIT" || faults+=("$WATCHDOG_UNIT не активен")

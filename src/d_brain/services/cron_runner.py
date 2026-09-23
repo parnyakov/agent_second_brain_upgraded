@@ -16,6 +16,7 @@ Semantics:
 import asyncio
 import contextlib
 import copy
+import html
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -195,6 +196,14 @@ class CronRunner:
                     except Exception as exc:  # noqa: BLE001 — Telegram hiccup
                         logger.exception("cron job %s delivery failed", job.id)
                         delivery_error = str(exc)[:200]
+                    # NOTE (2026-09-22, durable outbox): `deliver` is
+                    # `send_response`, which now queues the reply before it
+                    # sends it — a Telegram hiccup no longer raises here, it
+                    # becomes a retry. So this branch narrowed to "could not
+                    # even be queued". A reply that ends up undeliverable is
+                    # NOT the job's fault and deliberately no longer counts
+                    # toward max_consecutive_errors; it is reported by the
+                    # outbox itself, in /work's dead-queue line.
             # Jobs are stateless by contract; drop the turn's context so
             # the next job starts clean and the window never grows. Best
             # effort — a failed /clear must not block the state update.
@@ -391,7 +400,27 @@ class CronRunner:
 
     # ── loop ─────────────────────────────────────────────────────────
 
+    async def _deliver_notices(self) -> None:
+        """Forward the cron brain's owner notices (e.g. its pane was parked
+        off a background task's view — agent-infra-backlog item 28). The
+        watchdog only watches the main brain, so the cron loop does this
+        for its own session. Best-effort, never breaks the tick."""
+        pop = getattr(self.session, "pop_notices", None)
+        if pop is None:
+            return
+        try:
+            notices = list(await asyncio.to_thread(pop))
+        except Exception:  # noqa: BLE001
+            logger.warning("could not read cron session notices", exc_info=True)
+            return
+        for text in notices:
+            try:
+                await self.alert(html.escape(text))
+            except Exception:  # noqa: BLE001
+                logger.error("cron owner notice lost: %s", text, exc_info=True)
+
     async def tick(self) -> None:
+        await self._deliver_notices()
         await self._limit_recovery()
         for job in self.claim_due(self.clock()):
             try:

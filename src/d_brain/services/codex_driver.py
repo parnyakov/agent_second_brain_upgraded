@@ -224,7 +224,7 @@ class CodexExecDriver:
     Constructor deliberately mirrors ``ClaudeSession``'s shape where the
     concept survives (``session_name`` / ``work_dir`` / ``runtime_dir`` /
     ``model`` / injected clock+sleep+rid for tests) and drops what does not
-    (``mcp_config``, ``tmux_config``, ``transcript_shadow_mode``,
+    (``mcp_config``, ``tmux_config``,
     ``system_prompt_file`` → ``instructions_file``).
     """
 

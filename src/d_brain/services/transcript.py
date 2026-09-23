@@ -8,16 +8,28 @@ is pure parsing + incremental file I/O, no tmux/subprocess — mirrors the
 tmux_parse/claude_session split so this stays independently unit-testable
 against small hand-built JSONL fixtures.
 
-Kept STRICTLY diagnostic (shadow mode) for this round: nothing here is
-allowed to become the thing actually delivered to Telegram yet — see
-ClaudeSession's ``transcript_shadow_mode`` wiring in claude_session.py.
+**This is THE source of a reply** (backlog item 32, 2026-09-22). It was
+diagnostic-only ("shadow mode") until the failure that made the screen-scrape
+path untenable: ``capture-pane`` only ever shows the last
+``_CAPTURE_SCROLLBACK`` lines, so a reply LONGER than that window scrolls its
+own ``<<<R:id>>>`` opening marker out of the frame before the turn ends. The
+pane then holds a complete, ready answer that the parser cannot recognise
+(``region=None``), the caller waits out its whole ceiling and the owner gets
+"превышено время ожидания" — the longer and more useful the answer, the more
+likely it is lost (live case on a second instance, 22.09, 412 694 ms). The
+transcript has no window: every record ever appended stays in the file, so
+length stops being a delivery risk. The pane is still read, but only for
+PANE STATE (working / finished / rate-limited / logged out / foreign view) —
+never for reply text. See :class:`ReplyTail`, the one entry point ``ask()``
+uses.
 
 Format risk (explicitly flagged by the audit): the JSONL schema is not a
 published/versioned API and can drift between CLI releases. Every entry
 point here is written to fail closed and quiet on a single malformed
-line/record (skip it) rather than raise — a caller integrating this into a
-live turn must never let a transcript-shape surprise take down real
-delivery.
+line/record (skip it) rather than raise — a transcript-shape surprise must
+degrade to "no reply found yet" (the caller then rides its existing
+ceiling/timeout path, exactly as it did when a marker went missing on the
+pane), never to an exception out of a live turn.
 """
 
 from __future__ import annotations
@@ -37,23 +49,76 @@ _OPEN_RE = re.compile(r"(?m)^.*?<<<R:(\w+)>>>[ \t]*\r?$")
 _CLOSE_RE = re.compile(r"(?m)^.*?<<<E:(\w+)>>>[ \t]*\r?$")
 
 
+def transcript_dir(work_dir: Path | str) -> Path:
+    """The directory Claude Code keeps this cwd's transcripts in.
+
+    THE one place the project-dir slug is computed — see
+    :func:`transcript_path` for the rule and the evidence behind it. It was
+    spelled out separately in three places, and two of them (this session's
+    post-`/clear` resync and scripts/marker_compliance.py) had the same
+    slashes-only bug.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(Path(work_dir).resolve()))
+    return Path.home() / ".claude" / "projects" / slug
+
+
 def transcript_path(work_dir: Path | str, session_id: str) -> Path:
     """Path Claude Code writes this session's transcript to.
 
-    Slug convention verified against the live install (also used by
-    ``scripts/marker_compliance.py``): the absolute cwd with every ``/``
-    replaced by ``-``.
+    Slug convention, re-verified live 2026-09-22 against a throwaway session
+    (NOT assumed): the absolute cwd with every character that is not a letter
+    or digit replaced by ``-``. It is not only ``/`` — the original version of
+    this function replaced slashes alone and pointed at a directory that does
+    not exist for any cwd containing a ``_`` or a ``.``. Evidence: a session
+    started in ``/tmp/dbrain-smoke-tfgw_84x/work`` writes to
+    ``…/projects/-tmp-dbrain-smoke-tfgw-84x-work/``, and this repo's own
+    worktrees (``…/agent-second-brain/.claude/worktrees/x``) appear as
+    ``-home-…-agent-second-brain--claude-worktrees-x`` — the doubled dash is
+    the ``/`` and the ``.``. It went unnoticed because the production vault
+    path happens to contain neither character.
+
+    Since the reply itself is now read from this file, a wrong path is a
+    total delivery failure rather than a degraded diagnostic — so when the
+    computed path does not exist, the pinned session id (a UUID, unique
+    across every project dir) is looked up directly. If that finds nothing
+    either, the computed path is returned unchanged and the caller sees a
+    missing file, exactly as before.
     """
-    slug = str(Path(work_dir).resolve()).replace("/", "-")
-    return Path.home() / ".claude" / "projects" / slug / f"{session_id}.jsonl"
+    projects = Path.home() / ".claude" / "projects"
+    computed = transcript_dir(work_dir) / f"{session_id}.jsonl"
+    if computed.exists():
+        return computed
+    try:
+        for found in projects.glob(f"*/{session_id}.jsonl"):
+            logger.warning(
+                "transcript for session %s is not at the computed path %s but "
+                "at %s — using the pinned id's actual location",
+                session_id,
+                computed,
+                found,
+            )
+            return found
+    except OSError:
+        pass
+    return computed
 
 
 def _record_text(rec: dict) -> str | None:
     """Assistant text content of one JSONL record, or ``None`` if this
-    record carries no assistant text (tool_use/tool_result/user/meta/...)."""
+    record carries no assistant text (tool_use/tool_result/user/meta/...).
+
+    ``model == "<synthetic>"`` records are skipped: those are Claude Code's
+    own meta entries (compaction notices and the like), not something the
+    model said. They never carry a reply, and letting one land BETWEEN an
+    open and a closing marker would splice CLI chrome into a delivered
+    answer. Same skip as :func:`latest_context_tokens` makes, for the same
+    "that is not the model talking" reason.
+    """
     if rec.get("type") != "assistant":
         return None
     message = rec.get("message") or {}
+    if message.get("model") == "<synthetic>":
+        return None
     content = message.get("content")
     if isinstance(content, str):
         return content or None
@@ -77,17 +142,14 @@ class TranscriptReply:
     closed: bool  # True iff a matching <<<E:rid>>> line was found
 
 
-def extract_reply_from_record(rec: dict, rid: str) -> TranscriptReply | None:
-    """The ``rid``'s reply from one JSONL record, or ``None``.
+def extract_reply_from_text(text: str, rid: str) -> TranscriptReply | None:
+    """The ``rid``'s reply inside raw (un-rendered) model ``text``, or ``None``.
 
     Mirrors :func:`d_brain.services.tmux_parse.extract_reply`'s line-
-    anchoring rules against raw model text. ``isSidechain`` records are
-    REJECTED unconditionally — a background subagent's own text must never
-    be mistaken for the main turn's reply (explicit audit risk note).
+    anchoring rules. A LAST open marker / FIRST close after it, so a turn
+    that (wrongly) emitted the pair twice yields the newest complete answer,
+    never a splice of both.
     """
-    if rec.get("isSidechain"):
-        return None
-    text = _record_text(rec)
     if not text:
         return None
     my_opens = [m for m in _OPEN_RE.finditer(text) if m.group(1) == rid]
@@ -111,7 +173,7 @@ def latest_reply(
 ) -> tuple[str, str | None]:
     """The most recent assistant reply in the transcript at ``path``,
     scanning the tail IN REVERSE — WITHOUT requiring a known ``rid`` up
-    front (unlike :func:`extract_reply_from_record`, which needs one).
+    front (unlike :class:`ReplyTail`, which follows a known one).
 
     Backlog item 14: powers the ``/resend`` command, a manual, READ-ONLY
     escape hatch for the ~3.3% of turns measured where the tmux-pane-scrape
@@ -350,3 +412,88 @@ class TranscriptTail:
                 )
         self._offset += consumed
         return records
+
+
+class ReplyTail:
+    """THE reply source for one in-flight turn (backlog item 32).
+
+    Anchored at the transcript's end the moment the prompt is sent, so it can
+    only ever see text the model produced FOR THIS TURN — an older reply
+    already in the file is invisible to it, and a second turn gets its own
+    instance (and its own rid) rather than inheriting this one's state.
+
+    Why text is accumulated across records instead of matched per record:
+    Claude Code closes an assistant record whenever the model stops to call a
+    tool, so a reply that opens with ``<<<R:id>>>``, pauses for a tool call and
+    then finishes lands in TWO records with the pair split across them. Joined
+    in arrival order, the markers line up again exactly as the model wrote
+    them. ``isSidechain`` records are dropped unconditionally on the way in —
+    a background subagent's own text must never be mistaken for the main
+    turn's reply (explicit audit risk note, R1).
+
+    :meth:`poll` returns:
+      * ``None`` — no ``<<<R:rid>>>`` seen yet (still thinking, narrating, or
+        running tools).
+      * ``TranscriptReply(closed=False)`` — the opening marker and a body, no
+        closing marker yet. The turn may still be writing: a caller must NOT
+        deliver this as a finished answer on sight (half a reply is worse
+        than a late one). It is what the caller's existing salvage/ceiling
+        rules judge, for the ~3% of turns where the model never emits the
+        closing marker at all (backlog item 11).
+      * ``TranscriptReply(closed=True)`` — a complete reply. Deliverable.
+
+    Never raises: a missing file, an unreadable one, a malformed line and an
+    unexpected record shape all degrade to "nothing found yet".
+    """
+
+    def __init__(self, path: Path | str, rid: str) -> None:
+        self._tail = TranscriptTail.at_end(path)
+        self._rid = rid
+        self._parts: list[str] = []
+        self._joined: str | None = None
+        self._reply: TranscriptReply | None = None
+        #: True once ANY record at all has been consumed for this turn —
+        #: "the transcript is alive", as opposed to a tail following a file
+        #: nobody writes (a stale pin, a `claude` restarted inside the pane
+        #: under a different id). The caller logs it when a turn ends empty.
+        self.saw_records = False
+        #: True once an opening ``<<<R:rid>>>`` has been seen, even if the
+        #: body after it is empty (so :meth:`poll` returns ``None``). The
+        #: caller's honest "did the model ever start answering" flag — which
+        #: must not hinge on the answer being non-empty.
+        self.saw_open = False
+
+    def poll(self) -> TranscriptReply | None:
+        """Consume whatever the model appended since the last call and report
+        this rid's reply as it currently stands."""
+        added = False
+        for rec in self._tail.poll_new_records():
+            self.saw_records = True
+            try:
+                if not isinstance(rec, dict) or rec.get("isSidechain"):
+                    continue
+                text = _record_text(rec)
+            except Exception:  # noqa: BLE001 — schema drift must never be fatal
+                logger.debug(
+                    "skipping malformed transcript record while following a "
+                    "live turn",
+                    exc_info=True,
+                )
+                continue
+            if text:
+                self._parts.append(text)
+                added = True
+        if not self._parts:
+            return None
+        # Rebuild only when something actually arrived: a quiet turn is polled
+        # once a second for up to an hour, and re-joining the whole
+        # accumulated text every time would make a long agentic turn
+        # quadratic in its own length.
+        if added or self._joined is None:
+            self._joined = "\n".join(self._parts)
+            if not self.saw_open:
+                self.saw_open = any(
+                    m.group(1) == self._rid for m in _OPEN_RE.finditer(self._joined)
+                )
+            self._reply = extract_reply_from_text(self._joined, self._rid)
+        return self._reply

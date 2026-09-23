@@ -22,15 +22,17 @@ from d_brain.services.processor import ClaudeProcessor
 # object ever constructed today is still ClaudeSession.
 _session: EngineDriver | None = None
 _cron_session: EngineDriver | None = None
+_duty_session: EngineDriver | None = None
 _processor: ClaudeProcessor | None = None
 _ask_lock = asyncio.Lock()
 
 
 def reset() -> None:
     """Drop the singletons (tests only)."""
-    global _session, _cron_session, _processor
+    global _session, _cron_session, _duty_session, _processor
     _session = None
     _cron_session = None
+    _duty_session = None
     _processor = None
 
 
@@ -48,8 +50,26 @@ def _persisted_name(settings: Settings) -> str:
     return name
 
 
+def _stall_kwarg(stall_timeout: float | None) -> dict[str, float]:
+    """``{"stall_timeout": x}`` or ``{}`` (review round 3, R1).
+
+    An EMPTY dict when unset, rather than passing the engine constant
+    explicitly: the main and cron sessions must keep constructing their
+    driver with byte-for-byte the arguments they did before this parameter
+    existed, so that whatever each driver's own default is — including a
+    future change to it — remains theirs. Only the duty session, which is
+    watched by nobody (see Settings.duty_stall_timeout), opts into an
+    override.
+    """
+    return {} if stall_timeout is None else {"stall_timeout": float(stall_timeout)}
+
+
 def _build_codex_session(
-    settings: Settings, *, session_name: str, runtime_dir: Path
+    settings: Settings,
+    *,
+    session_name: str,
+    runtime_dir: Path,
+    stall_timeout: float | None = None,
 ) -> EngineDriver:
     """Construct the Codex-backed driver (Codex plan, phase 2).
 
@@ -59,9 +79,6 @@ def _build_codex_session(
 
     * ``mcp_config`` / ``tmux_config`` — MCP is configured in Codex's own
       config, and there is no tmux.
-    * ``transcript_shadow_mode`` — that flag diffs the tmux screen-scrape
-      against the JSONL transcript. This engine has exactly one source for
-      the reply (the ``agent_message`` event), so there is nothing to shadow.
     * ``system_prompt_file`` → ``instructions_file``. Claude Code takes the
       persona via ``--append-system-prompt``; Codex takes AGENTS.md-shaped
       standing instructions, so this points at ``deploy/codex-agents.md``,
@@ -91,6 +108,7 @@ def _build_codex_session(
         instructions_file=instructions,
         model=settings.codex_model or None,
         **extra,
+        **_stall_kwarg(stall_timeout),
     )
 
 
@@ -100,14 +118,21 @@ def _build_session(
     session_name: str,
     runtime_dir: Path,
     engine: str = "claude",
+    stall_timeout: float | None = None,
 ) -> EngineDriver:
     # Engine seam (Codex plan, phase 1). Everything below this branch is the
     # unmodified pre-seam function: engine="claude" — the default, and the
     # only value production ever passes today — builds byte-for-byte the same
     # ClaudeSession with the same arguments as before this parameter existed.
+    #
+    # `stall_timeout` (review round 3, R1) keeps that property: left unset it
+    # reaches neither driver's constructor at all — see _stall_kwarg.
     if engine == "codex":
         return _build_codex_session(
-            settings, session_name=session_name, runtime_dir=runtime_dir
+            settings,
+            session_name=session_name,
+            runtime_dir=runtime_dir,
+            stall_timeout=stall_timeout,
         )
     if engine != "claude":
         raise ValueError(f"unknown engine: {engine!r}")
@@ -143,8 +168,12 @@ def _build_session(
         mcp_config=mcp if mcp.exists() else None,
         system_prompt_file=brain_prompt,
         model=settings.claude_model or None,
-        transcript_shadow_mode=settings.transcript_shadow_mode,
         tmux_config=tmux_conf if tmux_conf.exists() else None,
+        # Defaults equal the previously hardcoded 200x50, so an install
+        # that sets neither env var is unchanged (see Settings.pane_width).
+        pane_width=settings.pane_width,
+        pane_height=settings.pane_height,
+        **_stall_kwarg(stall_timeout),
     )
 
 
@@ -177,6 +206,44 @@ def get_cron_session(settings: Settings) -> EngineDriver:
             engine=settings.cron_engine,
         )
     return _cron_session
+
+
+def get_duty_session(settings: Settings) -> EngineDriver:
+    """Return the duty brain — a THIRD, isolated session (backlog items 29-30).
+
+    Exact sibling of ``get_cron_session``: same persona and vault, its own
+    session name and its own runtime dir. Two things are deliberately
+    different:
+
+    * It follows ``chat_engine``, not ``cron_engine``. The duty session
+      stands in for the CHAT brain when that one is busy, so flipping the
+      chat engine to Codex must take the stand-in with it — otherwise an
+      operator running Codex for chat would still boot a tmux Claude
+      session behind their back.
+    * It is never ``/clear``-ed per job the way the cron session is; the
+      clear is time-based (``duty_idle_reset_seconds``), so several
+      messages arriving inside one busy window keep their own thread.
+    * It is the ONLY session built with an explicit ``stall_timeout``
+      (review round 3, R1). The engine default (900s) sits above this
+      session's whole turn budget (``duty_turn_timeout``, 600s), which made
+      the stall interrupt unreachable — and ``duty_dir`` is watched by
+      nobody: the watchdog polls ``settings.runtime_dir`` only, so neither
+      its recovery nor its orphan-reply poller covers this session. Self-
+      interruption inside the budget is the only backstop it has.
+
+    The cron session is NOT reused for this on purpose: it is wiped after
+    every scheduled job and can be busy with one when the user writes.
+    """
+    global _duty_session
+    if _duty_session is None:
+        _duty_session = _build_session(
+            settings,
+            session_name=f"{_persisted_name(settings)}_duty",
+            runtime_dir=settings.duty_dir,
+            engine=settings.chat_engine,
+            stall_timeout=settings.duty_stall_timeout or None,
+        )
+    return _duty_session
 
 
 def get_processor(settings: Settings) -> ClaudeProcessor:

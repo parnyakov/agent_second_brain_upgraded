@@ -789,3 +789,371 @@ def test_two_documents_in_the_same_second_only_dispatch_one(monkeypatch, tmp_pat
     # librarian promise holds for BOTH files regardless
     assert len(list((tmp_path / "attachments/2026-09-04").glob("img-*.jpg"))) == 2
     assert chat._media_claim_at is None
+
+
+# ── duty session routing (agent-infra-backlog items 29-30) ────────────────
+
+
+class DutyManager(FakeManager):
+    """Lock-free but pane-busy — the unattended-cascade shape — with the duty
+    hooks the real ChatSessionManager exposes."""
+
+    def __init__(self, *, main_busy: bool, duty_reply: str = "<b>из дежурной</b>"):
+        super().__init__()
+        self.main_busy = main_busy
+        self.duty_reply = duty_reply
+        self.duty_calls: list[tuple[int, str, str | None]] = []
+        self.steerable = True
+        self.steered: list[str] = []
+
+    def is_turn_active(self) -> bool:
+        return not self.steerable  # a maintenance turn holds the session
+
+    def is_steerable_turn(self) -> bool:
+        return self.steerable
+
+    async def steer(self, text: str) -> None:
+        self.steered.append(text)
+
+    async def is_main_busy(self) -> bool:
+        return self.main_busy
+
+    async def answer_from_duty(self, user_id, prompt, *, busy_seconds=None,
+                               fallback=None) -> str:
+        self.duty_calls.append((user_id, prompt, fallback))
+        return self.duty_reply
+
+
+def test_busy_main_session_answers_from_duty_without_entering_ask(monkeypatch):
+    """The owner's complaint (item 29): during an unattended cascade the
+    ask-lock is free, so the message used to go into ask() and burn the
+    whole busy-wait budget only to return a brush-off. The pane check now
+    routes it to the duty session instead — ask() is never entered."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="запиши мысль"))
+    assert mgr.sent == []  # never reached the main session's ask()
+    assert mgr.duty_calls == [(1, "запиши мысль", None)]
+    assert bot.messages and "из дежурной" in bot.messages[0][1]
+
+
+def test_idle_main_session_still_takes_the_normal_path(monkeypatch):
+    """The gate must not divert anything when the pane is genuinely idle."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=False)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="привет"))
+    assert mgr.sent == [(1, "привет")]
+    assert mgr.duty_calls == []
+
+
+def test_maintenance_turn_is_answered_from_duty(monkeypatch):
+    """A message during a non-steerable (maintenance) turn must still not be
+    injected into that turn — but it now gets a real answer instead of the
+    'повтори через несколько минут' brush-off."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=False)
+    mgr.steerable = False
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="пиши короче"))
+    assert mgr.steered == []  # nothing contaminated the maintenance turn
+    assert mgr.sent == []
+    assert len(mgr.duty_calls) == 1
+    # the pre-duty wording is handed down as the fallback, verbatim
+    assert "обслуживание" in mgr.duty_calls[0][2]
+    assert "из дежурной" in bot.messages[0][1]
+
+
+def test_duty_path_shows_typing(monkeypatch):
+    from d_brain.bot.handlers import chat
+
+    class TypingBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.typing = 0
+
+        async def send_chat_action(self, chat_id, action):
+            self.typing += 1
+
+    mgr = DutyManager(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = TypingBot()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="привет"))
+    assert bot.typing >= 1
+
+
+def test_duty_path_crash_still_delivers_the_old_message(monkeypatch):
+    """A failure inside the duty path must leave the user with the pre-duty
+    message, never with silence."""
+    from d_brain.bot.handlers import chat
+
+    class Broken(DutyManager):
+        async def answer_from_duty(self, *a, **kw):
+            raise RuntimeError("duty exploded")
+
+    mgr = Broken(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="привет"))
+    assert bot.messages and "/stop" in bot.messages[0][1]
+
+
+def test_a_manager_without_the_duty_probe_keeps_todays_path(monkeypatch):
+    """Forward/backward compatibility: no is_main_busy ⇒ straight into the
+    main session, exactly as before this feature."""
+    from d_brain.bot.handlers import chat
+
+    mgr = FakeManager()
+    assert not hasattr(mgr, "is_main_busy")
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="привет"))
+    assert mgr.sent == [(1, "привет")]
+
+
+# ── the gate covers EVERY input path, not just text (blind review F6) ─────
+
+
+def test_the_busy_gates_live_in_run_turn_not_in_dispatch_text():
+    """Structural guard for F6. The gate was originally in _dispatch_text,
+    which left voice — the system's PRIMARY channel — and media outside it:
+    they call _process_and_reply directly. It now lives in _run_turn, behind
+    the single _process_and_reply choke point every path funnels through; a
+    future edit that moves either probe back to the text path would silently
+    re-open the hole for three of the four paths, and every behavioral test
+    below would still pass because they all enter through text.
+
+    ``_held_by_maintenance`` is in the same list for the same reason: it
+    replaced the ``is_steerable_turn`` branch that used to sit in
+    _dispatch_text and therefore only ever protected typed text."""
+    import inspect
+
+    from d_brain.bot.handlers import chat
+
+    turn = inspect.getsource(chat._run_turn)
+    dispatch = inspect.getsource(chat._dispatch_text)
+    for probe in ("_main_is_busy", "_held_by_maintenance"):
+        assert probe in turn
+        assert probe not in dispatch
+
+
+def test_voice_path_gets_the_duty_answer_without_entering_ask(monkeypatch):
+    """The voice-first case the whole feature exists for: before F6 a voice
+    message arriving during an unattended cascade paid the full
+    DEFAULT_BUSY_WAIT_BUDGET (up to 300s of silence) before the duty session
+    answered."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(
+        chat._process_and_reply(bot, chat_id=10, user_id=1, prompt="[voice] мысль")
+    )
+    assert mgr.sent == []  # never reached the main session's ask()
+    assert mgr.duty_calls == [(1, "[voice] мысль", None)]
+    assert bot.messages and "из дежурной" in bot.messages[0][1]
+
+
+class VoiceBot(MediaBot):
+    """A bot that can hand back a voice file, like MediaBot does for docs."""
+
+
+def _voice_message():
+    from datetime import datetime
+
+    return _Stub(
+        from_user=_Stub(id=7),
+        chat=_Stub(id=10),
+        message_id=555,
+        date=datetime(2026, 9, 4, 12, 30, 0),
+        voice=_Stub(file_id="v1", duration=3),
+        answer=None,
+    )
+
+
+def test_voice_handler_reaches_the_gate_end_to_end(monkeypatch, tmp_path):
+    """Not just _process_and_reply in isolation: the REAL voice handler must
+    funnel into it, so the gate it now carries actually applies to the
+    voice-first channel."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    monkeypatch.setattr(
+        chat, "get_settings", lambda: _Stub(vault_path=tmp_path, deepgram_api_key="k")
+    )
+
+    class FakeTranscriber:
+        def __init__(self, _key):
+            pass
+
+        async def transcribe(self, _payload):
+            return "запиши мысль"
+
+    monkeypatch.setattr(chat, "DeepgramTranscriber", FakeTranscriber)
+    bot = VoiceBot()
+
+    asyncio.run(chat.handle_chat_voice(_voice_message(), bot))
+
+    assert mgr.sent == []  # ask() never entered
+    assert mgr.duty_calls == [(7, "[voice] запиши мысль", None)]
+    assert bot.messages and "из дежурной" in bot.messages[0][1]
+    # the librarian safety net still ran first
+    daily = (tmp_path / "daily/2026-09-04.md").read_text(encoding="utf-8")
+    assert "запиши мысль" in daily
+
+
+def test_media_prompt_path_gets_the_duty_answer_too(monkeypatch):
+    """Single-file media reaches _process_and_reply after its own claim
+    guard (which answers a different race), so it inherits the gate."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(
+        chat._process_and_reply(
+            bot, chat_id=10, user_id=1, prompt="Пользователь прислал photo: a.jpg"
+        )
+    )
+    assert mgr.sent == []
+    assert mgr.duty_calls and "a.jpg" in mgr.duty_calls[0][1]
+    assert chat._media_claim_at is None  # the claim path is untouched
+
+
+def test_album_flush_honours_the_gate_and_releases_the_claim(monkeypatch):
+    """An album must produce ONE duty reply for the whole group, and the
+    dispatch claim must come back — F6 must not wedge the media path."""
+    from d_brain.bot.handlers import chat
+
+    mgr = DutyManager(main_busy=True)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    monkeypatch.setattr(chat, "ALBUM_SETTLE", 0.0)
+    bot = FakeBot()
+    chat._album_buf["g9"] = [
+        {"kind": "photo", "rel_path": "a.jpg", "caption": "", "fwd": ""},
+        {"kind": "photo", "rel_path": "b.jpg", "caption": "", "fwd": ""},
+    ]
+    asyncio.run(chat._flush_album(bot, 10, 1, "g9"))
+
+    assert mgr.sent == []
+    assert len(mgr.duty_calls) == 1  # ONE duty reply for the whole album
+    assert chat._media_claim_at is None
+
+
+def test_the_empty_reply_retry_does_not_re_probe_the_gate(monkeypatch):
+    """The gate runs once, before the first attempt. The retry exists for an
+    empty reply from an already-idle session; re-probing there would add a
+    second ~3s pane check for a user already waiting on a second turn."""
+    from d_brain.bot.handlers import chat
+
+    class CountingGate(DutyManager):
+        def __init__(self):
+            super().__init__(main_busy=False)
+            self.probes = 0
+            self.reply = ""  # always empty ⇒ always retries
+
+        async def is_main_busy(self) -> bool:
+            self.probes += 1
+            return False
+
+    mgr = CountingGate()
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    asyncio.run(chat._process_and_reply(bot, chat_id=10, user_id=1, prompt="x"))
+    assert len(mgr.sent) == 2  # the retry happened
+    assert mgr.probes == 1  # but the gate was consulted once
+
+
+def test_typing_starts_before_the_busy_gate(monkeypatch):
+    """Review round 3, R3: when the marker is fresh but the second pane
+    probe finds the turn finished, the gate spends ~3s and returns False.
+    The indicator must already be up by then, not start afterwards."""
+    from d_brain.bot.handlers import chat
+
+    order: list[str] = []
+
+    class OrderBot(FakeBot):
+        async def send_chat_action(self, chat_id, action):
+            order.append("typing")
+
+    class SlowGate(DutyManager):
+        async def is_main_busy(self) -> bool:
+            order.append("gate")
+            return False
+
+    mgr = SlowGate(main_busy=False)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    asyncio.run(chat._process_and_reply(OrderBot(), 10, 1, "привет"))
+    assert order[0] == "typing"
+    assert "gate" in order
+
+
+def test_a_failing_typing_ping_never_costs_the_reply(monkeypatch):
+    from d_brain.bot.handlers import chat
+
+    class BrokenTyping(FakeBot):
+        async def send_chat_action(self, chat_id, action):
+            raise RuntimeError("telegram hiccup")
+
+    mgr = DutyManager(main_busy=False)
+    mgr.reply = "ответ"
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = BrokenTyping()
+    asyncio.run(chat._process_and_reply(bot, 10, 1, "привет"))
+    assert bot.messages and "ответ" in bot.messages[0][1]
+
+
+def test_an_idle_session_pays_no_extra_delay_with_the_real_is_main_busy(
+    monkeypatch, tmp_path
+):
+    """Integration (blind review F11): the handler against the REAL
+    ChatSessionManager.is_main_busy, not a stub. With no watchdog marker on
+    disk the gate must return immediately — no marker, no pane probes, no
+    _MAIN_BUSY_CONFIRM_SECONDS sleep — and the message must take the
+    ordinary path."""
+    import time
+
+    from d_brain.bot.handlers import chat
+    from d_brain.services.chat_session import ChatSessionManager
+    from d_brain.services.claude_session import AskResult
+
+    class Probed:
+        """A session whose pane probe would say "busy" if it were asked."""
+
+        def __init__(self):
+            self.probes = 0
+            self.prompts: list[str] = []
+
+        def ask(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            return AskResult("ok", reply="ответ")
+
+        def is_pane_turn_active(self) -> bool:
+            self.probes += 1
+            return True
+
+        def is_turn_active(self) -> bool:
+            return False
+
+    session = Probed()
+    mgr = ChatSessionManager(tmp_path, session=session, health_dir=tmp_path)
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+
+    started = time.monotonic()
+    asyncio.run(chat._dispatch_text(bot, chat_id=10, user_id=1, text="привет"))
+    elapsed = time.monotonic() - started
+
+    assert session.prompts == ["привет"]  # the normal path
+    assert session.probes == 0  # not even probed: no marker to confirm
+    assert elapsed < 1.0  # and certainly no 3s confirmation window
+    assert bot.messages and "ответ" in bot.messages[0][1]

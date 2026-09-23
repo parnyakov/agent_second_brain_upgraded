@@ -812,6 +812,48 @@ def test_smoke_script_exists_and_is_not_wired_into_the_bot():
     assert "chat_engine" not in body and "cron_engine" not in body
 
 
+def test_watchdog_long_run_cap_never_fires_on_this_engine(tmp_path):
+    """Item 29's auto-close is Claude-engine-only today — and, crucially,
+    it can never FALSELY close a live Codex turn.
+
+    The cap hangs off long-run tracking, which classifies ``capture_text()``
+    with ``tmux_parse.is_main_turn_active`` — a Claude-pane classifier. This
+    driver's ``capture_text()`` deliberately emits only its own vocabulary
+    (see ``test_capture_text_never_trips_tmux_classifiers`` above and the
+    method's docstring), so that classifier reads "no main turn active", no
+    run is ever tracked, and neither the notice nor the interrupt fires.
+    The accepted consequence, stated rather than papered over: with
+    ``chat_engine=codex`` the hard cap is simply inactive.
+    """
+    from d_brain.services import long_run
+    from d_brain.services.tmux_parse import is_main_turn_active
+    from d_brain.services.watchdog import Watchdog
+
+    drv = make_driver(tmp_path, FakePopen())
+    assert drv.ask("q").status == "ok"
+    assert is_main_turn_active(drv.capture_text()) is False
+
+    rt = tmp_path / "rt"
+    clock = {"now": 1000.0}
+    alerts: list[str] = []
+    wd = Watchdog(
+        drv,
+        runtime_dir=rt,
+        disk_free_fn=lambda: 10_000_000_000,
+        clock_fn=lambda: clock["now"],
+        alert_fn=alerts.append,
+        min_disk_bytes=500_000_000,
+        long_run_alert_seconds=60.0,
+        long_run_max_seconds=300.0,
+    )
+    for t in range(1000, 6000, 250):
+        clock["now"] = float(t)
+        wd._track_long_run()
+
+    assert alerts == []
+    assert long_run.read(rt).since == 0.0
+
+
 def test_no_sleep_leaks_into_the_suite():
     """Guard against a future edit re-introducing a real time.sleep in the
     driver's hot loops — the whole suite must stay sub-second."""

@@ -21,8 +21,10 @@ on NFS/9p and would silently degrade to no serialization.
 """
 
 import fcntl
+import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -34,20 +36,22 @@ from pathlib import Path
 
 from d_brain.services import long_run
 from d_brain.services.tmux_parse import (
-    _WORKING_RE,
     PaneState,
     _chrome,
     classify_state,
     extract_open_reply,
     extract_reply,
     find_pending_replies,
-    has_marker,
+    foreign_view_label,
     has_survey_prompt,
+    input_box_text,
+    is_agents_list_view,
     is_complete,
     is_idle,
     is_main_turn_active,
     is_working,
     is_working_progressing,
+    main_area_working,
     main_turn_finished,
     open_reply_rids,
     reply_rids,
@@ -56,9 +60,9 @@ from d_brain.services.tmux_parse import (
     turn_auth_error,
 )
 from d_brain.services.transcript import (
-    TranscriptTail,
-    extract_reply_from_record,
+    ReplyTail,
     latest_reply,
+    transcript_dir,
     transcript_path,
 )
 
@@ -115,15 +119,15 @@ DEFAULT_STALL_TIMEOUT = 900
 # instead, so this gives up around the same time the watchdog would
 # otherwise notice the pane is wedged and step in.
 DEFAULT_BUSY_WAIT_BUDGET = 300
-# How long the pane must show BOTH a finished main turn (main_turn_finished())
-# AND a byte-identical salvage region (the body of an unterminated
-# <<<R:id>>> span, extract_open_reply()) before ask() salvages the reply
-# from that span instead of waiting for a closing <<<E:id>>> that may never
-# come (backlog item 10, 2026-08-21: the model occasionally drops the
-# literal closing marker for an otherwise-complete answer). Stability is
-# checked on the salvage region ONLY, never on the whole pane capture — the
-# whole pane changes every second from ticking background-agent rows, which
-# would defeat any whole-pane stability check entirely. Sized well below
+# How long the pane must show a finished, not-working main turn AND the
+# transcript must hold a byte-identical body for an unterminated <<<R:id>>>
+# span before ask() salvages the reply from that span instead of waiting for
+# a closing <<<E:id>>> that may never come (backlog item 10, 2026-08-21: the
+# model occasionally drops the literal closing marker for an otherwise-
+# complete answer). Stability is checked on the reply BODY only, never on the
+# whole pane capture — the whole pane changes every second from ticking
+# background-agent rows, which would defeat any whole-pane stability check
+# entirely. Sized well below
 # DEFAULT_STALL_TIMEOUT (900s) so a genuinely missing-marker reply reaches
 # the user in ~2 minutes instead of riding the stall/timeout ceiling all the
 # way to an hour.
@@ -207,6 +211,13 @@ _RECENT_PROGRESS_POLLS = 2
 # static full-screen state; it survives several 1s-spaced samples, while a
 # frame like that is normally gone by the next poll as the turn keeps moving.
 _RATE_LIMIT_CONFIRM_POLLS = 3
+# DEFAULTS ONLY — the live values are per-instance (pane_width/pane_height
+# constructor args, Settings.pane_width / DBRAIN_PANE_WIDTH). Made settable
+# 2026-09-20: a wide pane lets the TUI lay the screen out in two columns
+# (transcript left, a file diff right), which appends text after the
+# `<<<E:id>>>` marker on its line and made every reply of the second
+# instance parse as region=None. tmux_parse strips such a column now; a
+# narrower pane is the mitigation that needs no parsing to be right.
 _PANE_WIDTH = "200"
 # Height 50 (not taller): the TUI draws its footer (idle ❯ / bypass line)
 # just below content, so on a tall pane the footer lands mid-screen with a
@@ -223,6 +234,41 @@ _PANE_HEIGHT = "50"
 # combination reproduces it, re-add a note with the repro. Deep captures
 # beyond this default are for the salvage/orphan paths only, if ever needed.
 _CAPTURE_SCROLLBACK = "-200"
+# Parked sessions (see ClaudeSession._park_foreign_session) kept per brain;
+# older ones are killed so they cannot pile up across repeated engine switches.
+_MAX_PARKED = 2
+# How long each step of the return-to-main keystroke sequence may take to
+# show on screen (see ClaudeSession._return_to_main).
+_VIEW_SWITCH_TIMEOUT = 5.0
+# Pseudo-label for the "← N agents" list view itself.
+AGENTS_LIST_VIEW = "← agents list"
+# Rounds of C-k + C-u _clear_input_draft may spend on a multi-line draft
+# (each round clears about one line, verified live).
+_MAX_CLEAR_ROUNDS = 8
+# Extra Enters _send_prompt may press when the first one was lost (the
+# 2026-09-19 incident: five prompts glued together in the input box, never
+# sent). Two, not more: a box that still holds the prompt after three Enters
+# is not a lost keystroke.
+_ENTER_RETRIES = 2
+# What an unsent paste leaves in the input box once the CLI collapses it.
+_PASTED_TEXT = "[Pasted text"
+# Transcript records that carry the session's display name (verified live on
+# 2.1.278: `/rename foo` appends custom-title + agent-name records holding
+# "foo" to the pinned transcript; the CLI's own auto-title is ai-title).
+_TITLE_FIELDS = {
+    "custom-title": "customTitle",
+    "agent-name": "agentName",
+    "ai-title": "aiTitle",
+}
+
+
+def exact_target(session_name: str) -> str:
+    """tmux ``-t`` value that matches ONLY ``session_name`` (its active pane).
+
+    See the ``_target`` comment in ``ClaudeSession.__init__`` for why a bare
+    name is a bug (prefix match onto ``<name>_cron``) and why the trailing
+    ``:`` is required."""
+    return f"={session_name}:"
 
 
 @dataclass
@@ -277,14 +323,17 @@ class ClaudeSession:
         rid_factory: Callable[[], str] | None = None,
         poll_interval: float = 1.0,
         paste_settle: float = 0.3,
+        submit_settle: float = 0.5,
         startup_timeout: float = 90.0,
         stall_timeout: float = DEFAULT_STALL_TIMEOUT,
         busy_wait_budget: float = DEFAULT_BUSY_WAIT_BUDGET,
         salvage_stable: float = DEFAULT_SALVAGE_STABLE,
         no_main_turn_ceiling: float = DEFAULT_NO_MAIN_TURN_CEILING,
-        transcript_shadow_mode: bool = False,
         tmux_config: Path | None = None,
         long_run_stale_after: float = DEFAULT_LONG_RUN_STALE_AFTER,
+        view_switch_timeout: float = _VIEW_SWITCH_TIMEOUT,
+        pane_width: int | str | None = None,
+        pane_height: int | str | None = None,
     ) -> None:
         self.session_name = session_name
         self.work_dir = Path(work_dir)
@@ -311,7 +360,14 @@ class ClaudeSession:
         self._clock = clock_fn
         self._rid_factory = rid_factory or (lambda: uuid.uuid4().hex[:8])
         self._poll_interval = poll_interval
+        self._view_switch_timeout = view_switch_timeout
+        # Pane geometry, per instance. tmux wants strings; None keeps the
+        # module defaults, so an unconfigured install is byte-for-byte
+        # unchanged. See _PANE_WIDTH for why this became settable.
+        self._pane_width = str(pane_width) if pane_width else _PANE_WIDTH
+        self._pane_height = str(pane_height) if pane_height else _PANE_HEIGHT
         self._paste_settle = paste_settle
+        self._submit_settle = submit_settle
         self._startup_timeout = startup_timeout
         self._stall_timeout = stall_timeout
         self._busy_wait_budget = busy_wait_budget
@@ -321,11 +377,6 @@ class ClaudeSession:
         # may be before the pre-send busy-wait stops trusting it — see
         # DEFAULT_LONG_RUN_STALE_AFTER and long_run.is_active().
         self._long_run_stale_after = long_run_stale_after
-        # R1 (Fable audit): diagnostic-only. When True, ask() ALSO extracts
-        # the reply from the JSONL transcript and logs agreement/disagreement
-        # with the panel path — it never changes what is actually delivered
-        # this round (see the module-level docstring in transcript.py).
-        self._transcript_shadow_mode = transcript_shadow_mode
         # B4 fix (Fable audit fix round, 2026-08-22): a tmux config file
         # (deploy/tmux.conf) applied via `-f` at the ACTUAL `new-session`
         # invocation — see _ensure_locked(). Needed because the `-g
@@ -362,7 +413,22 @@ class ClaudeSession:
 
         # Address the session's active window/pane by name. A fixed ":0.0"
         # breaks under `base-index 1` (window 0 won't exist) → empty capture.
-        self._target = session_name
+        #
+        # EXACT match (`=name:`), never a bare name: tmux resolves a bare
+        # `-t dbrain_X` by PREFIX, so while `dbrain_X` is absent it silently
+        # finds `dbrain_X_cron` — has-session says "exists", and every prompt,
+        # capture and cron `/clear` lands in the cron brain's pane (incident
+        # 2026-09-19, agent-infra-backlog item 28). The trailing `:` is what
+        # makes the same string valid for pane/window commands too: verified
+        # live on tmux 3.2a that `=name` alone is rejected by capture-pane/
+        # send-keys/paste-buffer/pipe-pane/set-option ("can't find pane") and
+        # renders empty in display-message, while `=name:` works for every
+        # command used here (has-session, kill-session, rename-session,
+        # set-option, resize-window, display-message, capture-pane,
+        # send-keys, paste-buffer, pipe-pane), resolves the ACTIVE window
+        # under base-index 1, and fails cleanly when only a prefix-sibling
+        # exists.
+        self._target = exact_target(session_name)
         self._pane_log = self.runtime_dir / "pane.log"
         self._ready_flag = self.runtime_dir / "ready"
         self._inflight = self.runtime_dir / "inflight"
@@ -372,6 +438,14 @@ class ClaudeSession:
         # the full duration of a turn (up to DEFAULT_TIMEOUT, an hour), and
         # state writes must never queue up behind it.
         self._state_lock = self.runtime_dir / "state.lock"
+        # Owner-facing notices raised by this session (today: a parked pane,
+        # see _park_foreign_session), drained by pop_notices() from whichever
+        # process talks to the owner first (watchdog tick, chat reply, cron
+        # tick). A file, not memory: parking can happen in any of them.
+        self._pending_notices = self.runtime_dir / "pending_notices"
+        # Labels seen on the pane right after a verified return to its own
+        # conversation (see _return_to_main).
+        self._returned_labels: set[str] = set()
         # Last marker-pair rid consumed by a completed ask() (wrap=True) OR
         # already forwarded by pop_orphan_replies(). Kept for diagnostics and
         # for older installs; the authoritative dedup store is the SET below.
@@ -441,9 +515,9 @@ class ClaudeSession:
             return 0
 
     def _session_exists(self) -> bool:
-        return self._tmux("has-session", "-t", self.session_name).returncode == 0
+        return self._tmux("has-session", "-t", self._target).returncode == 0
 
-    def _enforce_geometry(self) -> None:
+    def _enforce_geometry(self) -> bool:
         """Re-assert the pane size on an ALREADY RUNNING session.
 
         `new-session -x/-y` only sizes the pane at birth. tmux then shrinks the
@@ -458,19 +532,27 @@ class ClaudeSession:
         window cover the model's own text, so ordinary prose tripped the
         rate-limit signature. `window-size manual` stops clients from resizing
         it again. Cheap and idempotent: only resizes when the size differs.
+        Returns True when it did resize (the TUI then re-renders).
         """
         geometry = "#{window_width}x#{window_height}"
         got = self._tmux(
             "display-message", "-p", "-t", self._target, geometry
         ).stdout.strip()
-        want = f"{_PANE_WIDTH}x{_PANE_HEIGHT}"
+        want = f"{self._pane_width}x{self._pane_height}"
         if got == want:
-            return
+            return False
         logger.info("resizing pane %s: %s → %s", self.session_name, got or "?", want)
-        self._tmux("set-option", "-t", self.session_name, "window-size", "manual")
+        self._tmux("set-option", "-t", self._target, "window-size", "manual")
         self._tmux(
-            "resize-window", "-t", self._target, "-x", _PANE_WIDTH, "-y", _PANE_HEIGHT
+            "resize-window",
+            "-t",
+            self._target,
+            "-x",
+            self._pane_width,
+            "-y",
+            self._pane_height,
         )
+        return True
 
     def _send_enter(self) -> None:
         self._tmux("send-keys", "-t", self._target, "Enter")
@@ -573,9 +655,9 @@ class ClaudeSession:
         if not self._atomic_write(self._session_id_file, new_id + "\n"):
             logger.error(
                 "could not persist new session id %s — transcript-dependent "
-                "features (shadow mode, R3 context check, marker_compliance) "
-                "will be unable to resolve the live transcript until this "
-                "succeeds",
+                "features (the reply source itself, the R3 context check, "
+                "marker_compliance) will be unable to resolve the live "
+                "transcript until this succeeds",
                 new_id,
             )
         return new_id
@@ -702,8 +784,7 @@ class ClaudeSession:
         return "empty", None
 
     def _transcript_project_dir(self) -> Path:
-        slug = str(Path(self.work_dir).resolve()).replace("/", "-")
-        return Path.home() / ".claude" / "projects" / slug
+        return transcript_dir(self.work_dir)
 
     def _resync_session_id_after_clear(self, before: set[Path]) -> None:
         """Re-pin the session id after `/clear` (see clear()'s docstring for
@@ -741,11 +822,52 @@ class ClaudeSession:
             "pre-clear transcript, which has stopped growing"
         )
 
-    def _ensure_locked(self) -> None:
-        """Create + ready the session if needed. Caller must hold the lock."""
+    def _ensure_locked(self) -> str | None:
+        """Create + ready the session if needed. Caller must hold the lock.
+
+        An existing session is reused only while its pane shows the bot's own
+        conversation. A pane switched to a background task via the
+        "← N agents" view (agent-infra-backlog item 28: it sat on
+        `night-second-brain` after two weeks of human use while the bot ran
+        on Codex) still looks READY but answers into a transcript the bot
+        never reads, so every ask() times out. Conservative order — the
+        bot's conversation is only given up when nothing else worked:
+
+        1. no foreign view on screen → reuse as is;
+        2. otherwise press the keys that return to the main conversation
+           (verified live) and reuse the pane if that visibly worked;
+        3. only then park the session (renamed, owner notified) and start a
+           fresh one by the normal path below.
+
+        Returns the capture taken for that check when the existing session
+        was reused (ask() uses it as its pre-send frame), else None."""
         if self._session_exists():
-            self._enforce_geometry()
-            return
+            # Geometry first, frame second: a resize makes the TUI re-render,
+            # so a frame taken before it (80 columns, 23 rows) is neither
+            # what the view check should judge nor what ask() should use as
+            # its pre-send frame (review 2026-09-19).
+            if self._enforce_geometry():
+                self._sleep(self._poll_interval)
+            cap = self._capture()
+            view = self._foreign_view(cap)
+            if view is not None:
+                back = self._return_to_main(view)
+                if back is not None:
+                    cap, view = back, None
+            if view is None:
+                self._ensure_pipe()
+                return cap
+            if not self._park_foreign_session(view):
+                # Neither rename nor kill worked and the stuck pane is still
+                # there: creating a session under the same name would fail
+                # anyway, and reusing it is the very bug this guards against.
+                # Keep the pinned session_id (the stuck process still owns
+                # it), drop the ready flag and fail loudly instead.
+                self._ready_flag.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"session {self.session_name} is stuck on a foreign view "
+                    f"({view!r}) and could be neither parked nor killed"
+                )
         self._ready_flag.unlink(missing_ok=True)
         # R4 fix (Fable audit, verified live 2026-08-22 on the installed
         # tmux 3.2a): history-limit is fixed at WINDOW CREATION time. The
@@ -770,9 +892,9 @@ class ClaudeSession:
             "-s",
             self.session_name,
             "-x",
-            _PANE_WIDTH,
+            self._pane_width,
             "-y",
-            _PANE_HEIGHT,
+            self._pane_height,
             self._start_command(session_id),
         ]
         # B4 fix: on a COLD start (no tmux server yet) the `-g set-option`
@@ -798,16 +920,7 @@ class ClaudeSession:
                     self.tmux_config,
                 )
             self._tmux(*new_session_args)
-        # Pre-create the transcript owner-only: `cat >>` appends and keeps
-        # the mode, while letting tmux create it would use the server umask.
-        self._pane_log.touch()
-        os.chmod(self._pane_log, 0o600)
-        self._tmux(
-            "pipe-pane",
-            "-t",
-            self._target,
-            f"cat >> {shlex.quote(str(self._pane_log))}",
-        )
+        self._attach_pipe()
 
         deadline = self._clock() + self._startup_timeout
         last_state: PaneState | None = None
@@ -835,7 +948,7 @@ class ClaudeSession:
             if state == PaneState.READY:
                 self._ready_flag.write_text("ready\n")
                 logger.info("Claude session %s is ready", self.session_name)
-                return
+                return None
             last_state = state
             self._sleep(self._poll_interval)
         raise RuntimeError(
@@ -843,6 +956,313 @@ class ClaudeSession:
             f"last state={last_state}; pane tail:\n"
             + "\n".join(self._capture().splitlines()[-8:])
         )
+
+    def _attach_pipe(self) -> None:
+        # Pre-create the transcript owner-only: `cat >>` appends and keeps
+        # the mode, while letting tmux create it would use the server umask.
+        self._pane_log.touch()
+        os.chmod(self._pane_log, 0o600)
+        self._tmux(
+            "pipe-pane",
+            "-t",
+            self._target,
+            f"cat >> {shlex.quote(str(self._pane_log))}",
+        )
+
+    def _ensure_pipe(self) -> None:
+        """Re-attach pane.log to an existing session that lost it (e.g. one
+        started by hand). pane.log growth is the version-proof liveness
+        signal; without it every quiet turn reads as a stall. Only an
+        explicit "0" re-pipes — an unreadable answer leaves things alone."""
+        piped = self._tmux(
+            "display-message", "-p", "-t", self._target, "#{pane_pipe}"
+        ).stdout.strip()
+        if piped == "0":
+            logger.warning(
+                "session %s has no pane.log pipe — re-attaching", self.session_name
+            )
+            self._attach_pipe()
+
+    # ── foreign view handling (agent-infra-backlog item 28) ────────────
+
+    def _own_titles(self) -> set[str]:
+        """Every name the pinned conversation has carried (``/rename``, the
+        CLI's auto-title) — read from its own JSONL transcript. Empty when
+        there is no pinned transcript or it cannot be read."""
+        path = self.current_transcript_path()
+        if path is None:
+            return set()
+        titles: set[str] = set()
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '-title"' not in line and '"agent-name"' not in line:
+                        continue  # cheap pre-filter: transcripts can be large
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    field = _TITLE_FIELDS.get(rec.get("type"))
+                    value = rec.get(field) if field else None
+                    if isinstance(value, str) and value.strip():
+                        titles.add(value.strip())
+        except OSError:
+            return set()
+        return titles
+
+    def _foreign_view(self, cap: str) -> str | None:
+        """What the pane shows instead of the bot's conversation, or None.
+
+        A labelled input box alone is not enough: ``/rename foo`` in the
+        bot's own conversation draws exactly the same "──… foo ─" border as
+        a background task's view (verified live on Claude Code 2.1.278). A
+        label that is one of the pinned conversation's own titles is
+        therefore the bot's conversation. Any other label is only a
+        SUSPICION — _return_to_main() decides the rest."""
+        if is_agents_list_view(cap):
+            return AGENTS_LIST_VIEW
+        label = foreign_view_label(cap)
+        if label is None:
+            return None
+        titles = self._own_titles() | self._returned_labels
+        stem = label[:-1].rstrip() if label.endswith("…") else None
+        if label in titles or (stem and any(t.startswith(stem) for t in titles)):
+            return None
+        return label
+
+    def _wait_for_view(self, want_list: bool) -> str | None:
+        """Poll until the agents list is (or is no longer) on screen."""
+        deadline = self._clock() + self._view_switch_timeout
+        while True:
+            cap = self._capture()
+            if is_agents_list_view(cap) == want_list:
+                return cap
+            if self._clock() >= deadline:
+                return None
+            self._sleep(self._poll_interval)
+
+    def _clear_input_draft(self) -> bool:
+        """Empty the input box of whatever view is on screen, keystroke-safe.
+
+        With text in the box, ``Left`` only moves the cursor (verified live,
+        2.1.278) and Escape in the agents list only clears the draft ("esc
+        to clear") — and Escape in a background task's view INTERRUPTS that
+        task's running turn, so Escape is never the way to clear. ``C-u``
+        alone deletes only up to the cursor; ``C-k`` + ``C-u`` clears the
+        current line wherever the cursor is, and repeating it eats a
+        multi-line draft line by line (3 rounds for 3 lines, cursor mid-
+        text, live). On an empty box, in a running turn and in the list,
+        both keys do nothing (live). Plain capture cannot tell a dim
+        placeholder from typed text, so the stop signal is "a round changed
+        nothing" — compared row by row, empty rows included: after the last
+        row is emptied the box still has that row, and only the next round
+        removes it (live: a stripped comparison stopped there and left the
+        first row of a two-row draft behind). Whatever is left anyway makes
+        the next step's on-screen check fail, and the session is parked.
+        False only when it never settled."""
+        box = input_box_text(self._capture())
+        if box is None:
+            return True  # no box to clear; the next step's check decides
+        for _ in range(_MAX_CLEAR_ROUNDS):
+            self._tmux("send-keys", "-t", self._target, "C-k")
+            self._tmux("send-keys", "-t", self._target, "C-u")
+            self._sleep(self._paste_settle)
+            now = input_box_text(self._capture())
+            if now == box:
+                return True
+            logger.info(
+                "session %s: cleared a draft from the input box", self.session_name
+            )
+            box = now
+        return False
+
+    def _return_to_main(self, view: str) -> str | None:
+        """Try to bring the pane back to the bot's own conversation.
+
+        Verified live on Claude Code 2.1.278 in an isolated tmux server:
+        from a background task's view, ``Left`` on the empty input opens the
+        "← N agents" list, and ``Escape`` there returns to the session's OWN
+        conversation (the list itself says "esc returns to it"); from the
+        list alone, ``Escape`` suffices. Both steps are confirmed on screen
+        before the next one — sent back to back, the TUI swallows the Escape.
+
+        Returns a fresh capture of the conversation when both steps visibly
+        happened, else None (then the caller parks the session). A pane that
+        was in fact on the renamed main conversation all along (label not in
+        the pinned transcript, e.g. after the CLI re-keyed it) makes the same
+        round trip and lands where it started — harmless.
+
+        Any draft in the input box is cleared first (_clear_input_draft):
+        with text there neither key does what is described above."""
+        if not self._clear_input_draft():
+            logger.warning(
+                "session %s: could not clear the input box of view %r",
+                self.session_name,
+                view,
+            )
+            return None
+        if view != AGENTS_LIST_VIEW:
+            # Up to two Lefts. Verified live (2.1.278): once the box has been
+            # edited at all — a draft cleared by _clear_input_draft, or text
+            # a human typed and deleted again — the first Left on the now
+            # empty box does nothing visible and only the second opens the
+            # list; on a box untouched since the view opened one suffices.
+            # The second is sent only after the first visibly failed, and
+            # Left on an empty box outside the list moves nothing.
+            for _ in range(2):
+                self._tmux("send-keys", "-t", self._target, "Left")
+                if self._wait_for_view(want_list=True) is not None:
+                    break
+            else:
+                logger.warning(
+                    "session %s: view %r did not open the agents list on Left",
+                    self.session_name,
+                    view,
+                )
+                return None
+        self._tmux("send-keys", "-t", self._target, "Escape")
+        cap = self._wait_for_view(want_list=False)
+        if cap is None:
+            logger.warning(
+                "session %s: Escape did not leave the agents list", self.session_name
+            )
+            return None
+        label = foreign_view_label(cap)
+        if label is not None:
+            # Where "esc returns to it" lands IS the session's own
+            # conversation — remember its name so the next turn does not
+            # repeat the round trip (its transcript may be under an id the
+            # pinned session_id no longer points at).
+            self._returned_labels.add(label)
+        logger.warning(
+            "session %s was on a foreign view (%r) — returned to its own "
+            "conversation (now labelled %r)",
+            self.session_name,
+            view,
+            label,
+        )
+        return cap
+
+    def _park_foreign_session(self, label: str) -> bool:
+        """Move a session whose pane shows a foreign view out of the bot's way.
+
+        Renamed, not killed, so whatever a human was doing in it survives.
+        The parked name does not start with ``dbrain_``, so the nightly
+        server cleanup (which never touches ``dbrain_*``) can reclaim it once
+        it has sat idle and detached long enough. Its pane.log pipe is closed
+        so it can never write into the bot's transcript again — and if that
+        close fails the parked session is killed instead, since its output
+        growing pane.log would mask a stall of the fresh session. Kill is
+        also the fallback when the rename itself fails. The owner is told
+        either way: the bot's conversation context is gone.
+
+        Returns False only when neither rename nor kill succeeded.
+        """
+        parked = f"parked_{self.session_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+        logger.warning(
+            "session %s shows a foreign view (%r), not the bot's conversation "
+            "— parking it as %s and starting a fresh one",
+            self.session_name,
+            label,
+            parked,
+        )
+        if self._tmux("rename-session", "-t", self._target, parked).returncode == 0:
+            if self._tmux("pipe-pane", "-t", exact_target(parked)).returncode != 0:
+                logger.error(
+                    "could not close pane.log pipe of parked %s — killing it", parked
+                )
+                if self._tmux("kill-session", "-t", exact_target(parked)).returncode:
+                    logger.error("could not kill parked %s either", parked)
+                    how = (
+                        f"отложена как {parked}, но отключить её вывод и "
+                        "закрыть её не удалось — её стоит закрыть вручную"
+                    )
+                else:
+                    how = f"закрыта (отложить не удалось), имя было {parked}"
+            else:
+                how = f"отложена как {parked}"
+            self._prune_parked()
+        elif (
+            self._tmux("kill-session", "-t", self._target).returncode == 0
+            or not self._session_exists()  # vanished on its own meanwhile
+        ):
+            how = "закрыта (переименовать не удалось)"
+        else:
+            logger.error(
+                "session %s: neither rename nor kill worked", self.session_name
+            )
+            self._queue_notice(
+                f"🔴 Сессия {self.session_name} застряла на экране фоновой задачи "
+                f"«{label}» и её не удалось ни отложить, ни закрыть — ответы "
+                "не будут доходить. Нужен dbrain repair."
+            )
+            return False
+        kind = "кроновая" if self.session_name.endswith("_cron") else "основная"
+        self._queue_notice(
+            f"⚠️ Контекст разговора сброшен: {kind} сессия {self.session_name} "
+            f"была на экране фоновой задачи «{label}», {how}. "
+            "Дальше отвечает свежая сессия."
+        )
+        return True
+
+    def _prune_parked(self) -> None:
+        """Keep at most _MAX_PARKED parked sessions of THIS brain; kill the
+        oldest. The pattern is anchored on the timestamp so the main brain
+        never touches its ``_cron`` sibling's parked sessions."""
+        listing = self._tmux("list-sessions", "-F", "#{session_name}")
+        if listing.returncode != 0:
+            return
+        name = re.escape(self.session_name)
+        pattern = re.compile(rf"^parked_{name}_\d{{8}}-\d{{6}}$")
+        parked = sorted(n for n in (listing.stdout or "").split() if pattern.match(n))
+        for name in parked[:-_MAX_PARKED]:
+            logger.info("killing old parked session %s", name)
+            self._tmux("kill-session", "-t", exact_target(name))
+
+    # ── owner notices ────────────────────────────────────────────────
+
+    def _queue_notice(self, text: str) -> None:
+        try:
+            with self._state_locked(), self._pending_notices.open("a") as fh:
+                fh.write(json.dumps(text, ensure_ascii=False) + "\n")
+        except OSError:
+            logger.error("could not queue owner notice: %s", text)
+
+    def requeue_notices(self, texts: list[str]) -> None:
+        """Put notices whose delivery failed back at the FRONT of the queue
+        (they are older than anything queued meanwhile). Raises OSError when
+        the queue cannot be written — the caller then logs them as lost."""
+        if not texts:
+            return
+        with self._state_locked():
+            try:
+                newer = self._pending_notices.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                newer = ""
+            back = "".join(json.dumps(t, ensure_ascii=False) + "\n" for t in texts)
+            if not self._atomic_write(self._pending_notices, back + newer):
+                raise OSError(f"could not rewrite {self._pending_notices}")
+
+    def pop_notices(self) -> list[str]:
+        """Owner-facing notices raised since the last call, oldest first.
+        Each is handed out once, to whichever caller asks first."""
+        with self._state_locked():
+            try:
+                raw = self._pending_notices.read_text(encoding="utf-8")
+            except OSError:
+                return []
+            self._pending_notices.unlink(missing_ok=True)
+        out: list[str] = []
+        for line in raw.splitlines():
+            try:
+                text = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(text, str) and text:
+                out.append(text)
+        return out
 
     def ensure_session(self) -> None:
         with self._locked() as got:
@@ -1161,8 +1581,8 @@ class ClaudeSession:
         # only ever recover COMPLETE R/E pairs, so a reply that never got its
         # closing marker AND missed ask()'s own salvage window (R scrolled
         # out of the capture window, no recognizable boundary, region never
-        # stabilized within DEFAULT_SALVAGE_STABLE, or the _WORKING_RE
-        # conjunct refused it) was lost forever. Bar for delivery here is
+        # stabilized within DEFAULT_SALVAGE_STABLE, or the pane still showed
+        # a working signature) was lost forever. Bar for delivery here is
         # "two consecutive watchdog ticks show byte-identical content" —
         # cheaper than ask()'s time-based stability window because the
         # watchdog already polls on its own fixed interval (DEFAULT_TICK),
@@ -1234,7 +1654,7 @@ class ClaudeSession:
         with self._locked(blocking=False) as got:
             if not got:
                 return False
-            self._tmux("kill-session", "-t", self.session_name)
+            self._tmux("kill-session", "-t", self._target)
             self._ready_flag.unlink(missing_ok=True)
             self._inflight.unlink(missing_ok=True)
             self._ensure_locked()
@@ -1273,7 +1693,7 @@ class ClaudeSession:
         """Tear down the session (lock-guarded). For CLI/teardown use."""
         with self._locked() as got:
             if got:
-                self._tmux("kill-session", "-t", self.session_name)
+                self._tmux("kill-session", "-t", self._target)
                 self._ready_flag.unlink(missing_ok=True)
                 self._inflight.unlink(missing_ok=True)
 
@@ -1378,9 +1798,11 @@ class ClaudeSession:
         the one this process was launched with via --session-id. Left
         unhandled, the pinned runtime_dir/session_id would go stale the
         instant this runs, silently breaking every transcript-dependent
-        feature (shadow mode, R3's context check, marker_compliance.py)
-        with no error until someone notices the transcript stopped growing
-        — so this resyncs the pin immediately after.
+        feature (the reply source ask() reads, R3's context check,
+        marker_compliance.py) with no error until someone notices the
+        transcript stopped growing — so this resyncs the pin immediately
+        after. An ask() already waiting when this fires notices the id
+        changed under it and says so (see its session-id check).
 
         Thin wrapper over ``send_control("/clear")`` — the resync logic
         lives THERE now (B1 fix, 2026-08-22) precisely so every caller that
@@ -1408,6 +1830,7 @@ class ClaudeSession:
         if not wrap:
             self._send_text(prompt)
             self._send_enter()
+            self._confirm_submitted()
             return
         payload = (
             f"{prompt}\n\n"
@@ -1418,74 +1841,95 @@ class ClaudeSession:
         )
         self._send_text(payload)
         self._send_enter()
+        self._confirm_submitted(f"<<<E:{rid}>>>")
 
-    # ── R1 shadow mode helpers (diagnostic only) ────────────────────────
+    def _confirm_submitted(self, marker: str | None = None) -> None:
+        """Press Enter again if the first one was lost.
 
-    def _shadow_poll(self, shadow_tail: "TranscriptTail | None", rid: str, current):
-        """Advance ``shadow_tail`` and fold in any newly-found reply for
-        ``rid``. A CLOSED record always wins over an OPEN one already held;
-        otherwise the first hit is kept. Never raises."""
-        if shadow_tail is None:
-            return current
+        Reproduced live on Claude Code 2.1.278 (isolated tmux server): a
+        31-line paste, 0.3-0.5 s, Enter — and the prompt just sat in the
+        input box; the next prompt was then pasted on top of it (the
+        2026-09-19 incident: five glued, unsent prompts). A second Enter
+        sent it. An extra Enter on an already-sent, empty box is a no-op
+        both while idle and during a running turn (live: no empty user
+        record in the transcript, the turn not disturbed).
+
+        The box is judged by input_box_text() only — the transcript echo of
+        a sent prompt carries the same marker. Still unsent = our marker or
+        a collapsed "[Pasted text …]" is visible in it. At most
+        _ENTER_RETRIES extra Enters, each logged."""
+        for attempt in range(_ENTER_RETRIES + 1):
+            self._sleep(self._submit_settle)
+            box = input_box_text(self._capture())
+            if box is None or not (
+                _PASTED_TEXT in box or (marker is not None and marker in box)
+            ):
+                return
+            if attempt == _ENTER_RETRIES:
+                logger.error(
+                    "session %s: prompt still unsent in the input box after "
+                    "%d extra Enters",
+                    self.session_name,
+                    _ENTER_RETRIES,
+                )
+                return
+            logger.warning(
+                "session %s: Enter lost — prompt still in the input box, "
+                "pressing Enter again (%d/%d)",
+                self.session_name,
+                attempt + 1,
+                _ENTER_RETRIES,
+            )
+            self._send_enter()
+
+    # ── the reply source (backlog item 32) ──────────────────────────────
+
+    def _open_reply_tail(
+        self, rid: str, log_id: str
+    ) -> tuple[ReplyTail | None, str | None]:
+        """A :class:`ReplyTail` anchored at the CURRENT end of this session's
+        pinned transcript — the source ask() reads the reply from — together
+        with the session id it belongs to.
+
+        ``(None, None)`` (with a loud log line) if there is no pinned session
+        id or the tail cannot be opened at all. That turn has no transcript to
+        read and falls back to the pane, which is strictly a degraded mode —
+        see the fallback in ask(). Never raises."""
         try:
-            for rec in shadow_tail.poll_new_records():
-                found = extract_reply_from_record(rec, rid)
-                if found is not None and (
-                    current is None or (found.closed and not current.closed)
-                ):
-                    current = found
-        except Exception:  # noqa: BLE001 — diagnostic only, never fatal
-            logger.warning("shadow mode: transcript poll failed", exc_info=True)
-        return current
+            sid = self._read_session_id()
+            if sid is None:
+                logger.error(
+                    "no pinned session id — cannot read the reply for %s from "
+                    "the transcript; falling back to reading the pane, which "
+                    "loses any reply longer than the capture window",
+                    log_id,
+                )
+                return None, None
+            return ReplyTail(transcript_path(self.work_dir, sid), rid), sid
+        except Exception:  # noqa: BLE001 — never take a live turn down
+            logger.error(
+                "could not open the transcript tail for %s", log_id, exc_info=True
+            )
+            return None, None
 
-    def _shadow_compare(
-        self, log_id: str, panel_reply: str | None, shadow_reply
-    ) -> None:
-        """Log agreement/disagreement between the panel path (what was
-        actually delivered/attempted) and the transcript path (diagnostic).
-        Never affects delivery — call sites pass what they already decided."""
-        if not self._transcript_shadow_mode:
-            return
-        if shadow_reply is None:
-            if panel_reply is not None:
-                logger.warning(
-                    "shadow mode: panel delivered a reply for %s but the "
-                    "transcript path found no matching record",
-                    log_id,
-                )
-            else:
-                logger.info(
-                    "shadow mode: transcript also shows no reply markers for "
-                    "%s — consistent with the F2 class (nothing to compare)",
-                    log_id,
-                )
-            return
-        if panel_reply is None:
-            logger.warning(
-                "shadow mode: transcript found a %s reply for %s that the "
-                "panel path never delivered (len=%d)",
-                "closed" if shadow_reply.closed else "open",
+    def _poll_reply(self, tail: ReplyTail | None, log_id: str):
+        """This turn's reply as the transcript currently has it, or ``None``.
+
+        Wrapped so a transcript-shape surprise (the JSONL schema is not a
+        published API) degrades to "nothing found yet" — the caller keeps
+        polling and ends on its existing ceiling — never to an exception out
+        of ask()."""
+        if tail is None:
+            return None
+        try:
+            return tail.poll()
+        except Exception:  # noqa: BLE001 — never take a live turn down
+            logger.error(
+                "transcript poll failed for %s — treating as 'no reply yet'",
                 log_id,
-                len(shadow_reply.body),
+                exc_info=True,
             )
-            return
-        a = " ".join(panel_reply.split())
-        b = " ".join(shadow_reply.body.split())
-        if a == b:
-            logger.info(
-                "shadow mode: panel and transcript agree for %s (%d chars)",
-                log_id,
-                len(a),
-            )
-        else:
-            logger.warning(
-                "shadow mode: panel/transcript MISMATCH for %s — panel=%d "
-                "chars, transcript=%d chars (transcript closed=%s)",
-                log_id,
-                len(a),
-                len(b),
-                shadow_reply.closed,
-            )
+            return None
 
     # ── ask ──────────────────────────────────────────────────────────
 
@@ -1519,13 +1963,21 @@ class ClaudeSession:
                 return AskResult("error", detail="could not acquire pane lock")
             # Claim the turn IMMEDIATELY: a stale inflight from a timed-out
             # earlier turn must not misrepresent this holder to the steering
-            # gate while _ensure_locked() spends up to startup_timeout. This
-            # is overwritten with a MAINT-prefixed placeholder further down,
-            # ONLY for the duration of the busy-wait on a leftover previous
-            # turn (see below) — never here at claim time.
-            self._inflight.write_text(f"{log_id}\n{self._clock()}\n")
+            # gate while _ensure_locked() spends up to startup_timeout. The
+            # claim is a MAINT-prefixed placeholder, not our real id: nothing
+            # of ours is in the pane yet, and _ensure_locked() may be driving
+            # it through the "← N agents" list (_return_to_main) or starting
+            # a fresh session. With the real id here is_steerable_turn() said
+            # True, and an owner message steered in at that moment landed in
+            # the list's "describe a task for a new session" box — spawning a
+            # background session — or in a half-started TUI (review
+            # 2026-09-19). The real id is written only right before the
+            # prompt is typed, same as after the busy-wait below.
+            self._inflight.write_text(
+                f"{MAINT_PREFIX}pending-{log_id}\n{self._clock()}\n"
+            )
             try:
-                self._ensure_locked()
+                reused_cap = self._ensure_locked()
             except Exception as exc:  # noqa: BLE001 — must never escape ask()
                 logger.error("ensure_session failed for %s: %s", log_id, exc)
                 self._inflight.unlink(missing_ok=True)
@@ -1539,7 +1991,9 @@ class ClaudeSession:
             # rest of the turn uses.
             deadline = self._clock() + timeout
 
-            pre_cap = self._capture()
+            # The view check in _ensure_locked() just captured this pane under
+            # the same lock; reuse that frame rather than taking a second one.
+            pre_cap = reused_cap if reused_cap is not None else self._capture()
             pre = classify_state(pre_cap)
             if pre == PaneState.RATE_LIMITED and self._confirmed_rate_limited(
                 pre_cap, log_id
@@ -1582,17 +2036,14 @@ class ClaudeSession:
                 # budget just because a static "working" signature happens
                 # to still be on screen (review 2026-08-20).
                 #
-                # inflight is switched to a MAINT-prefixed placeholder for
-                # the duration of this wait ONLY: we are not typing anything
+                # inflight keeps the MAINT-prefixed placeholder written at
+                # claim time for the whole wait: we are not typing anything
                 # yet, and the pane belongs to that OTHER, still-running
-                # turn — writing our real (non-maint) log_id here, before the
-                # pane is confirmed free, made is_steerable_turn() return
-                # True for that other turn, so an input arriving during the
-                # wait would be steered straight into it, interleaving both
+                # turn — our real (non-maint) log_id here, before the pane
+                # is confirmed free, made is_steerable_turn() return True
+                # for that other turn, so an input arriving during the wait
+                # would be steered straight into it, interleaving both
                 # turns' text in one pane (found in review 2026-08-20).
-                self._inflight.write_text(
-                    f"{MAINT_PREFIX}pending-{log_id}\n{self._clock()}\n"
-                )
                 cap = pre_cap
 
                 # B3 fast path (agent-infra-backlog item 22): the watchdog
@@ -1762,33 +2213,32 @@ class ClaudeSession:
                         busy_seconds=busy_seconds,
                     )
                 pre_cap = cap
-                # The pane is confirmed free: restore our real identity
-                # before typing anything into it.
-                self._inflight.write_text(f"{log_id}\n{self._clock()}\n")
+
+            # The pane is confirmed ours and free: take on our real identity
+            # (steerable from here on) right before typing anything into it.
+            self._inflight.write_text(f"{log_id}\n{self._clock()}\n")
+
+            # THE reply source for this turn (backlog item 32), anchored
+            # BEFORE the prompt is typed so nothing the model writes in answer
+            # to it can land ahead of the anchor — the rid is fresh, so
+            # records left over from an earlier turn cannot match it either.
+            # The pane is read from here on for STATE ONLY; the reply text
+            # comes from the transcript and nowhere else.
+            # The transcript the tail follows belongs to THIS session id. A
+            # `/clear` (or any re-key) mid-wait starts a brand-new JSONL file,
+            # leaving the tail pointed at one that has stopped growing — see
+            # the session-id check inside the loop.
+            reply_tail, sid_at_send = (
+                self._open_reply_tail(rid, log_id) if wrap else (None, None)
+            )
+            # Fixed at send time on purpose: a tail DROPPED mid-turn (the
+            # session was re-keyed under us) must not silently switch this
+            # turn over to reading the pane — that is a different
+            # conversation's screen by then. Only a turn that never had a
+            # transcript to read at all may fall back.
+            never_had_transcript = wrap and reply_tail is None
 
             self._send_prompt(prompt, rid, wrap=wrap)
-
-            # R1 shadow mode (Fable audit, diagnostic-only): a tail anchored
-            # to the CURRENT end of the pinned session's transcript, so only
-            # records appended from this send onward are ever considered.
-            # Never allowed to affect what this call returns — every use is
-            # wrapped so a transcript-shape surprise degrades to a log line,
-            # never a broken reply (see transcript.py's module docstring).
-            shadow_tail: TranscriptTail | None = None
-            shadow_reply = None
-            if wrap and self._transcript_shadow_mode:
-                try:
-                    sid = self._read_session_id()
-                    if sid is not None:
-                        shadow_tail = TranscriptTail.at_end(
-                            transcript_path(self.work_dir, sid)
-                        )
-                except Exception:  # noqa: BLE001 — diagnostic only, never fatal
-                    logger.warning(
-                        "shadow mode: could not open transcript tail for %s",
-                        log_id,
-                        exc_info=True,
-                    )
 
             last_active = self._clock()
             last_cap = pre_cap
@@ -1804,11 +2254,12 @@ class ClaudeSession:
             # exact frame observed at send time.
             send_time_cap = pre_cap
             main_turn_seen_active_or_changed = False
-            # F2 tracking (R2c): has a line-anchored <<<R:rid>>> EVER been
-            # seen in any capture this turn, even if it later scrolled out of
-            # the capture window? Distinguishes "marker once seen, now lost"
-            # from "marker never emitted at all" for the ceiling's honest
-            # message.
+            # F2 tracking (R2c): has a <<<R:rid>>> opening marker EVER been
+            # seen in the transcript this turn? Distinguishes "the model
+            # started answering but never closed the pair" from "no markers
+            # at all" for the ceiling's honest message. Unlike the pane, the
+            # transcript cannot lose a marker it once had, so this is now a
+            # statement about the MODEL, not about the capture window.
             ever_saw_r_marker = False
             idle_streak = 0
             rate_limited_streak = 0
@@ -1840,9 +2291,38 @@ class ClaudeSession:
             salvage_blocked_logged = False
             while self._clock() < deadline:
                 cap = self._capture()
+                transcript_reply = None
                 if wrap:
-                    shadow_reply = self._shadow_poll(shadow_tail, rid, shadow_reply)
-                    if not ever_saw_r_marker and has_marker(cap, rid, "R"):
+                    # `/clear` (or any other re-key) mid-wait starts a NEW
+                    # transcript file: the tail we hold stops growing and can
+                    # never carry this turn's reply. Stop reading it — and say
+                    # so — rather than silently waiting out the ceiling on a
+                    # dead file. The turn itself is left alone (it may still
+                    # be running); it ends on the ceiling below, rid unhandled
+                    # for the orphan poller, exactly as any other lost-reply
+                    # turn does.
+                    if reply_tail is not None:
+                        sid_now = self._read_session_id()
+                        # A read that fails transiently returns None — that is
+                        # "unknown", not "re-keyed", and must not cost this
+                        # turn its reply source. Only a DIFFERENT, readable id
+                        # means the file we follow is no longer this session's.
+                        if sid_now is not None and sid_now != sid_at_send:
+                            logger.error(
+                                "session id changed mid-turn for %s (%s → %s) "
+                                "— the transcript this turn was being read "
+                                "from is gone; no reply can be recovered here",
+                                log_id,
+                                sid_at_send,
+                                sid_now,
+                            )
+                            reply_tail = None
+                    transcript_reply = self._poll_reply(reply_tail, log_id)
+                    if reply_tail is not None and reply_tail.saw_open:
+                        # Deliberately the MARKER, not the reply: a turn that
+                        # opened the pair and wrote nothing after it did start
+                        # answering, and must not be reported as "no markers
+                        # ever appeared".
                         ever_saw_r_marker = True
                 # COMPLETION IS CHECKED FIRST, before any fault state. Our own
                 # finished answer outranks whatever else is on the pane: with
@@ -1851,9 +2331,40 @@ class ClaudeSession:
                 # the finished answer away — the user got "⏳ Лимит подписки
                 # исчерпан" and then the real answer seconds later from the
                 # orphan poller. That is the 2026-08-20 double-message bug.
-                if wrap and is_complete(cap, rid):
-                    reply = extract_reply(cap, rid)
-                    self._shadow_compare(log_id, reply, shadow_reply)
+                #
+                # "Complete" is now the CLOSING MARKER IN THE TRANSCRIPT, not
+                # on the pane (backlog item 32): a reply longer than the
+                # capture window pushes its own opening marker out of frame,
+                # so the pane can show a finished answer that no parser can
+                # recognise. An unclosed span is deliberately NOT delivered
+                # here — half a reply is worse than a late one; it is what the
+                # salvage/ceiling rules below judge, once the pane says the
+                # turn is over.
+                #
+                # The pane is read for the reply in ONE case only: this
+                # session has no transcript at all (no pinned session id, or
+                # the tail could not be opened). That is degraded mode, not a
+                # second source — the two are mutually exclusive by
+                # construction, so a turn still takes its reply from exactly
+                # one place — and it beats timing out on every single turn
+                # against an otherwise healthy pane, which is what a lost pin
+                # would otherwise cost now that nothing else reads the screen.
+                pane_fallback = never_had_transcript and is_complete(cap, rid)
+                if pane_fallback:
+                    logger.warning(
+                        "delivering %s from the PANE: this session has no "
+                        "readable transcript, so any reply longer than the "
+                        "capture window would have been lost",
+                        log_id,
+                    )
+                if pane_fallback or (
+                    wrap and transcript_reply is not None and transcript_reply.closed
+                ):
+                    reply = (
+                        extract_reply(cap, rid)
+                        if pane_fallback
+                        else transcript_reply.body
+                    )
                     self._inflight.unlink(missing_ok=True)
                     migrated = self._ensure_migrated(cap)
                     if not migrated:
@@ -1902,7 +2413,12 @@ class ClaudeSession:
                 # RATE_LIMITED classification poll-resistant — the frame is
                 # static, so _RATE_LIMIT_CONFIRM_POLLS never clears it. The
                 # completion check above is unaffected (runs on raw `cap`).
-                state = classify_state(strip_open_reply_body(cap, rid) if wrap else cap)
+                # Our own (unclosed) reply text removed from the frame — see
+                # R5 below. Computed once: the salvage gate needs the same
+                # cleaned frame to ask "is the CLI still working?" without the
+                # model's own prose answering for it.
+                clean_cap = strip_open_reply_body(cap, rid) if wrap else cap
+                state = classify_state(clean_cap)
                 if state == PaneState.RATE_LIMITED:
                     # Require the signature to persist across several polls
                     # before trusting it — see _RATE_LIMIT_CONFIRM_POLLS.
@@ -1939,35 +2455,30 @@ class ClaudeSession:
                     self._sleep(self._poll_interval)
                     continue
 
-                # ── NEW: salvage / no-main-turn ceiling (backlog item 10) ──
+                # ── salvage / no-main-turn ceiling (backlog item 10) ───────
                 # Scoped to wrap=True: there is no closing-marker concept for
                 # wrap=False turns (those complete on two idle polls, above),
                 # so neither salvage nor the ceiling applies to them.
                 #
-                # KNOWN LIMITATION (round-2 review, 2026-08-21): salvage only
-                # ever recovers a reply that has SOME TUI boundary line
-                # (Worked-for / box rule / footer / idle prompt / spinner) on
-                # screen for extract_open_reply() to stop at. If a completed
-                # main turn's reply is followed by nothing recognizable as
-                # boundary chrome, extract_open_reply() never stabilizes and
-                # salvage silently never fires — the reply still reaches the
-                # user eventually via the ceiling (~300s) or the existing
-                # stall/timeout path, but not via salvage. The 2026-08-21
-                # incident this fix targets DID have a "Worked for …"
-                # boundary line, so the headline case is covered; this fix's
-                # actual reach is narrower than "every reply reaches
-                # Telegram quickly".
+                # The candidate is the transcript's UNCLOSED span for this rid
+                # (backlog item 32) — the model opened the pair and wrote an
+                # answer but never emitted `<<<E:rid>>>` (~3% of turns,
+                # backlog item 11). Two rules decide whether to deliver it:
+                # the PANE must say the main turn is over, and the BODY must
+                # have stopped growing. Both are needed — the pane alone can
+                # false-negative on a live turn, and a body that is still
+                # growing is a half-written answer.
                 #
-                # ALSO NOTE: extract_open_reply()'s boundary matching
-                # (_is_boundary_line) matches its signatures as SUBSTRINGS
-                # anywhere in a line ("Worked for", "bypass permissions on",
-                # a bare "❯", a box rule, a spinner shape) — if the model's
-                # OWN reply prose happens to contain one of these strings,
-                # the salvaged region can be truncated early, or salvage can
-                # be refused outright by the _WORKING_RE conjunct below. This
-                # is fail-safe in DIRECTION (under-delivers, never over-
-                # delivers wrong content) so it is not blocking, but it is a
-                # real, known limitation, not a hypothetical one.
+                # This replaced extract_open_reply()'s pane scraping, and with
+                # it two known limitations of that approach: salvage needed a
+                # recognisable TUI boundary line after the reply to stop at
+                # (absent one, it silently never fired), and its boundary
+                # signatures matched as substrings, so a reply whose own prose
+                # contained "Worked for" or "❯" could be truncated or refused.
+                # The transcript body has no chrome in it to confuse either
+                # way, which is also why the old `_WORKING_RE` conjunct on the
+                # candidate text is gone: it existed to catch pane chrome
+                # swept up into the region, and there is no pane chrome here.
                 if wrap:
                     if is_main_turn_active(cap):
                         last_main_turn_active = self._clock()
@@ -2001,35 +2512,55 @@ class ClaudeSession:
                             self._clock() - send_time,
                         )
 
-                    # Recomputed fresh EVERY poll (never trusts the cached
-                    # tracking value below for the gating decision itself) —
-                    # this also fails closed if the R marker has scrolled out
-                    # of the capture window.
-                    fresh_open = extract_open_reply(cap, rid)
+                    # The unclosed span as of THIS poll (the closed case
+                    # returned far above). Recomputed every poll and never
+                    # trusted from the cached tracking value below, so a body
+                    # that is still growing keeps resetting its own stability
+                    # clock instead of being delivered half-written.
+                    fresh_open = (
+                        transcript_reply.body
+                        if transcript_reply is not None and not transcript_reply.closed
+                        else None
+                    )
                     if fresh_open != salvage_region:
                         salvage_region = fresh_open
                         salvage_stable_since = self._clock()
 
+                    # A working signature in the conversation area, not
+                    # just the main-turn spinner. This is the replacement for
+                    # the `_WORKING_RE` conjunct the pane-scraping salvage
+                    # applied to its scraped region, and it exists for the
+                    # same reason: is_main_turn_active() can false-negative on
+                    # a genuinely live turn (the reviewer-demonstrated
+                    # non-paren spinner "✢ Razzle-dazzling…  44s · ↓1.8k
+                    # tokens"). Without it, a turn that opened the pair, wrote
+                    # a preamble and then spent minutes inside one tool call
+                    # has a body that is BYTE-IDENTICAL for the whole salvage
+                    # window — and would be delivered as a fragment, with its
+                    # rid marked handled, permanently blocking the real answer
+                    # that arrives later. Scoped to the conversation area
+                    # (main_area_working) for the reasons in that function's
+                    # docstring. At the full ceiling below this no longer
+                    # applies (R2b).
+                    # Deliberately the RAW frame, NOT `clean_cap`: stripping
+                    # our own open span also strips a non-paren spinner line
+                    # rendered right after the reply text, because
+                    # _is_boundary_line does not recognise that shape and so
+                    # sweeps it INTO the span (its docstring calls this out).
+                    # Cleaning first would make this net dead code for
+                    # exactly the shape it exists to catch — verified: the
+                    # Razzle-dazzling fixture salvages early with `clean_cap`
+                    # and correctly refuses with the raw frame. The model's
+                    # own prose is therefore inside what this reads, which is
+                    # why that scan has to be fail-safe about it.
+                    pane_still_working = wrap and main_area_working(cap)
                     if (
                         main_turn_finished(cap)
+                        and not pane_still_working
                         and self._clock() - last_main_turn_active
                         >= self._salvage_stable
                         and fresh_open is not None
                         and self._clock() - salvage_stable_since >= self._salvage_stable
-                        # ROUND-2 ADDITION (2026-08-21 review): refuse to
-                        # salvage if the candidate text ITSELF still contains
-                        # a working/spinner signature. is_main_turn_active()
-                        # can false-negative on a genuinely live turn (e.g. a
-                        # non-paren spinner shape it doesn't recognize —
-                        # reviewer-demonstrated, not hypothetical); if the
-                        # broader _WORKING_RE still finds a working signature
-                        # INSIDE the region extract_open_reply returned, that
-                        # is strong evidence the "reply" isn't actually
-                        # finished and got swept up together with ongoing
-                        # chrome. Refusing here falls through to the ceiling
-                        # path instead, which is safe: delayed via orphan
-                        # recovery, never wrong/truncated.
-                        and not _WORKING_RE.search(fresh_open)
                     ):
                         # Mirror the EXISTING normal-completion path exactly
                         # (release inflight → migrate/queue older orphans →
@@ -2055,14 +2586,10 @@ class ClaudeSession:
                             elapsed,
                             len(fresh_open),
                         )
-                        self._shadow_compare(log_id, fresh_open, shadow_reply)
                         return AskResult("ok", reply=fresh_open, salvaged=True)
 
                     region_desc = (
                         "None" if fresh_open is None else f"{len(fresh_open)} chars"
-                    )
-                    working_signature_in_region = bool(
-                        fresh_open and _WORKING_RE.search(fresh_open)
                     )
                     if (
                         not salvage_blocked_logged
@@ -2072,15 +2599,14 @@ class ClaudeSession:
                         salvage_blocked_logged = True
                         logger.info(
                             "salvage window open for %s but not taken: "
-                            "main_turn_finished=%s region=%s "
-                            "region_stable_for=%.1fs "
-                            "working_signature_in_region=%s "
+                            "main_turn_finished=%s pane_still_working=%s "
+                            "transcript_region=%s region_stable_for=%.1fs "
                             "since_main_turn_active=%.1fs",
                             log_id,
                             main_turn_finished(cap),
+                            pane_still_working,
                             region_desc,
                             self._clock() - salvage_stable_since,
-                            working_signature_in_region,
                             self._clock() - last_main_turn_active,
                         )
 
@@ -2088,26 +2614,24 @@ class ClaudeSession:
                         self._clock() - last_main_turn_active
                         >= self._no_main_turn_ceiling
                     ):
-                        # R2b (Fable audit): at the FULL ceiling, deliver an
-                        # open span REGARDLESS of the _WORKING_RE conjunct
-                        # that (correctly) still gates the fast 120s salvage
-                        # path above. That conjunct exists because
-                        # is_main_turn_active() can false-negative on a
-                        # genuinely live turn — but by the time a full
+                        # R2b (Fable audit): at the FULL ceiling, deliver the
+                        # open span even though the faster salvage path above
+                        # refused it (its body never stayed still for a whole
+                        # salvage window). By the time a full
                         # no_main_turn_ceiling has passed with no confirmed
-                        # main-turn activity AT ALL, a possibly-truncated or
-                        # contaminated reply is explicitly judged (per the
-                        # audit) better than the alternative this branch used
-                        # to guarantee: permanent loss, since a rid released
-                        # unhandled here can only ever be recovered by a
-                        # complete R/E pair later (F1) — never by this same
-                        # open span. ACCEPTED RISK, stated plainly: if
-                        # is_main_turn_active() is false-negativing on a
-                        # STILL-RUNNING turn, this can salvage a truncated
-                        # answer and permanently block the real, complete one
-                        # via handled_rids. Marked `salvaged=True` either way
-                        # so chat_session.py's existing warning notice covers
-                        # it (no new user-facing wording needed).
+                        # main-turn activity AT ALL, a possibly-truncated
+                        # reply is explicitly judged (per the audit) better
+                        # than the alternative this branch used to guarantee:
+                        # permanent loss, since a rid released unhandled here
+                        # can only ever be recovered by a complete R/E pair
+                        # later (F1) — never by this same open span. ACCEPTED
+                        # RISK, stated plainly: if is_main_turn_active() is
+                        # false-negativing on a STILL-RUNNING turn, this can
+                        # salvage a truncated answer and permanently block the
+                        # real, complete one via handled_rids. Marked
+                        # `salvaged=True` either way so chat_session.py's
+                        # existing warning notice covers it (no new
+                        # user-facing wording needed).
                         if main_turn_finished(cap) and fresh_open is not None:
                             elapsed = self._clock() - send_time
                             self._inflight.unlink(missing_ok=True)
@@ -2125,24 +2649,22 @@ class ClaudeSession:
                                 "ceiling salvage for %s: no closing marker, no "
                                 "confirmed main-turn activity for %.1fs "
                                 "(waited %.1fs total), delivering possibly-"
-                                "truncated body (len=%d, "
-                                "working_signature_in_region=%s) rather than "
-                                "a bare timeout",
+                                "truncated transcript body (len=%d) rather "
+                                "than a bare timeout",
                                 log_id,
                                 self._clock() - last_main_turn_active,
                                 elapsed,
                                 len(fresh_open),
-                                working_signature_in_region,
                             )
-                            self._shadow_compare(log_id, fresh_open, shadow_reply)
                             return AskResult("ok", reply=fresh_open, salvaged=True)
 
                         # F2 class (Fable audit R2c): nothing to salvage —
-                        # either the R marker never appeared at all, or it
-                        # did but is no longer extractable (scrolled out /
-                        # boundary never resolved). Distinguish the two for
-                        # an honest user-facing message: chat_session.py
-                        # greps `detail` for "no reply markers ever appeared".
+                        # the model never opened a `<<<R:rid>>>` pair in the
+                        # transcript at all, or this turn lost its transcript
+                        # (no pinned session id, an unreadable file, a
+                        # `/clear` mid-wait). Distinguish the two for an
+                        # honest user-facing message: chat_session.py greps
+                        # `detail` for "no reply markers ever appeared".
                         #
                         # Do NOT send Escape/Ctrl-C, do NOT interrupt: if
                         # is_main_turn_active ever false-negatives on a
@@ -2177,19 +2699,32 @@ class ClaudeSession:
                             "detected for %s (%.1fs since last active) — "
                             "lock released without interrupting, rid left "
                             "unhandled for the orphan poller: "
-                            "main_turn_finished=%s region=%s "
-                            "region_stable_for=%.1fs "
-                            "working_signature_in_region=%s "
-                            "ever_saw_r_marker=%s",
+                            "main_turn_finished=%s pane_still_working=%s "
+                            "transcript_region=%s region_stable_for=%.1fs "
+                            "transcript_records_seen=%s ever_saw_r_marker=%s",
                             log_id,
                             self._clock() - last_main_turn_active,
                             main_turn_finished(cap),
+                            pane_still_working,
                             region_desc,
                             self._clock() - salvage_stable_since,
-                            working_signature_in_region,
+                            reply_tail is not None and reply_tail.saw_records,
                             ever_saw_r_marker,
                         )
-                        self._shadow_compare(log_id, None, shadow_reply)
+                        if reply_tail is not None and not reply_tail.saw_records:
+                            # A tail that consumed NOTHING for a whole turn is
+                            # following a file nobody writes — a stale pin, or
+                            # a `claude` restarted inside the pane under
+                            # another id. Nothing else in the journal says so,
+                            # and left unnoticed it is a timeout on every
+                            # single turn.
+                            logger.error(
+                                "the transcript this session is pinned to (%s) "
+                                "received NOTHING for the whole of %s — the "
+                                "pinned session id is probably stale",
+                                sid_at_send,
+                                log_id,
+                            )
                         detail = (
                             "no closing marker and no active main turn"
                             if ever_saw_r_marker
@@ -2266,4 +2801,20 @@ class ClaudeSession:
                 self._sleep(self._poll_interval)
 
             # timed out: prompt is still physically in the pane → keep inflight
+            if reply_tail is not None and not reply_tail.saw_records:
+                # Same stale-pin alarm as the ceiling branch above, for the
+                # one path that skips it: a turn whose MAIN spinner keeps
+                # reading as active never reaches the ceiling (it needs
+                # no_main_turn_ceiling seconds with no main-turn activity)
+                # and exits here instead. A live turn against a transcript
+                # that receives nothing is exactly the stale-pin shape, and
+                # it must not be the one case that says nothing (blind
+                # review, round 2).
+                logger.error(
+                    "the transcript this session is pinned to (%s) received "
+                    "NOTHING for the whole of %s — the pinned session id is "
+                    "probably stale",
+                    sid_at_send,
+                    log_id,
+                )
             return AskResult("timeout", detail=f"no reply in {timeout}s")

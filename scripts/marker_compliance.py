@@ -59,10 +59,15 @@ def default_transcript_path() -> Path:
     """
     home = Path.home()
     project_dir = home / ".claude" / "projects"
-    # Same convention used by every session this vault runs: the project dir
-    # name is the vault path with slashes replaced by dashes.
+    # Same convention used by every session this vault runs — kept in step
+    # with d_brain.services.transcript.transcript_dir(), which is where the
+    # rule and its evidence are documented: EVERY non-alphanumeric character
+    # becomes a dash, not just the slashes (live-verified 2026-09-22; the
+    # slashes-only version pointed at a directory that does not exist for a
+    # vault path containing a "_" or a "."). Spelled out here rather than
+    # imported because this script is meant to run standalone.
     vault_path = Path(__file__).resolve().parent.parent / "vault"
-    slug = str(vault_path).replace("/", "-")
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(vault_path))
     candidate_dir = project_dir / slug
 
     runtime_dir = Path(

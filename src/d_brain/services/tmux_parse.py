@@ -13,6 +13,9 @@ Design invariants (from live spikes + adversarial review):
 * State signatures are matched only against the CHROME region (the bottom
   of the pane: footer/banner/idle line), never the whole transcript, so a
   reply that *mentions* "usage limit" or "/login" cannot be misclassified.
+* A TWO-COLUMN frame (transcript left, a second column right) does not get
+  the line-anchoring rule relaxed — the right column is cut off and the
+  same strict rule re-applied. See _column_frame.
 
 The rate-limit / logged-out signatures are not yet confirmed against a
 live session and may need adjustment per CLI version (see tests, open Q #2).
@@ -61,6 +64,154 @@ def _line_anchored(rid: str, kind: str) -> re.Pattern[str]:
     return re.compile(rf"(?m)^.*?<<<{kind}:{re.escape(rid)}>>>[ \t]*\r?$")
 
 
+# ── two-column frames (2026-09-20 incident) ──────────────────────────
+#
+# A pane can be rendered in TWO columns: the transcript on the left and a
+# second column on the right (observed: a file diff, lines starting with
+# "+"), separated by a long run of spaces. The marker line then reads
+#
+#     "  <<<E:dfca5573>>>               +ЬКО с европейским минеральным…"
+#
+# and every marker regex above requires the marker at END of line. That
+# requirement is not a detail to relax: it is the ONLY thing separating a
+# real answer from the prompt ECHO, which always carries text after the
+# marker ("<<<R:id>>> and a line containing only…"). With it unmet, the
+# second instance's replies all parsed as region=None and nothing was
+# delivered to its user at all.
+#
+# So the rule stays; the right COLUMN is removed instead, and the strict
+# rule is re-applied to the single-column frame that remains. The echo
+# lives inside the left column and keeps its own trailing text, so it is
+# still rejected — that property is covered by a test.
+#
+# Detection is deliberately strict: a false positive would TRUNCATE a real
+# reply, which is no better than dropping it. All of the following must
+# hold for a column boundary `c` to be accepted:
+#   * at least _COLUMN_MIN_RUN lines in a row have >= _COLUMN_MIN_GUTTER
+#     spaces ending exactly at `c`, with non-space at `c`;
+#   * at least _COLUMN_MIN_LEFT of those also carry text in the LEFT
+#     column, which is what tells a real column from a plain indented
+#     block (a diff body, a code block) — those have nothing to their left;
+#   * no line in the run crosses the gutter, i.e. the empty corridor is
+#     unbroken for the whole run.
+# Measured against 578 real single-column captures from a live 2.1.278
+# session (plain prose, tool output, multi-edit diffs, three concurrent
+# background agents): zero boundaries detected.
+_COLUMN_MIN_GUTTER = 6
+_COLUMN_MIN_RUN = 4
+_COLUMN_MIN_LEFT = 2
+# Soft-wrap threshold floor for a column frame — see _column_wrap_min.
+_COLUMN_MIN_WRAP = 60
+_COLUMN_GUTTER_RE = re.compile(rf" {{{_COLUMN_MIN_GUTTER},}}(?=\S)")
+
+
+def _column_boundary(lines: list[str]) -> int | None:
+    """Index at which a stable right-hand column starts, or ``None``.
+
+    The SMALLEST qualifying boundary wins, so a nested/three-column render
+    is cut back to its leftmost (transcript) column rather than half-way.
+    """
+    cands = [{m.end() for m in _COLUMN_GUTTER_RE.finditer(ln)} for ln in lines]
+    for c in sorted({x for s in cands for x in s}):
+        run = left = 0
+        for i, s in enumerate(cands):
+            if c in s:
+                run += 1
+                if lines[i][: c - _COLUMN_MIN_GUTTER].strip():
+                    left += 1
+                if run >= _COLUMN_MIN_RUN and left >= _COLUMN_MIN_LEFT:
+                    return c
+            elif len(lines[i].rstrip()) <= c - _COLUMN_MIN_GUTTER:
+                # Wholly inside the left column (or blank): neutral, a
+                # column with an empty right cell must not reset the run.
+                continue
+            else:
+                run = left = 0
+    return None
+
+
+_BLANK_RUN_RE = re.compile(r" {2,}")
+
+
+def _cut_at_gutter(line: str, boundary: int) -> str:
+    """``line`` with everything from its gutter rightwards removed.
+
+    Cutting every line at the same column would be wrong: the right
+    column's own cells are indented differently (a diff body indents
+    deeper than its line numbers), so the detected boundary is only where
+    the MOST COMMON cell starts. A cell starting a few columns earlier
+    would leave its first characters glued to the left column — measured,
+    and it corrupted a reply body.
+
+    So the boundary only says WHERE to look; each line is cut at the start
+    of its own blank corridor, i.e. the run of spaces that reaches the
+    boundary. A line with no such corridor (a full-width rule, the footer)
+    crosses no column and is returned untouched.
+    """
+    best: int | None = None
+    for m in _BLANK_RUN_RE.finditer(line):
+        start, end = m.start(), m.end()
+        if end - start < _COLUMN_MIN_GUTTER:
+            continue
+        # The corridor must reach the boundary, not be some wide gap inside
+        # the left column's own text.
+        if start <= boundary and end >= boundary - _COLUMN_MIN_GUTTER:
+            best = start if best is None else max(best, start)
+    if best is None:
+        return line if len(line) > boundary else line.rstrip()
+    return line[:best].rstrip()
+
+
+def _column_frame(text: str) -> tuple[str, int] | None:
+    """``(text with the right column cut off, left column width)``, or
+    ``None`` when ``text`` has no stable right column (the normal case —
+    the caller then keeps using the raw frame, unchanged).
+
+    Line-for-line aligned with ``text``: only characters are dropped, never
+    lines, so a line index means the same thing in both
+    (:func:`_strip_open_body_by_lines` relies on that).
+    """
+    lines = text.split("\n")
+    c = _column_boundary(lines)
+    if c is None:
+        return None
+    return "\n".join(_cut_at_gutter(ln, c) for ln in lines), c - _COLUMN_MIN_GUTTER
+
+
+def strip_right_column(text: str) -> str:
+    """``text`` with a detected right-hand column removed, else unchanged."""
+    got = _column_frame(text)
+    return text if got is None else got[0]
+
+
+def _frames(text: str) -> list[tuple[str, int]]:
+    """The frames to try marker matching against, best-known first:
+    ``(frame text, soft-wrap threshold)``.
+
+    Always the raw capture — so a single-column pane behaves exactly as it
+    did before two-column frames existed, byte for byte — plus, ONLY when a
+    stable right column was detected, the same capture with that column cut
+    off. Every marker entry point in this module walks this list instead of
+    matching against ``text`` directly.
+    """
+    frames = [(text, _WRAP_MIN_LEN)]
+    got = _column_frame(text)
+    if got is not None:
+        frames.append((got[0], _column_wrap_min(got[1])))
+    return frames
+
+
+def _column_wrap_min(width: int) -> int:
+    """Soft-wrap threshold for a left column ``width`` columns wide.
+
+    _WRAP_MIN_LEN (140) is 0.7 of the 200-column pane it was measured on;
+    a left column is narrower, so its soft-wrapped lines never reach 140
+    and unwrap_soft_breaks would leave the reply chopped into a ragged
+    column. Same ratio, with a floor so a very narrow column cannot start
+    gluing genuinely short lines together."""
+    return max(_COLUMN_MIN_WRAP, int(width * 0.7))
+
+
 def extract_reply(text: str, rid: str) -> str | None:
     """Return the text of the last well-formed, line-anchored
     ``<<<R:rid>>> .. <<<E:rid>>>`` pair, stripped, or ``None``.
@@ -69,8 +220,20 @@ def extract_reply(text: str, rid: str) -> str | None:
     self-references are mid-line and thus ignored). The chosen span must not
     contain another line-anchored marker of either kind, so a stray end
     marker cannot make the span swallow chrome.
+
+    A frame rendered in two columns is retried with its right column cut
+    off (see _column_frame) — same strict rule, single-column text.
     """
     _require_rid(rid)
+    for frame, wrap_min in _frames(text):
+        body = _extract_reply_in(frame, rid, wrap_min)
+        if body is not None:
+            return body
+    return None
+
+
+def _extract_reply_in(text: str, rid: str, wrap_min: int) -> str | None:
+    """extract_reply's body, against ONE already-chosen frame."""
     opens = list(_line_anchored(rid, "R").finditer(text))
     ends = list(_line_anchored(rid, "E").finditer(text))
     if not opens or not ends:
@@ -93,7 +256,7 @@ def extract_reply(text: str, rid: str) -> str | None:
             continue
         # The pane is a RENDERED screen: undo the terminal's soft wraps here,
         # at the single point every delivered reply passes through.
-        return unwrap_soft_breaks(inner).strip()
+        return unwrap_soft_breaks(inner, wrap_min).strip()
     return None
 
 
@@ -108,7 +271,7 @@ _BLOCK_START_RE = re.compile(r"^\s*(?:[-*•>#|]|\d+[.)]\s|```|<pre|<b>|\[)")
 _FENCE_RE = re.compile(r"^\s*(?:```|</?pre\b)")
 
 
-def unwrap_soft_breaks(text: str) -> str:
+def unwrap_soft_breaks(text: str, min_len: int = _WRAP_MIN_LEN) -> str:
     """Glue terminal soft-wraps back into single paragraphs.
 
     `capture-pane` returns the RENDERED screen, so every line break the
@@ -121,6 +284,9 @@ def unwrap_soft_breaks(text: str) -> str:
     PHYSICAL line before it was long enough to have been cut, it does not open
     a list/quote/heading/code block, and neither sits inside a fenced or <pre>
     region — where every break is meaningful and must survive untouched.
+
+    ``min_len`` defaults to the 200-column pane's threshold; a two-column
+    frame passes the narrower left column's own (see _column_wrap_min).
     """
     out: list[str] = []
     last_raw_len = 0  # length of the previous PHYSICAL line, not the joined one
@@ -141,7 +307,7 @@ def unwrap_soft_breaks(text: str) -> str:
             not in_block
             and out
             and raw.strip()
-            and last_raw_len >= _WRAP_MIN_LEN
+            and last_raw_len >= min_len
             and not _BLOCK_START_RE.match(raw)
         ):
             out[-1] = out[-1].rstrip() + " " + raw.strip()
@@ -165,11 +331,12 @@ def find_latest_reply(text: str) -> tuple[str, str] | None:
     validated with the same pairing/no-inner-marker rules as
     :func:`extract_reply`, so this can never disagree with it.
     """
-    for end_m in reversed(list(_ANY_END_MARKER_RE.finditer(text))):
-        rid = end_m.group(1)
-        body = extract_reply(text, rid)
-        if body is not None:
-            return rid, body
+    for frame, wrap_min in _frames(text):
+        for end_m in reversed(list(_ANY_END_MARKER_RE.finditer(frame))):
+            rid = end_m.group(1)
+            body = _extract_reply_in(frame, rid, wrap_min)
+            if body is not None:
+                return rid, body
     return None
 
 
@@ -182,19 +349,29 @@ def find_unhandled_replies(text: str, handled: set[str]) -> list[tuple[str, str]
     observed "answer never arrived" race). Returning all unhandled pairs makes
     delivery independent of poll timing — dedup is the caller's ``handled``
     set, not "is it currently the newest one".
+
+    On a two-column frame the raw pass finds nothing (no marker reaches the
+    end of its line); the column-stripped pass then does. Whichever frame
+    yields MORE pairs wins, so the returned list always comes from a single
+    coherent rendering of the screen and stays correctly ordered for
+    :func:`find_pending_replies`' watermark.
     """
-    seen: set[str] = set()
-    out: list[tuple[str, str]] = []
-    for end_m in _ANY_END_MARKER_RE.finditer(text):
-        rid = end_m.group(1)
-        if rid in handled or rid in seen:
-            continue
-        body = extract_reply(text, rid)
-        if body is None:
-            continue
-        seen.add(rid)
-        out.append((rid, body))
-    return out
+    best: list[tuple[str, str]] = []
+    for frame, wrap_min in _frames(text):
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for end_m in _ANY_END_MARKER_RE.finditer(frame):
+            rid = end_m.group(1)
+            if rid in handled or rid in seen:
+                continue
+            body = _extract_reply_in(frame, rid, wrap_min)
+            if body is None:
+                continue
+            seen.add(rid)
+            out.append((rid, body))
+        if len(out) > len(best):
+            best = out
+    return best
 
 
 def find_pending_replies(text: str, handled: set[str]) -> list[tuple[str, str]]:
@@ -236,9 +413,15 @@ def open_reply_rids(text: str) -> set[str]:
 
     Superset of :func:`reply_rids` (which only returns rids with a COMPLETE
     pair) — feeds the orphan-salvage path (Fable audit R2a) that rescues an
-    UNCLOSED span nobody's ``ask()`` is waiting on.
+    UNCLOSED span nobody's ``ask()`` is waiting on. A union across frames:
+    the function's contract is already "seen at all", so a rid visible only
+    once the right column is cut off belongs in it too.
     """
-    return {m.group(1) for m in _ANY_OPEN_MARKER_RE.finditer(text)}
+    return {
+        m.group(1)
+        for frame, _ in _frames(text)
+        for m in _ANY_OPEN_MARKER_RE.finditer(frame)
+    }
 
 
 def has_marker(text: str, rid: str, kind: str) -> bool:
@@ -251,7 +434,8 @@ def has_marker(text: str, rid: str, kind: str) -> bool:
     honest ``no reply markers ever appeared`` message) needs (R2c).
     """
     _require_rid(rid)
-    return bool(_line_anchored(rid, kind).search(text))
+    pat = _line_anchored(rid, kind)
+    return any(pat.search(frame) for frame, _ in _frames(text))
 
 
 #
@@ -404,13 +588,109 @@ def _chrome(text: str) -> str:
 
 
 _CHROME_LINE_RE = re.compile(
-    r"^\s*❯?\s*$"               # empty / bare idle prompt
-    r"|^\s*─+\s*$"              # box rule
-    r"|bypass permissions on"   # always-present footer
-    r"|esc to interrupt"        # working spinner hint
-    r"|^\s*⏵⏵"                  # footer arrows
-    r"|^\s{2}\S.* \| .* \| "    # status line: "  name | model | path"
+    r"^\s*❯?\s*$"  # empty / bare idle prompt
+    r"|^\s*─+\s*$"  # box rule
+    r"|bypass permissions on"  # always-present footer
+    r"|esc to interrupt"  # working spinner hint
+    r"|^\s*⏵⏵"  # footer arrows
+    r"|^\s{2}\S.* \| .* \| "  # status line: "  name | model | path"
 )
+
+
+# The prompt box's TOP border carries a trailing label whenever the session on
+# screen has a NAME — measured in ~/.dbrain/pane.log (2026-09-19,
+# agent-infra-backlog item 28) and live on Claude Code 2.1.278:
+#   "──────…────── night-second-brain ─"
+#   "❯ "
+# A label alone does NOT mean "foreign": `/rename foo` in the bot's own
+# conversation draws the very same border ("──…── foo ─", verified live), and
+# so does the main conversation once the CLI auto-titles it after it has been
+# moved to the background (the incident's "Организация мыслей и
+# восстановление спокойствия"). Telling the two apart is the caller's job
+# (ClaudeSession._foreign_view: own transcript's titles, then the verified
+# return-to-main keystrokes) — this only reads the label.
+#
+# Only the border DIRECTLY above the bottom-most ❯ line counts: that ❯ is the
+# input box. Anything higher is transcript, where the model's own text (e.g.
+# "─── Итог ─" followed by a quoted "❯ …" line) can take the same shape.
+# The in-transcript "── 1 new message ──…" divider has rules on BOTH sides
+# and never matches.
+_VIEW_LABEL_RE = re.compile(r"^\s*─{3,} (\S(?:[^─]*\S)?) ─\s*$")
+_INPUT_LINE_RE = re.compile(r"^\s*❯")
+# The "← N agents" LIST view itself (verified live, 2.1.278): the input box
+# holds the placeholder "describe a task for a new session" and the footer
+# offers "ctrl+x to delete". Anything typed there spawns a NEW background
+# session, so the bot must never treat it as its conversation either.
+_AGENTS_LIST_INPUT_RE = re.compile(r"^\s*❯ describe a task for a new session\s*$")
+# Footer of the list: "enter to open · space to reply · ctrl+x to delete" when
+# its input is empty, "enter to create · esc to clear" once something is typed
+# into it (verified live, 2.1.278) — then the placeholder is gone too, and
+# Escape only clears the draft instead of leaving the list.
+_AGENTS_LIST_FOOTER_RE = re.compile(r"ctrl\+x to delete|enter to create · esc to clear")
+_INPUT_BOX_EDGE_RE = re.compile(r"^\s*─{3,}")
+
+
+def _input_line_index(lines: list[str]) -> int | None:
+    for i in range(len(lines) - 1, -1, -1):
+        if _INPUT_LINE_RE.match(lines[i]):
+            return i
+    return None
+
+
+def foreign_view_label(text: str) -> str | None:
+    """The name on the input box's top border, or None when there is none.
+
+    A pane showing a background task still looks READY, and a prompt typed
+    into it is answered by that task, not by the bot's conversation — so the
+    reply never reaches the main transcript and every ask() times out with
+    ``region=None ever_saw_r_marker=False`` (the 2026-09-19 incident).
+    Measured from the last NON-blank row, since capture-pane pads a
+    not-yet-full pane with empty rows below the prompt box.
+    """
+    lines = _chrome(text.rstrip()).splitlines()
+    i = _input_line_index(lines)
+    if not i:  # None, or ❯ on the very first chrome row (nothing above it)
+        return None
+    m = _VIEW_LABEL_RE.match(lines[i - 1])
+    return m.group(1) if m else None
+
+
+def is_agents_list_view(text: str) -> bool:
+    """True when the pane shows the "← N agents" list instead of a session."""
+    lines = [ln for ln in _chrome(text.rstrip()).splitlines() if ln.strip()]
+    i = _input_line_index(lines)
+    if i is not None and _AGENTS_LIST_INPUT_RE.match(lines[i]):
+        return True
+    return any(_AGENTS_LIST_FOOTER_RE.search(ln) for ln in lines[-2:])
+
+
+def input_box_text(text: str) -> str | None:
+    """What sits in the input box right now, or None when no box is found.
+
+    The box is the bottom-most ``❯`` line with a rule DIRECTLY above it, plus
+    every line below it down to the next ``───`` rule (a multi-line draft or
+    a not yet collapsed paste wraps onto several rows; verified live on
+    2.1.278). Both rules are required: the transcript echo of a submitted
+    prompt also starts with ``❯`` but is not boxed. A box without a closing
+    rule (cut off, a modal on top) is not trusted either — None.
+
+    The rows are returned as rendered (chevron removed, each row stripped,
+    an empty row kept: a draft whose last row was just emptied differs from
+    one whose row is gone — _clear_input_draft relies on that). An empty box
+    may show a dim placeholder ("Try …", "Press up to edit queued
+    messages") — plain capture-pane cannot tell it from typed text, so
+    callers only look for things a placeholder never contains, or for
+    change."""
+    lines = text.rstrip().splitlines()
+    i = _input_line_index(lines)
+    if not i or not _INPUT_BOX_EDGE_RE.match(lines[i - 1]):
+        return None
+    body = [lines[i].lstrip().removeprefix("❯")]
+    for ln in lines[i + 1 :]:
+        if _INPUT_BOX_EDGE_RE.match(ln):
+            return "\n".join(part.strip() for part in body)
+        body.append(ln)
+    return None
 
 
 def strip_chrome(text: str) -> str:
@@ -682,6 +962,68 @@ def turn_auth_error(text: str, rid: str) -> bool:
     return _auth_error_block(lines)
 
 
+def main_area_working(text: str) -> bool:
+    """True iff a PROGRESS signature (a live elapsed-time + token counter, or
+    a background-agent wait) is visible in the conversation area — the lines
+    of chrome ABOVE the persistent bypass footer.
+
+    The safety net for :func:`is_main_turn_active`'s known false negatives.
+    That function keys on the paren-anchored spinner, and a real CLI shape
+    renders it WITHOUT parens ("✢ Razzle-dazzling…  44s · ↓1.8k tokens",
+    reviewer-demonstrated 2026-08-21, not hypothetical) — a live turn then
+    reads as finished, and ask()'s salvage would hand out whatever fragment
+    the model had written so far and mark the rid delivered, permanently
+    blocking the real answer.
+
+    Before backlog item 32 this net was a `_WORKING_RE` check ask() ran
+    against the pane region it had scraped between the reply marker and the
+    first boundary line. The reply text no longer comes from the pane, so
+    there is no such region any more — but the SCOPE that made the old check
+    correct has to be kept, and it was exactly "the conversation area, not
+    the footer and not the agent list":
+
+    * the footer itself carries "esc to interrupt" on 99.6% of real frames
+      with the main turn long finished (see :func:`_static_hint_outside_footer`),
+      so the broad :func:`is_working` would refuse every salvage;
+    * the background-agent rows BELOW the footer carry their own
+      "3m 14s · ↓ 42.7k tokens" counters (golden incident fixture), which is
+      Defect A/B all over again — a listed background task must never mean
+      "the main turn is still writing".
+
+    Both are drawn BELOW the prompt box, and the main turn's own spinner is
+    drawn above it, so the chrome is cut at the box. Both incident fixtures
+    agree on that layout even though they disagree on where the agent rows
+    sit relative to the footer.
+
+    The box is found from the BOTTOM — the last bare ``❯`` line, the same
+    rule ``_VIEW_LABEL_RE``'s comment above states ("only the border
+    DIRECTLY above the bottom-most ❯ line counts: that ❯ is the input box").
+    Scanning from the top instead is wrong and was caught in review: the
+    model's own text is in this window (``_chrome`` strips only CLOSED
+    pairs, and the span being judged here is by definition unclosed), a
+    markdown ``---`` in a reply renders as exactly the box-rule shape, and
+    the first such line would cut the search short ABOVE a live spinner —
+    reinstating the very fragment-delivery this net exists to prevent.
+
+    Bottom-up is fail-safe in the right direction: anything odd in the
+    model's prose stays INSIDE the searched area, so the worst it can do is
+    refuse a salvage that the ceiling then delivers anyway. Same for a frame
+    with no box in chrome at all, which is searched whole.
+
+    Reach is ``_CHROME_LINES`` lines, not the whole open span the old
+    `_WORKING_RE` conjunct scanned — so this is not a strict superset of it.
+    The same bound already applies to :func:`is_main_turn_active`, and a
+    spinner is drawn at the bottom of the conversation area, which is what
+    this window holds.
+    """
+    lines = _chrome(text).splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if _IDLE_BARE_RE.search(lines[i]):
+            lines = lines[:i]
+            break
+    return any(_WORKING_PROGRESS_RE.search(ln) for ln in lines)
+
+
 def main_turn_finished(text: str) -> bool:
     """True iff the main turn is demonstrably DONE: not active (see
     :func:`is_main_turn_active`) AND at least one POSITIVE finished signal
@@ -752,10 +1094,23 @@ def extract_open_reply(text: str, rid: str) -> str | None:
        the same normalization every normally-delivered reply already goes
        through.
     5. Returns ``None`` if the result is empty after stripping.
+    6. A two-column frame is retried with its right column cut off — that
+       frame is precisely what produced the ``region=None`` log lines on
+       the second instance (2026-09-20): with text after it, the open
+       marker was not line-anchored either, so even salvage had nothing.
     """
     _require_rid(rid)
     if extract_reply(text, rid) is not None:
         return None  # a complete pair exists — defer to the authoritative path
+    for frame, wrap_min in _frames(text):
+        body = _extract_open_reply_in(frame, rid, wrap_min)
+        if body is not None:
+            return body
+    return None
+
+
+def _extract_open_reply_in(text: str, rid: str, wrap_min: int) -> str | None:
+    """extract_open_reply's body, against ONE already-chosen frame."""
     opens = list(_line_anchored(rid, "R").finditer(text))
     if not opens:
         return None
@@ -768,7 +1123,7 @@ def extract_open_reply(text: str, rid: str) -> str | None:
         if _is_boundary_line(line):
             break
         body_lines.append(line)
-    body = unwrap_soft_breaks("\n".join(body_lines)).strip()
+    body = unwrap_soft_breaks("\n".join(body_lines), wrap_min).strip()
     return body or None
 
 
@@ -795,7 +1150,14 @@ def strip_open_reply_body(text: str, rid: str) -> str:
         return text  # a complete pair exists — strip_reply_bodies handles it
     opens = list(_line_anchored(rid, "R").finditer(text))
     if not opens:
-        return text
+        # Two-column frame: the open marker is not line-anchored in the RAW
+        # capture, but extract_open_reply can now salvage a body out of the
+        # column-stripped one — so this must be able to strip that same body
+        # out of the raw frame, or the prose it delivers stays in the chrome
+        # window and can fake a RATE_LIMITED forever (F4/R5, above).
+        # _column_frame is line-for-line aligned with `text`, so the body's
+        # LINE range carries over unchanged.
+        return _strip_open_body_by_lines(text, rid)
     marker_end = opens[-1].end()
     nl = text.find("\n", marker_end)
     if nl == -1:
@@ -812,6 +1174,30 @@ def strip_open_reply_body(text: str, rid: str) -> str:
             break
         pos = line_end + 1
     return text[:body_start] + text[pos:]
+
+
+def _strip_open_body_by_lines(text: str, rid: str) -> str:
+    """strip_open_reply_body for a two-column frame: locate the open span's
+    body in the column-stripped rendering, then drop those same LINES from
+    the raw one (the two are line-for-line aligned)."""
+    got = _column_frame(text)
+    if got is None:
+        return text
+    col_lines = got[0].split("\n")
+    pat = _line_anchored(rid, "R")
+    marker = None
+    for i, line in enumerate(col_lines):
+        if pat.search(line):
+            marker = i
+    if marker is None:
+        return text
+    end = len(col_lines)
+    for j in range(marker + 1, len(col_lines)):
+        if _is_boundary_line(col_lines[j]):
+            end = j
+            break
+    raw_lines = text.split("\n")
+    return "\n".join(raw_lines[: marker + 1] + raw_lines[end:])
 
 
 def parse_reset_time(text: str) -> tuple[int, int] | None:

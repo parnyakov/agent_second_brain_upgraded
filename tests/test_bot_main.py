@@ -59,7 +59,11 @@ def test_buttons_router_not_included_others_are():
     included_names = {router.name for router in dp.sub_routers}
 
     assert "buttons" not in included_names
-    assert {"commands", "process", "chat", "resend"} <= included_names
+    assert {"commands", "process", "chat", "resend", "work"} <= included_names
+    # /work must be reachable while the session is busy — registered after
+    # chat.router's catch-all it would never fire at all.
+    ordered = [router.name for router in dp.sub_routers]
+    assert ordered.index("work") < ordered.index("chat")
 
 
 # ── native "/" command menu ─────────────────────────────────────────────────
@@ -69,7 +73,7 @@ def test_bot_commands_has_expected_entries():
     from d_brain.bot.main import bot_commands
 
     commands = bot_commands()
-    assert len(commands) == 8
+    assert len(commands) == 9
 
     by_command = {c.command: c.description for c in commands}
     assert set(by_command) == {
@@ -80,6 +84,7 @@ def test_bot_commands_has_expected_entries():
         "new",
         "compact",
         "resend",
+        "work",
         "relogin",
     }
     for description in by_command.values():

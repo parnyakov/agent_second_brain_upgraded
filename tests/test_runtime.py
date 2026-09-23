@@ -1,5 +1,7 @@
 """Tests for the shared session/processor singletons."""
 
+import subprocess
+
 import d_brain.services.runtime as rt
 from d_brain.config import Settings
 
@@ -63,6 +65,192 @@ def test_get_cron_session_is_isolated_sibling(tmp_path):
     assert cron.runtime_dir == s.cron_dir
     assert cron.runtime_dir != main.runtime_dir
     assert cron.work_dir == main.work_dir
+
+
+def test_engine_round_trip_keeps_names_and_dirs(tmp_path):
+    """The owner flips DBRAIN_CHAT_ENGINE/DBRAIN_CRON_ENGINE and restarts the
+    bot (agent-infra-backlog item 28). Claude → Codex → Claude must land on
+    the SAME persisted tmux names and runtime dirs, so the Claude side finds
+    its own sessions again (exact-match addressing and the foreign-view check
+    in ClaudeSession take it from there) and the Codex side its own thread."""
+    from d_brain.services.claude_session import ClaudeSession, exact_target
+    from d_brain.services.codex_driver import CodexExecDriver
+
+    def build(engine):
+        rt.reset()
+        s = _settings(tmp_path, chat_engine=engine, cron_engine=engine)
+        (tmp_path / "deploy" / "codex-agents.md").write_text(
+            "# d-brain codex agent contract\n"
+        )
+        return s, rt.get_session(s), rt.get_cron_session(s)
+
+    s, chat1, cron1 = build("claude")
+    # The Claude brains were running before the switch: pinned transcript ids.
+    for sess, sid in ((chat1, "chat-sid"), (cron1, "cron-sid")):
+        (sess.runtime_dir / "session_id").write_text(sid + "\n")
+    _, chat_cx, cron_cx = build("codex")
+    _, chat2, cron2 = build("claude")
+    rt.reset()
+
+    assert isinstance(chat1, ClaudeSession) and isinstance(chat2, ClaudeSession)
+    assert isinstance(chat_cx, CodexExecDriver)
+    assert isinstance(cron_cx, CodexExecDriver)
+    for a, b in ((chat1, chat_cx), (chat1, chat2), (cron1, cron_cx), (cron1, cron2)):
+        assert a.session_name == b.session_name
+        assert a.runtime_dir == b.runtime_dir
+    assert cron2.session_name == f"{chat2.session_name}_cron"
+    # The main brain can never resolve to its cron sibling.
+    assert chat2._target == exact_target(chat2.session_name)
+    assert cron2._target == exact_target(cron2.session_name)
+    assert chat2._target != cron2._target
+
+    # Back on Claude, the still-running tmux sessions show their own
+    # conversations: ensure_session() reuses them as they are — no new
+    # process, no keys, and the pinned session ids survive the round trip.
+    ready = (
+        "────────────────────\n❯\n────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    for sess, sid in ((chat2, "chat-sid"), (cron2, "cron-sid")):
+        calls = []
+
+        def runner(args, _calls=calls, **kwargs):  # noqa: ANN001
+            _calls.append(args[1])
+            out = ready if args[1] == "capture-pane" else "200x50\n"
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        sess._runner = runner
+        sess.ensure_session()
+        assert "new-session" not in calls and "send-keys" not in calls
+        assert (sess.runtime_dir / "session_id").read_text().strip() == sid
+
+
+def test_get_duty_session_is_an_isolated_third_sibling(tmp_path):
+    """backlog items 29-30: the duty brain is a THIRD session — same persona
+    and vault, its own session name and its own runtime dir, sharing state
+    with neither the main brain nor the cron one."""
+    rt.reset()
+    s = _settings(tmp_path)
+    main = rt.get_session(s)
+    cron = rt.get_cron_session(s)
+    duty = rt.get_duty_session(s)
+    assert duty is not main and duty is not cron
+    assert duty.session_name == f"{main.session_name}_duty"
+    assert duty.runtime_dir == s.duty_dir
+    assert duty.runtime_dir not in (main.runtime_dir, cron.runtime_dir)
+    assert duty.work_dir == main.work_dir
+
+
+def test_get_duty_session_follows_the_chat_engine(tmp_path):
+    """It stands in for the CHAT brain, so flipping DBRAIN_CHAT_ENGINE must
+    take it along — otherwise an operator on Codex would still get a tmux
+    Claude session started behind their back. cron_engine must not move it."""
+    from d_brain.services.claude_session import ClaudeSession
+    from d_brain.services.codex_driver import CodexExecDriver
+
+    (tmp_path / "deploy").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "deploy" / "codex-agents.md").write_text(
+        "# d-brain codex agent contract\n"
+    )
+    rt.reset()
+    duty = rt.get_duty_session(_settings(tmp_path, chat_engine="codex"))
+    assert isinstance(duty, CodexExecDriver)
+    rt.reset()
+    duty = rt.get_duty_session(_settings(tmp_path, cron_engine="codex"))
+    assert isinstance(duty, ClaudeSession)
+    rt.reset()
+
+
+def test_duty_session_gets_a_stall_timeout_inside_its_own_budget(tmp_path):
+    """Review round 3, R1: the engine default (900s) sits above the duty
+    session's whole turn budget (600s), so its stall interrupt could never
+    fire — and duty_dir is watched by nobody (the watchdog polls
+    runtime_dir only), so a wedged duty pane would neither heal itself nor
+    ever deliver its reply. Self-interruption inside the budget is the only
+    backstop that session has."""
+    from d_brain.services.claude_session import DEFAULT_STALL_TIMEOUT
+
+    rt.reset()
+    s = _settings(tmp_path)
+    duty = rt.get_duty_session(s)
+    rt.reset()
+    assert duty._stall_timeout == s.duty_stall_timeout
+    assert duty._stall_timeout < s.duty_turn_timeout  # the whole point
+    assert duty._stall_timeout < DEFAULT_STALL_TIMEOUT
+
+
+def test_only_the_duty_session_overrides_the_stall_timeout(tmp_path, monkeypatch):
+    """The main and cron sessions must be constructed with byte-for-byte the
+    arguments they were before this parameter existed — `stall_timeout` must
+    not reach their constructor at all, so whatever the driver's own default
+    is (including a future change to it) stays theirs."""
+    from d_brain.services.claude_session import DEFAULT_STALL_TIMEOUT
+
+    seen: list[dict] = []
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+            self.session_name = kwargs["session_name"]
+            self.runtime_dir = kwargs["runtime_dir"]
+
+    monkeypatch.setattr(rt, "ClaudeSession", Recorder)
+    rt.reset()
+    s = _settings(tmp_path)
+    rt.get_session(s)
+    rt.get_cron_session(s)
+    rt.get_duty_session(s)
+    rt.reset()
+
+    main, cron, duty = seen
+    assert "stall_timeout" not in main
+    assert "stall_timeout" not in cron
+    assert duty["stall_timeout"] == s.duty_stall_timeout < DEFAULT_STALL_TIMEOUT
+
+
+def test_the_codex_duty_session_gets_the_same_override(tmp_path):
+    """Engine switching stays symmetric: the hole R1 closes is the duty
+    session's, not the tmux driver's."""
+    from d_brain.services.codex_driver import CodexExecDriver
+
+    (tmp_path / "deploy").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "deploy" / "codex-agents.md").write_text(
+        "# d-brain codex agent contract\n"
+    )
+    rt.reset()
+    s = _settings(tmp_path, chat_engine="codex")
+    duty = rt.get_duty_session(s)
+    rt.reset()
+    assert isinstance(duty, CodexExecDriver)
+    assert duty._stall_timeout == s.duty_stall_timeout
+
+
+def test_a_zero_duty_stall_timeout_falls_back_to_the_engine_default(tmp_path):
+    """0 is the rollback: no override, exactly the pre-R1 construction."""
+    from d_brain.services.claude_session import DEFAULT_STALL_TIMEOUT
+
+    rt.reset()
+    duty = rt.get_duty_session(_settings(tmp_path, duty_stall_timeout=0.0))
+    rt.reset()
+    assert duty._stall_timeout == DEFAULT_STALL_TIMEOUT
+
+
+def test_get_duty_session_is_singleton_and_reset_clears(tmp_path):
+    rt.reset()
+    s = _settings(tmp_path)
+    d1 = rt.get_duty_session(s)
+    assert rt.get_duty_session(s) is d1
+    rt.reset()
+    assert rt.get_duty_session(s) is not d1
+
+
+def test_get_duty_session_refuses_without_persona(tmp_path):
+    import pytest
+
+    rt.reset()
+    s = _settings(tmp_path, persona=False)
+    with pytest.raises(RuntimeError, match="persona"):
+        rt.get_duty_session(s)
 
 
 def test_get_cron_session_is_singleton_and_reset_clears(tmp_path):

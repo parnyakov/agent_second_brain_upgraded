@@ -18,8 +18,23 @@ SuccessExitStatus=143 SIGTERM
 # Bounded stop. Without it a stop can run into the *default* 90s
 # DefaultTimeoutStopSec, after which systemd logs that a python3 unit
 # process "remains running after unit stopped" and can start a second
-# instance over the live one. A graceful aiogram shutdown takes seconds.
-TimeoutStopSec=45
+# instance over the live one. Bounded it must stay — but the bound now has to
+# agree with the application's own.
+#
+# Since 2026-09-22 (backlog item 33 step 3) SIGTERM no longer cuts the bot
+# off: it stops taking new work and gives the turns already in flight
+# DBRAIN_SHUTDOWN_GRACE (default 300s) to finish, then one bounded outbox
+# drain (shutdown.FINAL_DRAIN_TIMEOUT, 10s) and a hard exit. 360s = 300 + 10
+# + slack, i.e. strictly longer than the application deadline, so systemd
+# never SIGKILLs a turn the bot was about to finish. Lower this below the
+# grace and the whole feature buys nothing; tests/test_shutdown.py fails if
+# the two drift apart.
+#
+# An idle stop is still instant — the grace is only ever paid when a turn is
+# actually running. `uv run` forwards SIGTERM to the python child and waits
+# for it (verified on uv 0.12.5, 2026-09-22), which is what makes the
+# application-level deadline reachable through the wrapper at all.
+TimeoutStopSec=360
 # Why TimeoutStopSec alone does NOT close that gap: ExecStart is `uv run`, so
 # the tracked MainPID is the uv wrapper and `python -m d_brain` is its CHILD.
 # Under KillMode=process both the SIGTERM and the post-TimeoutStopSec SIGKILL
@@ -28,6 +43,13 @@ TimeoutStopSec=45
 # reaps that child by exact command line, never by cgroup, so the detached
 # tmux brain (and the watchdog) are never signalled. Leading '-': a clean
 # stop leaves nothing to kill and pkill's exit 1 must not fail the unit.
+#
+# It does NOT cut the graceful stop short: ExecStopPost only runs once the
+# MainPID is gone, and `uv` does not exit until its python child does. It
+# stays as the safety net for the one case that still needs it — a stop that
+# outran TimeoutStopSec above, where the SIGKILL lands on `uv` alone and the
+# python child would otherwise be orphaned exactly as in the 2026-08-20
+# incident.
 ExecStopPost=-/usr/bin/pkill -KILL -x -f '.*python[0-9.]* -m d_brain'
 WorkingDirectory=%h/projects/dbrain
 ExecStart=%h/.local/bin/uv run python -m d_brain

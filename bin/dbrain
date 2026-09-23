@@ -71,15 +71,31 @@ case "$cmd" in
       else
         echo "— мозг:     Codex, НУЖЕН ВХОД → dbrain login"
       fi
-    elif tmux has-session -t "$BRAIN" 2>/dev/null; then
+    elif tmux has-session -t "=$BRAIN:" 2>/dev/null; then
       echo "— мозг:     жив ($BRAIN)"
     else
       echo "— мозг:     НЕ запущен"
     fi
+    if tmux has-session -t "=${BRAIN}_duty:" 2>/dev/null; then echo "— дежурный: жив (${BRAIN}_duty)"; else echo "— дежурный: не поднят (нормально, поднимается по надобности)"; fi
     echo "Полная проверка с ответом агента: dbrain doctor"
     ;;
   restart)
     echo "♻️  Перезапускаю сервисы…"
+    # Since 2026-09-22 a stop is graceful: the bot stops брать новое и даёт
+    # текущему ходу договорить (DBRAIN_SHUTDOWN_GRACE, по умолчанию 5 минут).
+    # `systemctl restart` ждёт молча всё это время, поэтому говорим об этом
+    # заранее — иначе выглядит как зависание.
+    #
+    # Второй SIGTERM = немедленный выход, но systemd НЕ шлёт его повторно
+    # сам: юниту, который уже останавливается, нужен явный `kill`. Это и есть
+    # кнопка «не жди».
+    if [ "$SYSTEMD_SCOPE" = "user" ]; then
+      _force_hint="systemctl --user kill -s TERM $BOT_UNIT"
+    else
+      _force_hint="sudo systemctl kill -s TERM $BOT_UNIT"
+    fi
+    echo "   (если бот сейчас отвечает — ждём, пока договорит, до ~5 минут;"
+    echo "    не ждать: $_force_hint)"
     _sctl_rw reset-failed "$BOT_UNIT" "$WATCHDOG_UNIT" 2>/dev/null || true
     _sctl_rw restart "$BOT_UNIT" "$WATCHDOG_UNIT"
     echo "Готово. Проверь: dbrain status"
@@ -101,15 +117,15 @@ case "$cmd" in
     _uv python -m d_brain.services.doctor
     ;;
   clear)
-    if tmux has-session -t "$BRAIN" 2>/dev/null; then
-      tmux send-keys -t "$BRAIN" "/clear" Enter
+    if tmux has-session -t "=$BRAIN:" 2>/dev/null; then
+      tmux send-keys -t "=$BRAIN:" "/clear" Enter
       echo "🧹 Память сессии очищена (durable-данные в файлах не тронуты)."
     else
       echo "Мозг не запущен — нечего чистить. Попробуй: dbrain repair"
     fi
     ;;
   attach)
-    exec tmux attach -t "$BRAIN"
+    exec tmux attach -t "=$BRAIN:"
     ;;
   repair)
     echo "🔧 Чиню: сброс ошибок + перезапуск…"
@@ -137,8 +153,9 @@ case "$cmd" in
     # keeps the brain alive). Recreate BOTH sessions so the bot rebuilds them
     # with the fresh login on the next message / cron job.
     echo "♻️  Пересоздаю сессию, чтобы она подхватила новый вход…"
-    tmux kill-session -t "$BRAIN" 2>/dev/null || true
-    tmux kill-session -t "${BRAIN}_cron" 2>/dev/null || true
+    tmux kill-session -t "=$BRAIN:" 2>/dev/null || true
+    tmux kill-session -t "=${BRAIN}_cron:" 2>/dev/null || true
+    tmux kill-session -t "=${BRAIN}_duty:" 2>/dev/null || true
     echo "Готово. Бот поднимет сессию заново при следующем сообщении. Проверь: dbrain status"
     ;;
   onboarding)

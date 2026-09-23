@@ -1,5 +1,6 @@
 """Application configuration using Pydantic Settings."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Literal
@@ -56,6 +57,42 @@ class Settings(BaseSettings):
     )
     tz: str = Field(default="UTC", description="Timezone for timers/reports")
 
+    # ── pane geometry ────────────────────────────────────────────────
+    # Was hardcoded (200x50) in claude_session.py. Made settable
+    # 2026-09-20 after the second instance stopped delivering replies:
+    # at a wide pane the Claude Code TUI can lay the screen out in TWO
+    # columns (transcript left, a file diff right), which puts text
+    # AFTER the `<<<E:id>>>` marker on its line — and the parser
+    # deliberately only accepts a marker at END of line, so every reply
+    # parsed as region=None. tmux_parse now strips such a right column
+    # (see _strip_right_column), but a narrower pane is the cheap,
+    # immediate mitigation that needs no code path to be correct.
+    # Defaults are exactly the previous hardcoded values, so leaving
+    # both unset is a byte-for-byte no-op.
+    pane_width: int = Field(
+        default=200,
+        ge=40,
+        validation_alias=AliasChoices("DBRAIN_PANE_WIDTH", "pane_width"),
+        description=(
+            "tmux pane width for the interactive session. 200 = today's "
+            "hardcoded value. Lower it (e.g. 160) on an instance where "
+            "the TUI splits the screen into two columns."
+        ),
+    )
+    pane_height: int = Field(
+        default=50,
+        ge=20,
+        validation_alias=AliasChoices("DBRAIN_PANE_HEIGHT", "pane_height"),
+        description=(
+            "tmux pane height for the interactive session. 50 = today's "
+            "hardcoded value; the TUI draws its footer just below the "
+            "content, so a much TALLER pane puts the footer mid-screen "
+            "and chrome-region state detection misses it (see "
+            "claude_session._PANE_HEIGHT). Do not raise without "
+            "re-checking _CHROME_LINES."
+        ),
+    )
+
     # ── multi-instance parameterization (C1, multi-instance plan) ──
     # Every field here defaults to EXACTLY today's single-instance behavior.
     # Setting none of them must be a byte-for-byte no-op.
@@ -84,15 +121,6 @@ class Settings(BaseSettings):
             "'user' → `systemctl --user restart <unit>` (today's behavior). "
             "'system' → `sudo -n systemctl restart <unit>`, for the "
             "templated system units a non-login service account needs."
-        ),
-    )
-    transcript_shadow_mode: bool = Field(
-        default=False,
-        description=(
-            "R1 (Fable audit, 2026-08-22): also extract replies from the "
-            "session's JSONL transcript and log agreement/disagreement with "
-            "the panel path. Diagnostic only — never changes what is "
-            "actually delivered to Telegram this round."
         ),
     )
     context_alert_tokens: int = Field(
@@ -130,6 +158,22 @@ class Settings(BaseSettings):
             "pane telling the session to close the turn and dispatch "
             "remaining work to background agents. 0 (the default) means "
             "this code path never fires — zero live behavior change."
+        ),
+    )
+    long_run_max_seconds: float = Field(
+        default=1800.0,
+        description=(
+            "agent-infra-backlog item 29 (2026-09): HARD cap on how long an "
+            "UNATTENDED turn of the main session may run before the watchdog "
+            "closes it automatically (one interrupt() per run) and tells the "
+            "owner why. The owner's rule: a long background job belongs to "
+            "an agent, not to the main session — a turn that outlives this "
+            "cap is a failure mode, not work. MUST be larger than "
+            "long_run_alert_seconds (and larger than long_run_nudge_seconds "
+            "when that is enabled): the intended order of the three "
+            "thresholds is alert → nudge → max. 0 disables the auto-close "
+            "entirely — the rollback switch for this feature; the heads-up "
+            "alert and the marker keep working regardless."
         ),
     )
 
@@ -207,6 +251,173 @@ class Settings(BaseSettings):
         description="Retry delay for a failed one-shot ('at') job",
     )
 
+    # ── durable inbox (agent-infra-backlog item 33, step 2) ──────────
+    inbox_replay_max_age: float = Field(
+        default=3600.0,
+        validation_alias=AliasChoices(
+            "DBRAIN_INBOX_REPLAY_MAX_AGE", "inbox_replay_max_age"
+        ),
+        description=(
+            "How old (seconds) an accepted-but-unanswered incoming message "
+            "may be and still be replayed at startup. Default one hour, the "
+            "same window the reference agent uses: long enough that a "
+            "restart or a crash never eats a message, short enough that "
+            "booting after a night down does not answer yesterday's chat. "
+            "Anything older is moved to runtime_dir/inbox/stale/ instead of "
+            "being replayed — nothing is deleted. 0 (or negative) disables "
+            "replay entirely and retires the whole backlog."
+        ),
+    )
+
+    # ── graceful stop (agent-infra-backlog item 33, step 3) ──────────
+    shutdown_grace_seconds: float = Field(
+        default=300.0,
+        validation_alias=AliasChoices(
+            "DBRAIN_SHUTDOWN_GRACE", "shutdown_grace_seconds"
+        ),
+        description=(
+            "How long (seconds) a stop waits for the turns already in flight "
+            "before it leaves. On SIGTERM the bot stops TAKING work — new "
+            "messages are still accepted to disk and answered with a short "
+            "'перезапускаюсь' line, then replayed after the restart — while "
+            "whatever was already running gets this long to produce its "
+            "reply. Only ever paid when something is actually running: an "
+            "idle bot stops at once. A second signal exits immediately.\n\n"
+            "MUST stay below the unit's TimeoutStopSec (360s in "
+            "deploy/dbrain-bot.service and deploy/systemd/dbrain-bot@.service) "
+            "with room for shutdown.FINAL_DRAIN_TIMEOUT on top, or systemd "
+            "SIGKILLs the process mid-grace and the wait buys nothing. "
+            "tests/test_shutdown.py pins that relationship."
+        ),
+    )
+
+    # ── per-chat queue (agent-infra-backlog item 33, step 5) ─────────
+    chat_queue_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("DBRAIN_CHAT_QUEUE", "chat_queue_enabled"),
+        description=(
+            "One turn per chat at a time; a message that arrives while the "
+            "main session is working is acknowledged at once ('принял, отвечу "
+            "следом') and waits ON DISK until the session is free. False → "
+            "byte-for-byte the pre-queue behavior, where the same message got "
+            "a brush-off or an answer from the context-less duty session. The "
+            "rollback switch for this feature."
+        ),
+    )
+    chat_queue_max_waiting: int = Field(
+        default=10,
+        validation_alias=AliasChoices(
+            "DBRAIN_CHAT_QUEUE_MAX", "chat_queue_max_waiting"
+        ),
+        description=(
+            "How many messages ONE chat may have waiting. Past it the sender "
+            "is told plainly that the message will not be answered — nothing "
+            "is ever dropped quietly. 0 (or negative) means no limit, which "
+            "is only sane if you never want to be told the queue is running "
+            "away from you."
+        ),
+    )
+    chat_queue_max_age: float = Field(
+        default=7200.0,
+        validation_alias=AliasChoices(
+            "DBRAIN_CHAT_QUEUE_MAX_AGE", "chat_queue_max_age"
+        ),
+        description=(
+            "How long (seconds) a message may wait before the queue gives up "
+            "on it, moves it to runtime_dir/chat-queue/stale/ and says so. "
+            "Two hours is far beyond any legitimate turn (chat_turn_timeout "
+            "is 1500s, the watchdog closes an unattended run at 1800s), so "
+            "reaching it means something is wrong rather than slow. 0 (or "
+            "negative) disables the age cap entirely."
+        ),
+    )
+
+    # ── duty session (agent-infra-backlog items 29–30) ───────────────
+    # The THIRD engine session, modelled on the cron one: same persona, same
+    # vault, own session name and own runtime dir. It exists for exactly one
+    # case — a Telegram message arriving while the main brain is mid
+    # UNATTENDED long turn (ask-lock free, pane busy), which used to get the
+    # "🛠 идёт длинная фоновая задача" brush-off and nothing else. The cron
+    # session cannot be reused for this: it is /clear-ed after every job and
+    # may itself be running one.
+    duty_session_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("DBRAIN_DUTY_SESSION", "duty_session_enabled"),
+        description=(
+            "Answer from the duty session when the main one is busy. False → "
+            "byte-for-byte today's behavior (the busy/maintenance brush-off "
+            "message), the rollback switch for this feature."
+        ),
+    )
+    duty_turn_timeout: float = Field(
+        default=600.0,
+        description=(
+            "ask() timeout for a duty turn. Deliberately far below the main "
+            "session's: a duty turn is contracted to be short, and the user "
+            "is already waiting out a busy main session. Raised 300 → 600 "
+            "(blind review F7, 2026-09-20): the FIRST duty turn of a busy "
+            "window is not just the answer — it is a cold `claude` start "
+            "plus the CLAUDE.md session bootstrap plus the answer, all "
+            "inside this one budget, and 300s could not reliably hold all "
+            "three. A warm turn is unaffected: it finishes when it "
+            "finishes, this is only the ceiling."
+        ),
+    )
+    duty_stall_timeout: float = Field(
+        default=240.0,
+        description=(
+            "Hang detector for a DUTY turn, per-session rather than the "
+            "engine default (claude_session.DEFAULT_STALL_TIMEOUT = 900s). "
+            "MUST be strictly less than duty_turn_timeout, and the margin "
+            "matters: ask()'s loop is bounded by `deadline = clock + "
+            "timeout` while the stall check fires on `clock - last_active > "
+            "stall_timeout`, so a stall timeout at or above the turn budget "
+            "can never fire and the Escape is dead code (review round 3, "
+            "R1 — the same defect F3 fixed for the chat path). It bites "
+            "HARDER here: duty_dir is watched by nobody. The watchdog polls "
+            "settings.runtime_dir only, so neither its recovery nor its "
+            "orphan-reply poller ever looks at the duty session — a wedged "
+            "duty pane does not heal itself and its late reply never "
+            "arrives. Self-interruption inside the budget is the only "
+            "backstop that path has. 240s leaves 360s of headroom under the "
+            "600s budget: enough for the Escape to land and the turn to "
+            "report a status."
+        ),
+    )
+    duty_idle_reset_seconds: float = Field(
+        default=3600.0,
+        description=(
+            "If the duty session has not been used for longer than this, it "
+            "gets a /clear before the next turn. Keeps continuity inside one "
+            "busy window without letting its context grow for months. 0 → "
+            "clear before every duty turn."
+        ),
+    )
+    chat_turn_timeout: float = Field(
+        default=1500.0,
+        description=(
+            "Hard ceiling for a CHAT-initiated main-session turn. Before this "
+            "existed the chat path inherited DEFAULT_TIMEOUT (3600s) — an "
+            "hour of a Telegram user staring at a typing indicator. On "
+            "expiry ask() keeps the request in flight (the rid is NOT marked "
+            "handled), so a late reply still arrives via the watchdog's "
+            "orphan path (Claude engine; under Codex the turn's process is "
+            "terminated instead — see chat_session._turn_limit_keeps_inflight). "
+            "0 → the old DEFAULT_TIMEOUT behavior.\n\n"
+            "MUST be strictly greater than claude_session.DEFAULT_STALL_TIMEOUT "
+            "(900s). ask()'s loop is bounded by `deadline = clock + timeout` "
+            "while its hang detector fires on `clock - last_active > "
+            "stall_timeout`; at equal values that strict inequality can never "
+            "hold, so the stall interrupt becomes dead code on every chat turn "
+            "and a wedged pane rides the ceiling instead of being interrupted. "
+            "The default was exactly 900.0 until the blind review caught it "
+            "(F3, 2026-09-20); 1500 leaves a real 600s stall window while "
+            "staying well under DEFAULT_TIMEOUT. A misconfigured value is "
+            "WARNED about at startup, never raised — a bot that refuses to "
+            "boot is worse than one with a dead stall check."
+        ),
+    )
+
     @field_validator("runtime_dir", "vault_path", mode="after")
     @classmethod
     def _expand_user(cls, v: Path) -> Path:
@@ -233,10 +444,93 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _warn_on_dead_duty_stall_window(self) -> "Settings":
+        """Round-3 R1's invariant, in the same shape as the chat one below:
+        a ``duty_stall_timeout`` at or above ``duty_turn_timeout`` can never
+        fire, so the duty session loses its only self-recovery — nothing
+        else watches ``duty_dir``. Warning, never an exception, for the same
+        reason as below."""
+        if self.duty_turn_timeout <= 0 or self.duty_stall_timeout <= 0:
+            return self
+        if self.duty_stall_timeout >= self.duty_turn_timeout:
+            logging.getLogger(__name__).warning(
+                "DUTY_STALL_TIMEOUT=%s is not less than DUTY_TURN_TIMEOUT=%s: "
+                "a duty turn's stall interrupt can never fire, and nothing "
+                "else watches the duty session — a wedged duty pane will not "
+                "recover on its own.",
+                self.duty_stall_timeout,
+                self.duty_turn_timeout,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_on_dead_chat_stall_window(self) -> "Settings":
+        """Blind review F3: a ``chat_turn_timeout`` at or below the stall
+        timeout silently disables ``ask()``'s stall interrupt for every chat
+        turn (see the field's description for the arithmetic).
+
+        A WARNING, deliberately not a ValidationError: this runs on every
+        ``Settings()``, including the bot's own startup, and an operator
+        typo that merely weakens a hang detector must not turn into a
+        service that will not boot at all. The import is local so `config`
+        keeps no module-level dependency on the engine layer.
+        """
+        if self.chat_turn_timeout <= 0:
+            return self  # 0 = "use DEFAULT_TIMEOUT (3600)", which is fine
+        from d_brain.services.claude_session import DEFAULT_STALL_TIMEOUT
+
+        if self.chat_turn_timeout <= DEFAULT_STALL_TIMEOUT:
+            logging.getLogger(__name__).warning(
+                "CHAT_TURN_TIMEOUT=%s is not greater than the stall timeout "
+                "(%s): ask()'s stall interrupt can never fire on a chat turn, "
+                "so a wedged pane will ride the full ceiling instead of being "
+                "interrupted. Set it above %s.",
+                self.chat_turn_timeout,
+                DEFAULT_STALL_TIMEOUT,
+                DEFAULT_STALL_TIMEOUT,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_on_grace_the_unit_will_not_honour(self) -> "Settings":
+        """A grace the systemd unit cannot cover buys nothing.
+
+        The unit's ``TimeoutStopSec`` is the real ceiling: past it systemd
+        SIGKILLs the process mid-grace, so an operator who raises
+        ``DBRAIN_SHUTDOWN_GRACE`` in ``/etc/dbrain/<instance>/.env`` — the same
+        file systemd reads as ``EnvironmentFile=``, which is exactly why this
+        is easy to get wrong — silently gets the old hard kill back (blind
+        review 6). A WARNING, not an error, for the same reason as the check
+        above: a stop that is less graceful than intended must not become a
+        bot that will not boot.
+        """
+        from d_brain.services.shutdown import STOP_OVERHEAD, UNIT_TIMEOUT_STOP_SEC
+
+        if self.shutdown_grace_seconds + STOP_OVERHEAD > UNIT_TIMEOUT_STOP_SEC:
+            logging.getLogger(__name__).warning(
+                "DBRAIN_SHUTDOWN_GRACE=%s plus %.0fs of stop overhead exceeds "
+                "the unit's TimeoutStopSec=%.0f: systemd will SIGKILL the "
+                "process before the grace is up, so a turn in flight is cut "
+                "off exactly as it was before. Lower the grace to %.0f or "
+                "raise TimeoutStopSec in the unit.",
+                self.shutdown_grace_seconds,
+                STOP_OVERHEAD,
+                UNIT_TIMEOUT_STOP_SEC,
+                UNIT_TIMEOUT_STOP_SEC - STOP_OVERHEAD,
+            )
+        return self
+
     @property
     def cron_dir(self) -> Path:
         """Cron state dir: jobs.json + the cron session's runtime files."""
         return self.runtime_dir / "cron"
+
+    @property
+    def duty_dir(self) -> Path:
+        """Duty state dir: the duty session's own runtime files + last-use
+        stamp. Sibling of cron_dir, for the same isolation reason."""
+        return self.runtime_dir / "duty"
 
     @property
     def admin_chat_id(self) -> int | None:

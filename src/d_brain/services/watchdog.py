@@ -114,6 +114,21 @@ DEFAULT_LONG_RUN_ALERT = 900.0
 # background agents. 0.0 means this code path never fires — see
 # Watchdog._track_long_run.
 DEFAULT_LONG_RUN_NUDGE = 0.0
+# agent-infra-backlog item 29 (2026-09): HARD cap. An unattended turn of the
+# main session that runs longer than this is closed automatically (one
+# interrupt() per run) and the owner is told why. The rule this encodes is
+# the owner's own: a long background job belongs to an agent, the main
+# session is loaded only with short work and supervision — so a turn that
+# outlives the cap is a failure mode, not work in progress.
+#
+# THRESHOLD ORDER (all measured from the same "unattended run started"
+# instant): alert (DEFAULT_LONG_RUN_ALERT, 900s — one heads-up notice)
+# < nudge (DEFAULT_LONG_RUN_NUDGE, off by default — one in-pane reminder to
+# self-close) < max (this, 1800s — the watchdog closes it). Configuring them
+# out of order is not fatal, just nonsense: the earlier stages would fire
+# after the turn was already closed. 0.0 disables the auto-close entirely
+# (rollback switch); the alert and the marker are unaffected.
+DEFAULT_LONG_RUN_MAX = 1800.0
 
 _SERVICEABLE = {
     PaneState.READY,
@@ -130,7 +145,7 @@ class Watchdog:
         runtime_dir: Path,
         disk_free_fn: Callable[[], int] | None = None,
         clock_fn: Callable[[], float] = time.time,
-        alert_fn: Callable[[str], None] = lambda _m: None,
+        alert_fn: Callable[[str], object] = lambda _m: None,
         sleep_fn: Callable[[float], None] = time.sleep,
         tick: float = DEFAULT_TICK,
         stall_threshold: float = DEFAULT_STALL_THRESHOLD,
@@ -145,6 +160,7 @@ class Watchdog:
         context_rearm_ticks: int = DEFAULT_CONTEXT_REARM_TICKS,
         long_run_alert_seconds: float = DEFAULT_LONG_RUN_ALERT,
         long_run_nudge_seconds: float = DEFAULT_LONG_RUN_NUDGE,
+        long_run_max_seconds: float = DEFAULT_LONG_RUN_MAX,
     ) -> None:
         self.session = session
         self.runtime_dir = Path(runtime_dir)
@@ -209,6 +225,20 @@ class Watchdog:
         # 0.0 (the default) means this never fires.
         self._long_run_nudge_seconds = long_run_nudge_seconds
         self._long_run_nudge_sent = False
+        # Item 29: hard cap. 0.0 (or a non-positive value) never closes
+        # anything. Both pieces of state are per-RUN latches reset on
+        # 'started'/'ended', exactly like _long_run_nudge_sent — so at most
+        # ONE interrupt() is ever issued for a given unattended run, however
+        # many ticks observe it past the cap.
+        self._long_run_max_seconds = long_run_max_seconds
+        self._long_run_closed = False
+        # When the auto-close (or the last escalation reminder about a run
+        # that refused to close) was announced. Rate-limits the escalation to
+        # at most one message per _long_run_max_seconds — a turn that ignores
+        # the interrupt must not turn into a notification flood, and must
+        # NEVER escalate into force_recover/kill: that would destroy the
+        # session and the very context whose partial work we are preserving.
+        self._long_run_closed_ts = 0.0
 
     def _is_hung(self, state: PaneState) -> bool:
         # Hang model (paired with ask()'s stall detector): silence is NOT a
@@ -429,6 +459,13 @@ class Watchdog:
         circuit its own busy-wait via the marker this writes — it never
         itself decides anything is a fault.
 
+        Three thresholds hang off the same tracked run, in this order (see
+        ``DEFAULT_LONG_RUN_MAX``): ``alert`` → one heads-up message;
+        ``nudge`` (off by default) → one in-pane reminder to self-close;
+        ``max`` → ``_enforce_long_run_cap`` closes the turn. Item 29's cap
+        is the only one of the three that CHANGES the session's state
+        rather than just reporting on it.
+
         Defensive/duck-typed like the rest of this method's siblings: a fake
         or minimal session object used in tests may not implement every real
         method, and that must never crash a tick.
@@ -454,6 +491,8 @@ class Watchdog:
 
         if event in ("started", "ended"):
             self._long_run_nudge_sent = False
+            self._long_run_closed = False
+            self._long_run_closed_ts = 0.0
 
         if event == "started":
             logger.info("long-run: unattended long turn started")
@@ -507,6 +546,135 @@ class Watchdog:
             except Exception:  # noqa: BLE001 — best effort, never fatal
                 logger.warning("long-run: nudge steer failed", exc_info=True)
 
+        self._enforce_long_run_cap(new_state.since, now)
+
+    def _enforce_long_run_cap(self, since: float, now: float) -> None:
+        """Hard cap on an unattended run (agent-infra-backlog item 29).
+
+        Last stage of the threshold ladder documented on
+        ``DEFAULT_LONG_RUN_MAX``: alert (heads-up) < nudge (ask the session
+        to self-close, off by default) < max (THIS — close it ourselves).
+
+        Only ever reached from ``_track_long_run``, which means it only ever
+        sees an UNATTENDED run: ``long_run.next_state`` refuses to track a
+        turn whose ask-lock is held, so an ordinary chat turn the user is
+        sitting in front of — however long it runs — can never be closed by
+        this path. That is deliberate, not an oversight: the user waiting on
+        their own answer is exactly who this cap exists to protect.
+
+        Two-stage, and the second stage is deliberately toothless:
+
+        1. First tick past the cap: ONE ``interrupt()`` (a TUI Escape / a
+           SIGINT to the exec process — the same thing ``/stop`` does) plus
+           one message explaining what happened and where the partial work
+           is.
+        2. If later ticks still see the SAME run (the turn ignored the
+           interrupt): at most one reminder per ``_long_run_max_seconds``,
+           and nothing else. No repeated interrupts, and explicitly no
+           ``force_recover``/kill — recovering the session would destroy the
+           conversation context that holds the very work this message is
+           telling the owner about.
+        """
+        if self._long_run_max_seconds <= 0 or since <= 0:
+            return
+        elapsed = now - since
+        if elapsed < self._long_run_max_seconds:
+            return
+        minutes = max(1, round(elapsed / 60))
+
+        if self._long_run_closed:
+            # Stage 2: it did not close. Remind, rarely; never re-interrupt.
+            if now - self._long_run_closed_ts < self._long_run_max_seconds:
+                return
+            self._long_run_closed_ts = now
+            logger.warning(
+                "long-run: turn still running %.0fs after auto-close", elapsed
+            )
+            self._alert_fn(
+                f"⚠️ Ход основной сессии не закрылся после автоматического "
+                f"прерывания — идёт уже ~{minutes} мин. Сессию принудительно "
+                "не перезапускаю: это уничтожило бы её контекст вместе с "
+                "недоделанной работой. Прервать вручную — /stop."
+            )
+            return
+
+        # Stage 1: one interrupt, one honest message.
+        self._long_run_closed = True
+        self._long_run_closed_ts = now
+        # Duck-typed session (tests, minimal fakes) like every sibling in
+        # this method's neighborhood: a tick must never die here.
+        try:
+            self.session.interrupt()
+            closed = True
+        except Exception:  # noqa: BLE001 — best effort, never fatal
+            closed = False
+            logger.warning("long-run: interrupt failed", exc_info=True)
+        logger.info(
+            "long-run: hard cap reached at ~%.0fs elapsed (interrupt %s)",
+            elapsed,
+            "sent" if closed else "FAILED",
+        )
+        if closed:
+            self._alert_fn(
+                f"⏹ Ход основной сессии шёл ~{minutes} мин — закрыл его "
+                "автоматически. Длинная работа должна уходить фоновым "
+                "агентам, а не занимать основную сессию. Что успело "
+                "записаться — лежит в файлах вольта. Если результат всё ещё "
+                "нужен — напиши ещё раз, вынесу это в агента."
+            )
+        else:
+            self._alert_fn(
+                f"⚠️ Ход основной сессии идёт ~{minutes} мин — это дольше "
+                "лимита, но закрыть его автоматически не получилось. "
+                "Длинная работа должна уходить фоновым агентам. Прервать "
+                "вручную — /stop."
+            )
+
+    def _deliver_notices(self) -> None:
+        """Forward the session's owner notices (e.g. "conversation context
+        reset: the pane was parked", agent-infra-backlog item 28). Parking
+        can happen at bot start-up or in force_recover(), with no chat reply
+        to carry the notice — this tick is what makes it reach the owner.
+        Best-effort; a session without notices (Codex driver) is skipped.
+
+        A notice whose send fails (alert_fn raises, or returns False — the
+        Telegram alerter does that when admin_chat_id is empty or the API
+        call fails) is handed back to the session together with every notice
+        after it, so a later tick — or the next chat reply — can deliver it.
+        pop_notices() empties the queue before the send is known to work;
+        without the requeue one failed POST lost the notice for good (review
+        2026-09-19)."""
+        pop = getattr(self.session, "pop_notices", None)
+        if pop is None:
+            return
+        try:
+            notices = list(pop())
+        except Exception:  # noqa: BLE001 — never break the liveness tick
+            logger.warning("could not read session notices", exc_info=True)
+            return
+        for i, text in enumerate(notices):
+            try:
+                sent = self._alert_fn(text) is not False
+            except Exception:  # noqa: BLE001
+                logger.warning("owner notice send failed", exc_info=True)
+                sent = False
+            if not sent:
+                self._requeue_notices(notices[i:])
+                return
+
+    def _requeue_notices(self, texts: list[str]) -> None:
+        requeue = getattr(self.session, "requeue_notices", None)
+        try:
+            if requeue is None:
+                raise AttributeError("session cannot take notices back")
+            requeue(texts)
+            logger.warning(
+                "owner notice not delivered — %d kept for a later try", len(texts)
+            )
+        except Exception:  # noqa: BLE001 — never break the liveness tick
+            for text in texts:
+                logger.error("owner notice lost: %s", text, exc_info=True)
+
     def _recover(self, reason: str, alert_msg: str) -> str:
         if self.session.force_recover():
             self._maybe_alert(f"recovered_{reason}", alert_msg)
@@ -530,6 +698,7 @@ class Watchdog:
         # nothing, which is exactly what happened on 2026-08-20.
         if self._delivery_guard is not None:
             self._delivery_guard.tick()
+        self._deliver_notices()
         self._check_context_size()
         self._track_long_run()
 
@@ -611,20 +780,29 @@ class Watchdog:
             self._sleep(interval)
 
 
-def _telegram_alerter(settings) -> Callable[[str], None]:  # pragma: no cover
+def _telegram_alerter(settings) -> Callable[[str], bool]:  # pragma: no cover
     import httpx
 
-    def send(msg: str) -> None:
+    def send(msg: str) -> bool:
+        """False when nothing reached Telegram (callers that must not lose a
+        message, like Watchdog._deliver_notices, keep it; the rest ignore
+        the result)."""
         if not settings.admin_chat_id:
-            return
+            logger.warning("watchdog alert not sent: admin_chat_id is not set")
+            return False
         try:
-            httpx.post(
+            resp = httpx.post(
                 f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
                 data={"chat_id": settings.admin_chat_id, "text": msg},
                 timeout=10,
             )
         except Exception:
             logger.warning("watchdog alert send failed")
+            return False
+        if not resp.is_success:
+            logger.warning("watchdog alert rejected: HTTP %s", resp.status_code)
+            return False
+        return True
 
     return send
 
@@ -659,6 +837,7 @@ def main() -> None:  # pragma: no cover
         context_alert_tokens=settings.context_alert_tokens,
         long_run_alert_seconds=settings.long_run_alert_seconds,
         long_run_nudge_seconds=settings.long_run_nudge_seconds,
+        long_run_max_seconds=settings.long_run_max_seconds,
     ).run()
 
 

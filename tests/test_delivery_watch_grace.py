@@ -33,6 +33,9 @@ def _run(
     systemctl.write_text(
         '#!/bin/bash\ncase "$*" in\n'
         '  *is-active*) exit 0 ;;\n'
+        # since 2026-09-22 the script reads ActiveState instead of `is-active`
+        # (a graceful stop holds `deactivating` for minutes and must not alert)
+        '  *ActiveState*) echo active ;;\n'
         f'  *ActiveEnterTimestamp*) echo "{watchdog_since}" ;;\n'
         f'  *NRestarts*) echo "{restarts}" ;;\n'
         "esac\nexit 0\n"
