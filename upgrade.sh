@@ -107,6 +107,19 @@ systemctl --user enable \
 systemctl --user restart dbrain-bot.service dbrain-watchdog.service
 systemctl --user start dbrain-process.timer dbrain-doctor.timer \
     dbrain-delivery-watch.timer
+# The nightly cleanup is the one timer the owner chooses at install time
+# (setup.sh, "Ночная уборка сервера"). An install that predates the question
+# has no DBRAIN_CLEANUP line and stays off: arming a timer that closes
+# terminal windows must never happen behind the owner's back.
+cleanup_choice=""
+if [ -f "$PROJECT_DIR/.env" ]; then
+    cleanup_choice="$(sed -n 's/^DBRAIN_CLEANUP=//p' "$PROJECT_DIR/.env" | tail -1 | tr -d "\"' \r")"
+fi
+if [ "$cleanup_choice" = "on" ]; then
+    systemctl --user enable --now dbrain-cleanup.timer
+else
+    systemctl --user disable --now dbrain-cleanup.timer 2>/dev/null || true
+fi
 fi  # end C11 single-instance (--user) branch
 
 # Privacy repair for existing installs: the runtime dir holds the full pane

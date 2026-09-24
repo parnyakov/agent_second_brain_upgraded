@@ -77,6 +77,14 @@ and, if needed, recreate your worktree isolation before touching any file" —
 see `vault/.claude/docs/worktree-agent-guard.md` for the exact preamble every
 worktree-isolated agent should carry regardless.
 
+## Nightly server cleanup
+
+When the owner enabled it at install time, idle terminal windows are closed
+after a week and regenerable caches are pruned. If the owner asks to keep the
+current window alive, run `python3 scripts/server_cleanup.py protect` from
+that same window (project directory) and confirm it succeeded; `unprotect`
+reverses it. The protection has no expiry.
+
 ## Durable memory (durable-state-first)
 
 Your conversation context is disposable: it may be auto-compacted or the

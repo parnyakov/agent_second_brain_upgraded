@@ -1,0 +1,12 @@
+[Unit]
+Description=d-brain nightly server cleanup (idle sessions and regenerable caches)
+OnFailure=dbrain-notify@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/dbrain
+EnvironmentFile=-%h/projects/dbrain/.env
+ExecStart=/usr/bin/python3 %h/projects/dbrain/scripts/server_cleanup.py run
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+TimeoutStartSec=15min

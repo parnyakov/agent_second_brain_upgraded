@@ -112,3 +112,32 @@ def test_setup_uses_the_services_claude_config_dir():
     body = SETUP[SETUP.index("authorize_claude() {"):]
     assert "claude_logged_in && claude_first_run_done" in body
     assert '"$CLAUDE_CONFIG_DIR/.claude.json"' in SETUP
+
+
+# ── nightly cleanup is opt-in ──────────────────────────────────────────────
+#
+# The cleanup timer closes idle terminal windows. That is exactly the kind of
+# thing a user must agree to, so the contract is: setup.sh asks, the answer
+# lands in .env, and upgrade.sh arms the timer ONLY for an explicit "on".
+
+
+def test_setup_asks_about_the_nightly_cleanup():
+    assert "choose_cleanup" in SETUP
+    assert "DBRAIN_CLEANUP" in SETUP
+
+
+def test_cleanup_timer_follows_the_answer_and_defaults_to_off():
+    # An install made before the question exists has no DBRAIN_CLEANUP line;
+    # the empty value must take the disable branch, never the enable one.
+    enable = UPGRADE.index("systemctl --user enable --now dbrain-cleanup.timer")
+    guard = UPGRADE.index('if [ "$cleanup_choice" = "on" ]')
+    assert guard < enable
+    assert "disable --now dbrain-cleanup.timer" in UPGRADE
+
+
+def test_cleanup_units_ship_with_the_project():
+    for unit in ("dbrain-cleanup.service", "dbrain-cleanup.timer"):
+        assert (ROOT / "deploy" / unit).exists()
+    service = (ROOT / "deploy/dbrain-cleanup.service").read_text()
+    # Same path placeholder upgrade.sh rewrites for every other unit.
+    assert "%h/projects/dbrain" in service

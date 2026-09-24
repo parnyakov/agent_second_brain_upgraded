@@ -137,8 +137,9 @@ def test_setup_first_run_then_rerun_is_idempotent(tmp_path):
     project = _project(tmp_path)
     env = _env(tmp_path)
 
-    # tz, engine, permissions, vault repo name: Enter accepts defaults.
-    first = _run(project, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", ""])
+    # tz, engine, permissions, nightly cleanup, vault repo name: Enter
+    # accepts every default.
+    first = _run(project, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", "", ""])
     assert first.returncode == 0, first.stdout[-3000:] + first.stderr[-3000:]
     assert FAKE_TOKEN not in first.stdout + first.stderr
     assert FAKE_DEEPGRAM not in first.stdout + first.stderr
@@ -182,7 +183,7 @@ def test_setup_first_run_then_rerun_is_idempotent(tmp_path):
     # A fresh install must not get the old "keyboard removed" migration ping.
     assert (tmp_path / "home" / ".dbrain" / "keyboard_removed").exists()
 
-    second = _run(project, env, ["", "", "", ""])
+    second = _run(project, env, ["", "", "", "", ""])
     assert second.returncode == 0, second.stdout[-3000:] + second.stderr[-3000:]
     assert "Вставьте токен" not in second.stdout
     assert "Telegram ID (только цифры)" not in second.stdout
@@ -217,7 +218,7 @@ def test_setup_on_a_new_server_restores_memory_from_the_private_repo(tmp_path):
         pytest.skip("setup refuses root by design")
     old = _project(tmp_path / "old")
     env = _env(tmp_path)
-    first = _run(old, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", ""])
+    first = _run(old, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", "", ""])
     assert first.returncode == 0, first.stdout[-3000:] + first.stderr[-3000:]
     vault = old / "vault"
     (vault / "MEMORY.md").write_text("# Память\n\nсохранённый факт\n")
@@ -225,7 +226,7 @@ def test_setup_on_a_new_server_restores_memory_from_the_private_repo(tmp_path):
     subprocess.run(["git", "-C", str(vault), "push", "-q"], env=env, check=True)
 
     new = _project(tmp_path / "new")
-    second = _run(new, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", "dbrain-vault"])
+    second = _run(new, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", "", "dbrain-vault"])
     assert second.returncode == 0, second.stdout[-3000:] + second.stderr[-3000:]
     assert "Память восстановлена" in second.stdout
     assert "сохранённый факт" in (new / "vault" / "MEMORY.md").read_text()
@@ -258,7 +259,7 @@ def test_setup_never_reports_success_when_the_agent_does_not_answer(tmp_path):
         pytest.skip("setup refuses root by design")
     project = _project(tmp_path)
     env = {**_env(tmp_path), "STUB_DOCTOR_RC": "1"}
-    first = _run(project, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", ""])
+    first = _run(project, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", "", ""])
     assert first.returncode == 1
     assert "Установка завершена" not in first.stdout
     assert "агент пока не отвечает" in first.stdout
@@ -267,7 +268,7 @@ def test_setup_never_reports_success_when_the_agent_does_not_answer(tmp_path):
 
     # After the login is fixed, the documented rerun completes.
     env["STUB_DOCTOR_RC"] = "0"
-    second = _run(project, env, ["", "", "", ""])
+    second = _run(project, env, ["", "", "", "", ""])
     assert second.returncode == 0, second.stdout[-3000:]
     assert "Установка завершена" in second.stdout
     assert "Вставьте токен" not in second.stdout
@@ -282,7 +283,7 @@ def test_upgrade_exit_3_without_a_doctor_result_is_a_failure(tmp_path):
     project = _project(tmp_path)
     (project / "upgrade.sh").write_text('#!/bin/bash\nexit 3\n')
     env = _env(tmp_path)
-    result = _run(project, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", ""])
+    result = _run(project, env, [FAKE_TOKEN, "123456789", FAKE_DEEPGRAM, "", "", "", "", ""])
     assert result.returncode == 1
     assert "upgrade.sh завершился ошибкой" in result.stdout
     assert "Установка завершена" not in result.stdout

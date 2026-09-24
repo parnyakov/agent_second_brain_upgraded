@@ -25,7 +25,7 @@ RUNTIME_DIR="${DBRAIN_RUNTIME_DIR:-$HOME/.dbrain}"
 # first-run screens again (found on a clean server).
 # Fixed, not "keep yours": the units hardcode %h/.claude.
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
-TOTAL_STEPS=13
+TOTAL_STEPS=14
 # Test harness only: skips live HTTPS checks of Telegram/Deepgram.
 OFFLINE_TEST="${DBRAIN_SETUP_OFFLINE_TEST:-0}"
 
@@ -460,6 +460,26 @@ choose_permissions() {
         || fail "Не удалось применить права." "Запустите вручную: bash $PROJECT_DIR/scripts/configure-permissions.sh $profile"
 }
 
+# Nightly housekeeping is opt-in on purpose: it closes terminal windows, and
+# a user who keeps long-running work in tmux must get to say no. "on" only
+# arms the timer; every deletion rule inside the script stays conservative.
+choose_cleanup() {
+    step "Ночная уборка сервера"
+    local current reply default_choice=1
+    current="$(env_get DBRAIN_CLEANUP)"
+    [ "$current" = "off" ] && default_choice=2
+    echo "  Раз в сутки в 20:30 агент может закрывать заброшенные окна терминала"
+    echo "  (7 суток без активности, ничего не запущено, никто не подключён) и чистить"
+    echo "  кэши, которые восстанавливаются сами. Ваша память, история диалогов и"
+    echo "  рабочие файлы не трогаются, отчёт приходит вам в Telegram."
+    echo "    1 = включить (рекомендуется)"
+    echo "    2 = не включать"
+    ask "Выбор [Enter = $default_choice]:"
+    read_answer reply
+    reply="${reply:-$default_choice}"
+    if [ "$reply" = "2" ]; then env_set DBRAIN_CLEANUP off; else env_set DBRAIN_CLEANUP on; fi
+}
+
 # Existing memory repository (new server, reinstall): a vault that only holds
 # the fresh template commit is replaced by the saved memory; a vault with
 # its own history is rebased onto it instead, never overwritten.
@@ -614,6 +634,7 @@ main() {
     choose_settings
     install_and_authorize_engine
     choose_permissions
+    choose_cleanup
     configure_vault_backup
     run_upgrade
     final_check

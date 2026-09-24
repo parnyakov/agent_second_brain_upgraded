@@ -1,0 +1,10 @@
+[Unit]
+Description=d-brain nightly server cleanup (20:30 local)
+
+[Timer]
+OnCalendar=*-*-* 20:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
