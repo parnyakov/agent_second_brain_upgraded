@@ -1781,12 +1781,20 @@ class ClaudeSession:
                 before = set(project_dir.glob("*.jsonl"))
             except OSError:
                 before = set()
+        # The resync runs INSIDE the pane lock (2026-09-25 fix). Released
+        # between the keystroke and the resync, the lock let a queued chat
+        # turn slip in, pin the OLD session id as its reply source, and then
+        # see the resync as "session id changed mid-turn" — it dropped its
+        # reply tail and sat out the full hour ceiling holding the lock, so
+        # every later message hung behind it (seen live right after /new).
+        # Holding the lock until the new id is pinned costs at most the
+        # resync's own ~10 s window.
         with self._locked() as got:
             if got:
                 self._send_text(text)
                 self._send_enter()
-        if is_clear and self._read_session_id() is not None:
-            self._resync_session_id_after_clear(before)
+            if is_clear and self._read_session_id() is not None:
+                self._resync_session_id_after_clear(before)
 
     def clear(self) -> None:
         """Manual recovery only (durable-state-first: no scheduled clear).

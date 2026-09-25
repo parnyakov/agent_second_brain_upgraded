@@ -573,6 +573,53 @@ def test_send_control_clear_resyncs_session_id_directly(tmp_path, clock, monkeyp
     assert resynced == "new-id-after-clear"
 
 
+def test_send_control_clear_resyncs_while_still_holding_the_pane_lock(
+    tmp_path, clock, monkeypatch
+):
+    """2026-09-25 hang after /new: with the lock released between the
+    keystroke and the resync, a queued chat turn took the pane, pinned the
+    OLD session id, then saw the resync as "session id changed mid-turn"
+    and sat out the hour ceiling holding the lock. No ask() may get the
+    pane until the new id is pinned."""
+    import fcntl
+
+    fake = FakeTmux([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    (tmp_path / ".dbrain" / "session_id").write_text("old-id\n")
+    project_dir = tmp_path / "claude-projects"
+    monkeypatch.setattr(s, "_transcript_project_dir", lambda: project_dir)
+    project_dir.mkdir()
+    (project_dir / "old-id.jsonl").touch()
+
+    monkeypatch.setattr(
+        s, "_send_text",
+        lambda text: (project_dir / "new-id-after-clear.jsonl").touch(),
+    )
+    monkeypatch.setattr(s, "_send_enter", lambda: None)
+
+    lock_free_at_pin: list[bool] = []
+    real_write = s._atomic_write
+
+    def spying_write(target, payload):
+        if target == s._session_id_file:
+            with open(s._pane_lock, "a") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                    lock_free_at_pin.append(True)
+                except BlockingIOError:
+                    lock_free_at_pin.append(False)
+        return real_write(target, payload)
+
+    monkeypatch.setattr(s, "_atomic_write", spying_write)
+
+    s.send_control("/clear")
+
+    assert lock_free_at_pin == [False]
+    resynced = (tmp_path / ".dbrain" / "session_id").read_text().strip()
+    assert resynced == "new-id-after-clear"
+
+
 def test_send_control_non_clear_does_not_resync(tmp_path, clock, monkeypatch):
     """Only the literal `/clear` text triggers the resync scan — other
     control commands (e.g. `/model`) must not pay that cost or touch the
