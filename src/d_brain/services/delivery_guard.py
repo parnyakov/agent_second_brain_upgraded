@@ -157,7 +157,25 @@ class DeliveryGuard:
         self._escalated = False
 
     def decide(self, health: Health) -> GuardDecision:
-        """Pure decision over the ledger + this guard's own restart budget."""
+        """Pure decision over the ledger + this guard's own restart budget.
+
+        THE LEDGER IS THE PROOF, and deliberately so (blind review). It is
+        tempting to add a second gate here —
+        "an outbox receipt dated after the last failed turn means the
+        channel worked, so do not act" — and it is wrong: the apology the
+        user gets for a failed turn goes out through the outbox too, and its
+        receipt is minted AFTER the ledger row for that same turn. Such a
+        gate is therefore satisfied by every streak this guard exists for,
+        which disarms it completely while looking like a careful check.
+
+        What was actually wrong, in the incident that motivated this fix,
+        was the ledger, and it is fixed where it is written: a turn the
+        duty session covered now
+        scores `ok`, and so does a late reply the watchdog delivers out of
+        the orphan path. `fail_streak >= threshold` now means what it says —
+        that many turns in a row where the person got nothing but a
+        brush-off, by any delivery route.
+        """
         if health.fail_streak < self._threshold:
             # Healthy again (or not yet alarming) — re-arm for next time.
             if health.fail_streak == 0:

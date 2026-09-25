@@ -635,13 +635,52 @@ def test_main_session_notices_still_ride_on_a_duty_reply(tmp_path):
     assert "ответ" in reply and duty.prompts
 
 
-def test_main_busy_status_is_still_scored_in_the_health_ledger(tmp_path):
-    """A duty reply must not hide a busy main channel from the DeliveryGuard."""
+def test_a_busy_turn_the_duty_session_answered_is_scored_as_delivered(tmp_path):
+    """FALSE ALARM. A real false alarm once fired «N ответов подряд не
+    доставлено» every five minutes while the owner was reading, in
+    Telegram, the answers the duty session was producing. The ledger had
+    recorded `busy` for each of those turns before the duty session had
+    even been asked.
+
+    The ledger's question is whether the PERSON got an answer, so a turn the
+    duty session covered closes it with a success and the streak does not
+    grow."""
     from d_brain.services import ask_health
 
-    m, _duty = _duty_manager(tmp_path, AskResult("busy"), AskResult("ok", reply="ок"))
+    m, duty = _duty_manager(tmp_path, AskResult("busy"), AskResult("ok", reply="ок"))
+    reply = asyncio.run(m.send_message(1, "x"))
+    assert "ок" in reply and duty.prompts
+    assert ask_health.read(tmp_path).last_status == "ok"
+    assert ask_health.read(tmp_path).fail_streak == 0
+
+
+def test_a_busy_turn_the_duty_session_could_not_cover_still_counts(tmp_path):
+    """THE REAL CASE, kept alive next to the false one: when the duty
+    session comes back empty too, the person got nothing but a brush-off.
+    That is a delivery failure, it grows the streak, and it is what arms the
+    restart backstop the B3 fix built for a wedged pane."""
+    from d_brain.services import ask_health
+
+    m, _duty = _duty_manager(tmp_path, AskResult("busy"), AskResult("error"))
     asyncio.run(m.send_message(1, "x"))
     assert ask_health.read(tmp_path).last_status == "busy"
+    assert ask_health.read(tmp_path).fail_streak == 1
+
+
+def test_a_busy_turn_with_no_duty_session_at_all_still_counts(tmp_path):
+    """Same, for the rollback path: the duty feature switched off must not
+    also switch off the failure accounting."""
+    from d_brain.services import ask_health
+
+    m, _duty = _duty_manager(
+        tmp_path,
+        AskResult("busy"),
+        AskResult("ok", reply="ок"),
+        duty_session_enabled=False,
+    )
+    asyncio.run(m.send_message(1, "x"))
+    assert ask_health.read(tmp_path).last_status == "busy"
+    assert ask_health.read(tmp_path).fail_streak == 1
 
 
 def test_main_turn_uses_the_chat_turn_timeout(tmp_path):
@@ -829,11 +868,12 @@ def test_under_codex_the_detour_is_off_and_everything_goes_through_ask(tmp_path)
     m._session.pane_active_answers = [True, True]
     assert asyncio.run(m.is_main_busy()) is False
 
-    # ...and the ordinary path still ends in a duty reply, with the main
-    # session's busy outcome honestly scored.
+    # ...and the ordinary path still ends in a duty reply, scored by what
+    # the person actually received: the duty session answered, so this is
+    # a delivered turn on Codex exactly as on Claude.
     reply = asyncio.run(m.send_message(1, "x"))
     assert "из дежурной" in reply and duty.prompts
-    assert ask_health.read(tmp_path).last_status == "busy"
+    assert ask_health.read(tmp_path).last_status == "ok"
 
 
 def test_injected_main_session_never_auto_resolves_a_real_duty_session(tmp_path):

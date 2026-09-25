@@ -85,14 +85,60 @@ def test_attended_active_turn_never_starts_a_run():
     assert new == LongRun()
 
 
-def test_attended_turn_ends_a_previously_tracked_run():
-    """A run that WAS unattended can become attended mid-flight (e.g. the
-    user starts typing into it); that must end the tracked run too."""
-    prev = LongRun(since=100.0, updated_ts=200.0, alerted=False)
+def test_attended_turn_pauses_a_tracked_run_instead_of_ending_it():
+    """FALSE ALARM: a run that WAS unattended becomes attended the moment
+    the owner writes in. That used to produce ``ended``, on which the
+    watchdog announces «сессия снова свободна» — a claim made precisely
+    when the session is busiest, with their message.
+
+    It is a pause: the turn is still running, `since` and `alerted` survive
+    so the same task cannot announce its own start a second time when they
+    stop typing, and no user-visible event is produced."""
+    prev = LongRun(since=100.0, updated_ts=200.0, alerted=True)
     new, event = long_run.next_state(
         prev, main_turn_active=True, attended=True, now=300.0, alert_after=900.0
     )
+    assert event == "paused"
+    assert new.since == 100.0
+    assert new.alerted is True
+    assert new.updated_ts == 300.0
+
+
+def test_a_paused_run_resumes_without_a_second_started_or_alert():
+    """The pause must REMOVE a false message, not postpone it: after the
+    human's turn the same task carries on with its original `since` and its
+    `alerted` latch, so neither 🛠 nor a fresh run is produced."""
+    state = LongRun(since=100.0, updated_ts=200.0, alerted=True)
+    state, event = long_run.next_state(
+        state, main_turn_active=True, attended=True, now=300.0, alert_after=900.0
+    )
+    assert event == "paused"
+    state, event = long_run.next_state(
+        state, main_turn_active=True, attended=False, now=400.0, alert_after=900.0
+    )
+    assert event == "none"
+    assert state.since == 100.0
+    assert state.alerted is True
+
+
+def test_the_turn_actually_stopping_still_ends_the_run():
+    """The REAL case, kept alive next to the false one: when the pane is no
+    longer busy the run ends, which is the one transition allowed to claim
+    the session is free."""
+    prev = LongRun(since=100.0, updated_ts=200.0, alerted=True)
+    new, event = long_run.next_state(
+        prev, main_turn_active=False, attended=True, now=300.0, alert_after=900.0
+    )
     assert event == "ended"
+    assert new == LongRun()
+
+
+def test_an_attended_turn_never_starts_tracking():
+    """Unchanged: an ordinary chat turn is not an unattended long run."""
+    new, event = long_run.next_state(
+        LongRun(), main_turn_active=True, attended=True, now=300.0, alert_after=900.0
+    )
+    assert event == "none"
     assert new == LongRun()
 
 

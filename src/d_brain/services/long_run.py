@@ -132,12 +132,35 @@ def next_state(
       "alert"   — the run crossed ``alert_after`` seconds and has not been
                   alerted about yet this run (latched via ``alerted``, so
                   this fires at most once per run).
-      "ended"   — a previously-tracked unattended run just stopped being
-                  tracked (turn no longer active, or it became attended).
+      "paused"  — the turn is STILL running, but a human's ``ask()`` took
+                  the lock, so it is no longer unattended.
+      "ended"   — the turn itself stopped: the pane is no longer busy.
 
     An ATTENDED active turn (the caller's own ``ask()`` holds the lock) never
-    starts or continues a tracked run — that is an ordinary chat turn, not
-    the unattended-cascade shape this module exists to catch.
+    STARTS a tracked run — that is an ordinary chat turn, not the
+    unattended-cascade shape this module exists to catch.
+
+    The ``paused`` / ``ended`` split exists because of a real false alarm:
+    both used to fall into one "nothing unattended remains" branch and both
+    produced ``ended``, on which the watchdog sends «✅ сессия снова
+    свободна» — so writing to the bot during a long run made the pane's own
+    busy-ness announce itself as freedom. The message was wrong about the
+    world at the instant it was sent; renaming it would not have helped.
+
+    Pausing deliberately KEEPS ``since`` and ``alerted``:
+
+    * ``since``, because zeroing it would restart the clock when the human's
+      turn ends and send a second «🛠 идёт длинная задача ~1 мин» about the
+      very same task — moving a false message one step later instead of
+      removing it;
+    * ``alerted``, because it is the latch that guarantees ✅ only ever
+      follows a 🛠 (blind-review fix F2, 2026-09).
+
+    The marker therefore stays ACTIVE across a pause, which is correct and
+    load-bearing: the pane really is busy, and ``claude_session.ask()``'s
+    busy-active fast path reads exactly that — and re-confirms it against
+    the live pane before trusting it, so nothing here can make it call a
+    free session busy.
     """
     if main_turn_active and not attended:
         if previous.since == 0.0:
@@ -155,8 +178,18 @@ def next_state(
                 "alert",
             )
         return updated, "none"
-    # Turn not active, or it's attended — nothing unattended-long-running
-    # remains, so any previously-tracked run ends here.
+    if main_turn_active:
+        # Still running, just no longer unattended — a human took the lock.
+        if previous.since != 0.0:
+            return (
+                LongRun(
+                    since=previous.since, updated_ts=now, alerted=previous.alerted
+                ),
+                "paused",
+            )
+        return LongRun(), "none"
+    # The turn itself is over: the pane is not busy. THIS is the only
+    # transition that may claim the session is free again.
     if previous.since != 0.0:
         return LongRun(), "ended"
     return LongRun(), "none"

@@ -374,17 +374,44 @@ class ChatSessionManager:
                 fallback=_busy_active_message(res.busy_seconds),
             )
         if res.status == "busy":
-            self._record_health(res.status)
             logger.warning(
                 "main session showed no progress across the whole busy wait "
                 "for user %d — falling back to the duty session",
                 user_id,
             )
-            text = await self.answer_from_duty(
+            text, answered = await self.answer_from_duty_detailed(
                 user_id,
                 prompt,
                 busy_seconds=res.busy_seconds,
                 fallback=_STATUS_MESSAGES["busy"],
+            )
+            # Scored AFTER the duty turn, on its outcome. The ledger's
+            # question is "did the person get an answer", not "which
+            # session produced it", and recording `busy` here before the
+            # duty session had even been asked is what made a false-alarm
+            # morning report «N ответов подряд не доставлено» about a
+            # morning whose answers the owner had already read in Telegram
+            # as they arrived.
+            #
+            # A duty session that ALSO came back empty leaves it at `busy`,
+            # unchanged: then the person really did get nothing but a
+            # brush-off, and the restart backstop the B3 fix armed for a
+            # wedged pane (see ask_health's module docstring) must still see
+            # the streak it was built for.
+            #
+            # THE TRADE, stated plainly (blind review 9): while the duty
+            # session keeps covering, a permanently wedged main pane grows
+            # no streak, so delivery_guard never restarts the bot over it.
+            # That is the intended reading of the rule («→ ok либо
+            # нейтральный статус, никогда busy») and it is the right call
+            # here: restarting the BOT does not unwedge a tmux PANE, the
+            # person is being answered, and the pane itself is covered by
+            # two paths that do not depend on this ledger at all —
+            # watchdog._is_hung → recovered_hung, and the long-run cap.
+            # What this must never do is stay quiet while the person gets
+            # nothing, and that case still scores `busy`.
+            self._record_health(
+                ask_health.SUCCESS_STATUS if answered else res.status
             )
         else:
             text = self._reply_text(user_id, res)
@@ -582,6 +609,34 @@ class ChatSessionManager:
     ) -> str:
         """Answer a message from the duty session while the main one is busy.
 
+        The text only — the shape every caller outside this module wants.
+        ``send_message`` uses :meth:`answer_from_duty_detailed` instead,
+        because it also has to score the turn in the health ledger and the
+        text alone cannot say whether a real answer came back.
+        """
+        text, _answered = await self.answer_from_duty_detailed(
+            user_id, prompt, busy_seconds=busy_seconds, fallback=fallback
+        )
+        return text
+
+    async def answer_from_duty_detailed(
+        self,
+        user_id: int,
+        prompt: str,
+        *,
+        busy_seconds: float | None = None,
+        fallback: str | None = None,
+    ) -> tuple[str, bool]:
+        """``(text, answered)`` — the reply, and whether the DUTY SESSION is
+        what produced it.
+
+        ``answered`` is the fact this whole distinction turns on: a
+        ``busy`` turn that the duty session covered is a turn the person got
+        a real answer to, and must not count as a delivery failure. Anything
+        else — the feature off, no session, a crash, an empty or failed duty
+        turn — returns ``False``, i.e. the user got only the brush-off, and
+        the ledger keeps scoring it as the failure it is.
+
         ``fallback`` is the message the user would have received before this
         feature existed; it is returned verbatim whenever the duty path is
         off, unavailable or broken — the rollback and the crash path land on
@@ -593,10 +648,10 @@ class ChatSessionManager:
         try:
             settings = self._config()
             if settings is None or not settings.duty_session_enabled:
-                return legacy
+                return legacy, False
             duty = self._resolve_duty()
             if duty is None:
-                return legacy
+                return legacy, False
             async with self._duty_lock:
                 now = time.time()
                 if self._duty_is_stale(settings, now):
@@ -613,11 +668,11 @@ class ChatSessionManager:
             return self._duty_reply_text(duty, res, busy_seconds, legacy)
         except Exception:  # noqa: BLE001 — the duty path must never cost a reply
             logger.exception("duty session failed for user %d", user_id)
-            return legacy
+            return legacy, False
 
     def _duty_reply_text(
         self, duty: Any, res: Any, busy_seconds: float | None, legacy: str
-    ) -> str:
+    ) -> tuple[str, bool]:
         reply = (res.reply or "").strip() if res.ok else ""
         if not reply:
             # Never hand the user silence: say what the main session is doing
@@ -632,12 +687,15 @@ class ChatSessionManager:
             logger.warning(
                 "duty session returned %s", "empty" if res.ok else res.status
             )
-            return f"{legacy}\n\n🔁 <i>Дежурная сессия тоже не ответила:</i> {detail}"
+            return (
+                f"{legacy}\n\n🔁 <i>Дежурная сессия тоже не ответила:</i> {detail}",
+                False,
+            )
         body = f"{duty_header(busy_seconds)}\n\n{reply}"
         notices = self._pop_notices(duty)
         if notices:
             body = "\n\n".join(html.escape(n) for n in notices) + "\n\n" + body
-        return body
+        return body, True
 
     def _is_turn_limit(self, res: Any) -> bool:
         """True iff this result is the chat-turn CEILING

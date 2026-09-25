@@ -373,5 +373,94 @@ def test_escalate_text_system_scope_targets_the_instance():
     assert "journalctl  -u" not in msg
 
 
+# The sudoers file lists one pair of units per instance and is maintainer-only
+# (it is not part of the distribution), so both tests below read the instance
+# names out of the file itself instead of carrying them as fixtures: a checkout
+# without the file has nothing to pin, and no instance name lives in the test.
+def _sudoers_text():
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "sudoers-dbrain"
+    )
+    if not path.exists():
+        import pytest
+
+        pytest.skip("sudoers-dbrain is not part of this checkout")
+    return path.read_text()
 
 
+def _sudoers_instances(text):
+    import re
+
+    return sorted(set(re.findall(r"dbrain-bot@([A-Za-z0-9_.-]+)\.service", text)))
+
+
+
+
+
+
+# ── what the streak means now ─────────────────────────────────────────
+
+
+def _apology_receipt(tmp_path, at: float) -> None:
+    """The receipt the bot mints for its OWN brush-off.
+
+    Every failed turn produces one: `_record_health` writes the ledger row,
+    then the apology text goes out through `send_response` → the outbox →
+    a receipt stamped after that row. This is the shape that killed the
+    "a receipt newer than the last failure means the channel works" veto —
+    it is present in every streak the guard exists for.
+    """
+    import json
+
+    d = tmp_path / "outbox"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "receipts.json").write_text(json.dumps({"ids": [f"{int(at * 1e9):019d}"]}))
+
+
+def test_a_streak_of_brush_offs_still_restarts_although_they_were_delivered(tmp_path):
+    """THE REAL CASE, and the one a timestamp veto would have swallowed.
+
+    Three turns in a row where the person got nothing but an apology. The
+    apologies themselves were delivered perfectly — receipts and all — which
+    is exactly why "something reached Telegram since the last failure" is
+    not evidence that anything is working. What the ledger now says is
+    narrow and true: three turns, no answer by any route."""
+    clock = Clock(1100.0)
+    guard, restarts, alerts = _guard(tmp_path, clock)
+    ask_health.record(tmp_path, "busy", clock_fn=lambda: 1000.0)
+    ask_health.record(tmp_path, "busy", clock_fn=lambda: 1030.0)
+    ask_health.record(tmp_path, "busy", clock_fn=lambda: 1060.0)
+    _apology_receipt(tmp_path, 1060.5)  # the brush-off for the third turn
+
+    assert guard.tick().action == "restart"
+    assert restarts == ["dbrain-bot.service"]
+    assert len(alerts) == 1
+
+
+def test_a_turn_answered_by_any_route_clears_the_streak_before_the_guard(tmp_path):
+    """NO FALSE ALARM. The false-alarm morning, in ledger terms: the duty
+    session covered those turns and the watchdog delivered the late ones, so
+    each of them now scores `ok` where it is written — and the guard never
+    sees a streak at all. The fix lives in the ledger, not in a veto here;
+    this pins that the guard honours it."""
+    guard, restarts, alerts = _guard(tmp_path, Clock(1100.0))
+    ask_health.record(tmp_path, "busy", clock_fn=lambda: 1000.0)
+    ask_health.record(tmp_path, "busy", clock_fn=lambda: 1030.0)
+    ask_health.record(tmp_path, "ok", clock_fn=lambda: 1060.0)
+    ask_health.record(tmp_path, "busy", clock_fn=lambda: 1070.0)
+
+    assert guard.tick().action == "none"
+    assert restarts == []
+    assert alerts == []
+
+
+def test_decide_takes_no_delivery_evidence(tmp_path):
+    """A regression guard on the design decision itself: `decide` is a pure
+    function of the ledger. Re-introducing a receipt/loss parameter here is
+    the change that disarmed the backstop — read its docstring first."""
+    import inspect
+
+    guard, _restarts, _alerts = _guard(tmp_path, Clock())
+    assert list(inspect.signature(guard.decide).parameters) == ["health"]

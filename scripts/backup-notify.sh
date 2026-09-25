@@ -59,5 +59,14 @@ if [ "$((NOW - LAST))" -lt "$COOLDOWN" ]; then
 fi
 echo "$NOW" >"$STAMP" 2>/dev/null || true
 
-curl -s -m 20 -X POST "https://api.telegram.org/bot$BACKUP_BOT_TOKEN/sendMessage" \
-    -d "chat_id=$BACKUP_CHAT_ID" -d "text=$MSG" >/dev/null || true
+# Prints `sent` on stdout when, and only when, a message actually left.
+# delivery-watch.sh reads that to decide whether a fault it found may be
+# marked as reported: a report nobody received must not count as one
+# (a report nobody received is not a report). Exit status stays 0 on every
+# path — this runs as a systemd OnFailure handler, where a non-zero exit
+# would mark the notifier itself as failed.
+if curl -s -m 20 -X POST "https://api.telegram.org/bot$BACKUP_BOT_TOKEN/sendMessage" \
+    -d "chat_id=$BACKUP_CHAT_ID" -d "text=$MSG" >/dev/null; then
+    echo sent
+fi
+exit 0

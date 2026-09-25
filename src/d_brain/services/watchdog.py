@@ -32,7 +32,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from d_brain.services import long_run
+from d_brain.services import ask_health, delivery_proof, long_run
 from d_brain.services.systemd_notify import notify, watchdog_interval
 from d_brain.services.tmux_parse import (
     PaneState,
@@ -240,6 +240,9 @@ class Watchdog:
         # NEVER escalate into force_recover/kill: that would destroy the
         # session and the very context whose partial work we are preserving.
         self._long_run_closed_ts = 0.0
+        # A ✅ that is owed but could not yet be honestly sent —
+        # see _track_long_run's "ended" branch.
+        self._long_run_free_notice_owed = False
 
     def _is_hung(self, state: PaneState) -> bool:
         # Hang model (paired with ask()'s stall detector): silence is NOT a
@@ -277,6 +280,77 @@ class Watchdog:
         # Returning to a good state re-arms alerts for the next incident.
         self._last_alert_key = None
         self._alert_repeats = 0
+
+    def _note_delivered(self) -> None:
+        """A reply just reached the owner through THIS process — close the
+        health ledger with a success.
+
+        The governing rule: a reply actually received by the person through
+        ANY delivery path (main session, duty session, delayed, retried
+        from the queue) closes the ledger with a success. The orphan path
+        is the delayed one: ``ask()`` already gave up on the turn and wrote
+        ``timeout`` into ``ask-health.json``, and the answer it was waiting
+        for is delivered here, one or more ticks later. Leaving the ledger
+        at ``timeout`` is what let three such turns in a row mean "3
+        ответов подряд не доставлено" while all three answers were sitting
+        in the owner's Telegram.
+
+        This is the ONE place the watchdog writes a file the bot owns. It is
+        a read-modify-write of a few bytes against a file the bot touches
+        only at the end of a turn, and ``ask_health.record`` is atomic and
+        best-effort by contract, so the worst a collision can cost is one
+        lost ledger update — the same risk the module already documents.
+        Worth it, because the alternative is a second source of truth for
+        the same fact.
+        """
+        try:
+            ask_health.record(self.runtime_dir, ask_health.SUCCESS_STATUS)
+        except Exception:  # noqa: BLE001 — telemetry must never fail a tick
+            logger.warning("could not record the delivered orphan reply")
+
+    # ── the one alert that rests on proof, not inference ──────────────
+
+    def _check_lost_delivery(self) -> None:
+        """Report a message this install can PROVE it failed to deliver.
+
+        Several alerting conditions were made quieter over time, and every
+        one of those gates is only defensible because this exists: whatever
+        the unit states, the streak or the pane say, a reply in
+        ``outbox/dead/`` or a message accepted and never answered still
+        reaches the owner.
+        ``scripts/delivery-watch.sh`` reports the same facts on its own
+        timer through ``notify.sh``; this path is deliberately a SECOND one,
+        because dead letters pile up exactly when Telegram sends are
+        failing, which is also when that script's notify channels fail.
+
+        Reported once per loss, not once per tick and not once per pile: the
+        latch stores the ids already reported, so a standing backlog is
+        silent and a NEW loss on top of it is not (blind review 4). The
+        latch advances only when the alert actually left — a report nobody
+        received must not count as having been made (blind review 3).
+
+        Same contract as its neighbours: runs every tick, never raises,
+        never changes what ``check_once`` returns.
+        """
+        try:
+            loss = delivery_proof.losses(self.runtime_dir, now=self._clock())
+            reported = delivery_proof.read_reported(self.runtime_dir)
+            fresh = loss.new_since(reported)
+            if not fresh:
+                if loss.ids != tuple(reported):
+                    # Losses were cleared: forget them, so the same id could
+                    # in principle be reported again.
+                    delivery_proof.write_reported(self.runtime_dir, loss.ids)
+                return
+            logger.error("delivery loss proven: %s", ", ".join(fresh))
+            message = "🔴 Сообщение не доставлено:\n" + "\n".join(
+                f"- {r}" for r in loss.reasons()
+            )
+            if self._alert_fn(message) is False:
+                return  # not reported — try again next tick
+            delivery_proof.write_reported(self.runtime_dir, loss.ids)
+        except Exception:  # noqa: BLE001 — a check must not kill its host loop
+            logger.exception("delivery-loss check failed")
 
     def _write_status(self, state: str) -> None:
         try:
@@ -494,21 +568,48 @@ class Watchdog:
             self._long_run_nudge_sent = False
             self._long_run_closed = False
             self._long_run_closed_ts = 0.0
+        if event == "started":
+            # A new run cancels a ✅ still owed for the previous one: the
+            # session is demonstrably not free.
+            self._long_run_free_notice_owed = False
 
         if event == "started":
             logger.info("long-run: unattended long turn started")
         elif event == "alert":
             elapsed = now - previous.since
-            minutes = max(1, round(elapsed / 60))
             logger.info("long-run: alert at ~%.0fs elapsed", elapsed)
-            self._alert_fn(
-                f"🛠 Идёт длинная автономная задача — сессия занята уже "
-                f"~{minutes} мин. Обычные сообщения в это время могут "
-                "получать «занято». Канал доставки при этом исправен."
+            # No number in the text. `since` is
+            # the age of the MARKER, not of one task: it survives back-to-
+            # back turns and, since the `paused` split, a human's turn in
+            # the middle too — so any minute count printed here would be a
+            # confident statement of something we do not know. It also
+            # makes every repeat a different string, which is what defeats
+            # the message-checksum debounce downstream. Exact seconds go to
+            # the log, where they are diagnosis rather than a claim.
+            # The last sentence is a claim about the outside world, so it
+            # is only made when the queues back it up (blind review 12) —
+            # the same rule this whole module is about.
+            text = (
+                "🛠 Идёт длинная автономная задача — основная сессия занята. "
+                "Обычные сообщения в это время могут получать «занято»."
             )
+            try:
+                intact = not delivery_proof.losses(
+                    self.runtime_dir, now=now
+                ).any
+            except Exception:  # noqa: BLE001 — never fatal, never claimed
+                intact = False
+            if intact:
+                text += " Канал доставки при этом исправен."
+            self._alert_fn(text)
+        elif event == "paused":
+            # The turn is still running, a human just took the lock.
+            # Nothing to announce — and deliberately no state reset, so the
+            # run does not re-announce its own start when they stop typing
+            # (see long_run.next_state).
+            logger.info("long-run: paused — the pane is serving a human turn")
         elif event == "ended":
             elapsed = now - previous.since
-            minutes = max(1, round(elapsed / 60))
             logger.info("long-run: ended after ~%.0fs elapsed", elapsed)
             # F2 fix (blind-review round, 2026-09): only announce the end if
             # we actually announced the start. `previous.alerted` is False
@@ -518,10 +619,29 @@ class Watchdog:
             # unsolicited "your long task finished" message for something
             # the user was never told had started, however short. Only the
             # "started"→"alert" pair is user-visible; "ended" mirrors that.
+            #
+            # The claim is re-checked against the pane at the moment of
+            # sending, not taken on trust from a flag that flipped. `cap`
+            # above is already a tick old by the time we get here, and
+            # "сессия снова свободна" is a statement about NOW.
+            # DEFERRED, not dropped (blind review 6). `ended` is reachable
+            # while the owner's own turn holds the lock — the cascade
+            # finishing on exactly that tick — and `new_state` has already
+            # cleared the `alerted` latch, so a ✅ refused here would never
+            # be sent at
+            # all. The requirement is that it arrives ONCE after the task
+            # actually finishes, not that it is skipped when the pane is
+            # momentarily busy. So the debt is carried and paid on the first
+            # tick that can honestly claim the session is free.
             if previous.alerted:
+                self._long_run_free_notice_owed = True
+
+        if self._long_run_free_notice_owed and new_state.since == 0.0:
+            if self._pane_is_free():
+                self._long_run_free_notice_owed = False
                 self._alert_fn(
-                    f"✅ Длинная автономная задача завершилась (~{minutes} мин) "
-                    "— сессия снова свободна."
+                    "✅ Длинная автономная задача завершилась — сессия снова "
+                    "свободна."
                 )
 
         # Step E (optional, default OFF via DEFAULT_LONG_RUN_NUDGE = 0.0):
@@ -547,21 +667,53 @@ class Watchdog:
             except Exception:  # noqa: BLE001 — best effort, never fatal
                 logger.warning("long-run: nudge steer failed", exc_info=True)
 
-        self._enforce_long_run_cap(new_state.since, now)
+        # `attended` is passed through, not re-derived: the tracked run
+        # SURVIVES a human taking the lock, so the cap must be told to keep
+        # its hands off — see _enforce_long_run_cap.
+        self._enforce_long_run_cap(new_state.since, now, attended=attended)
 
-    def _enforce_long_run_cap(self, since: float, now: float) -> None:
+    def _pane_is_free(self) -> bool:
+        """Is the main session idle RIGHT NOW — pane not busy, no live ask()?
+
+        A notice that says the session is free has to be checked against
+        the session at the instant it is sent, not inferred from a state
+        transition computed earlier in the tick.
+
+        Unknown reads as NOT free. This gates a purely informational ✅; the
+        cost of staying quiet when the pane cannot be read is one missing
+        nicety, and the cost of the opposite default is a false claim that
+        the session is idle.
+        """
+        try:
+            if is_main_turn_active(self.session.capture_text()):
+                return False
+            return not self.session.is_turn_active()
+        except Exception:  # noqa: BLE001 — duck-typed session, never fatal
+            logger.info("long-run: could not verify the pane is free — staying quiet")
+            return False
+
+    def _enforce_long_run_cap(
+        self, since: float, now: float, *, attended: bool = False
+    ) -> None:
         """Hard cap on an unattended run.
 
         Last stage of the threshold ladder documented on
         ``DEFAULT_LONG_RUN_MAX``: alert (heads-up) < nudge (ask the session
         to self-close, off by default) < max (THIS — close it ourselves).
 
-        Only ever reached from ``_track_long_run``, which means it only ever
-        sees an UNATTENDED run: ``long_run.next_state`` refuses to track a
-        turn whose ask-lock is held, so an ordinary chat turn the user is
-        sitting in front of — however long it runs — can never be closed by
-        this path. That is deliberate, not an oversight: the user waiting on
-        their own answer is exactly who this cap exists to protect.
+        Only ever applied to an UNATTENDED run: an ordinary chat turn the
+        user is sitting in front of — however long it runs — can never be
+        closed by this path. That is deliberate, not an oversight: the user
+        waiting on their own answer is exactly who this cap exists to
+        protect.
+
+        That used to be guaranteed upstream, because ``next_state`` zeroed
+        the marker the moment a turn became attended. That changed — a
+        tracked run now SURVIVES a human taking the lock ("paused"), so
+        the guarantee has to be restated here explicitly. Without the
+        ``attended`` guard below, the first thing this cap would do to a
+        long-running task is interrupt it the moment its owner wrote in to
+        ask how it was going.
 
         Two-stage, and the second stage is deliberately toothless:
 
@@ -576,12 +728,11 @@ class Watchdog:
            conversation context that holds the very work this message is
            telling the owner about.
         """
-        if self._long_run_max_seconds <= 0 or since <= 0:
+        if self._long_run_max_seconds <= 0 or since <= 0 or attended:
             return
         elapsed = now - since
         if elapsed < self._long_run_max_seconds:
             return
-        minutes = max(1, round(elapsed / 60))
 
         if self._long_run_closed:
             # Stage 2: it did not close. Remind, rarely; never re-interrupt.
@@ -591,11 +742,15 @@ class Watchdog:
             logger.warning(
                 "long-run: turn still running %.0fs after auto-close", elapsed
             )
+            # Number out of the text for the same reason as the 🛠 notice
+            # above: `elapsed` is the marker's age, which now spans the
+            # human's own turns too, and a moving number defeats the
+            # checksum debounce. It stays in the log line directly above.
             self._alert_fn(
-                f"⚠️ Ход основной сессии не закрылся после автоматического "
-                f"прерывания — идёт уже ~{minutes} мин. Сессию принудительно "
-                "не перезапускаю: это уничтожило бы её контекст вместе с "
-                "недоделанной работой. Прервать вручную — /stop."
+                "⚠️ Ход основной сессии не закрылся после автоматического "
+                "прерывания. Сессию принудительно не перезапускаю: это "
+                "уничтожило бы её контекст вместе с недоделанной работой. "
+                "Прервать вручную — /stop."
             )
             return
 
@@ -617,7 +772,7 @@ class Watchdog:
         )
         if closed:
             self._alert_fn(
-                f"⏹ Ход основной сессии шёл ~{minutes} мин — закрыл его "
+                "⏹ Ход основной сессии шёл дольше лимита — закрыл его "
                 "автоматически. Длинная работа должна уходить фоновым "
                 "агентам, а не занимать основную сессию. Что успело "
                 "записаться — лежит в файлах вольта. Если результат всё ещё "
@@ -625,10 +780,9 @@ class Watchdog:
             )
         else:
             self._alert_fn(
-                f"⚠️ Ход основной сессии идёт ~{minutes} мин — это дольше "
-                "лимита, но закрыть его автоматически не получилось. "
-                "Длинная работа должна уходить фоновым агентам. Прервать "
-                "вручную — /stop."
+                "⚠️ Ход основной сессии идёт дольше лимита, но закрыть его "
+                "автоматически не получилось. Длинная работа должна уходить "
+                "фоновым агентам. Прервать вручную — /stop."
             )
 
     def _deliver_notices(self) -> None:
@@ -701,6 +855,7 @@ class Watchdog:
             self._delivery_guard.tick()
         self._deliver_notices()
         self._check_context_size()
+        self._check_lost_delivery()
         self._track_long_run()
 
         if not self.session.is_healthy():
@@ -741,7 +896,21 @@ class Watchdog:
                     # M3 fix: this alert path has no HTML rendering (see
                     # _strip_report_html's docstring) — strip the tags
                     # instead of leaking them to the user literally.
-                    self._alert_fn(_strip_report_html(orphan))
+                    landed = self._alert_fn(_strip_report_html(orphan))
+                    if landed is False:
+                        # `_telegram_alerter` RETURNS False rather than
+                        # raising when there is no admin chat id, the POST
+                        # throws, or Telegram rejects it — so the except
+                        # below never sees this case. The rid was already
+                        # marked handled before the send, so the reply is
+                        # gone for good; saying "delivered" here would also
+                        # wipe the very streak that is the last trace of it
+                        # (blind review 2).
+                        logger.error(
+                            "orphan reply not delivered, %d chars lost", len(orphan)
+                        )
+                        continue
+                    self._note_delivered()
                     # The one line that tells 2026-08-20's postmortem apart
                     # from "the mechanism is silently doing nothing": without
                     # it, a healthy tick and a tick that just delivered a

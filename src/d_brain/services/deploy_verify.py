@@ -61,6 +61,11 @@ DELIVERY_CRITICAL_PATHS = (
     "src/d_brain/services/inbox.py",
     "src/d_brain/services/chat_queue.py",
     "src/d_brain/services/shutdown.py",
+    # And the module that reads those queues back as evidence:
+    # every alerting path now asks it whether a message was really lost, so
+    # a bug here is either a lost message nobody is told about or a false
+    # alarm every five minutes.
+    "src/d_brain/services/delivery_proof.py",
     "src/d_brain/bot/handlers/chat.py",
     "src/d_brain/bot/formatters.py",
     "src/d_brain/bot/main.py",

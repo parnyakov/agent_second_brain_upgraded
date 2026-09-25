@@ -783,11 +783,12 @@ def test_track_long_run_fires_exactly_one_alert_and_one_ended(tmp_path):
     assert alerts == []
     clock["now"] = 1061.0
     wd.check_once()  # crosses alert_after
-    alert_hits = [a for a in alerts if "занята уже" in a]
+    alert_hits = [a for a in alerts if "Идёт длинная автономная задача" in a]
     assert len(alert_hits) == 1
+    assert "мин" not in alert_hits[0]  # no number in the text
     clock["now"] = 1200.0
     wd.check_once()  # still active — must not alert again
-    assert len([a for a in alerts if "занята уже" in a]) == 1
+    assert len([a for a in alerts if "Идёт длинная автономная задача" in a]) == 1
     sess.pane_text = _IDLE_PANE
     clock["now"] = 1260.0
     wd.check_once()  # main turn no longer active — ends the run
@@ -960,7 +961,10 @@ def test_long_run_cap_closes_the_turn_exactly_once(tmp_path):
     assert sess.interrupts == 1
     closed = [a for a in alerts if "закрыл его автоматически" in a]
     assert len(closed) == 1
-    assert "~5 мин" in closed[0]
+    # No minute count in the text: `since` is the marker's age, not one
+    # task's duration, and a moving number defeats the message-checksum
+    # debounce downstream.
+    assert "мин" not in closed[0]
 
     # Later ticks still see the same run: no second interrupt, and no
     # second message until a whole cap has passed (escalation window).
@@ -1015,7 +1019,9 @@ def test_long_run_cap_disabled_never_interrupts(tmp_path):
         wd.check_once()
     assert sess.interrupts == 0
     assert [a for a in alerts if "закрыл его автоматически" in a] == []
-    assert len([a for a in alerts if "занята уже" in a]) == 1  # alert unaffected
+    assert len(
+        [a for a in alerts if "Идёт длинная автономная задача" in a]
+    ) == 1  # alert unaffected
 
 
 def test_long_run_cap_never_closes_an_attended_turn(tmp_path):
@@ -1081,3 +1087,402 @@ def test_long_run_cap_relatches_for_the_next_run(tmp_path):
     clock["now"] = 1801.0
     wd.check_once()
     assert sess.interrupts == 2
+
+
+# ── ✅ must state a fact, not a flag transition ───────────────────────
+
+
+def _long_wd(tmp_path, sess, clock, alerts, **kw):
+    return Watchdog(
+        sess,
+        runtime_dir=tmp_path,
+        disk_free_fn=lambda: 10_000_000_000,
+        clock_fn=lambda: clock["now"],
+        alert_fn=alerts.append,
+        min_disk_bytes=500_000_000,
+        long_run_alert_seconds=60.0,
+        **kw,
+    )
+
+
+def _ok_hits(alerts):
+    return [a for a in alerts if "снова свободна" in a]
+
+
+def _start_hits(alerts):
+    return [a for a in alerts if "Идёт длинная автономная задача" in a]
+
+
+def test_a_message_during_a_long_run_does_not_announce_the_session_is_free(tmp_path):
+    """FALSE ALARM: a session hangs for a long time, the owner writes in,
+    and a ✅ arrives. Writing to the bot takes the ask lock, which used to
+    read as "nothing unattended remains" and produce ✅ «сессия снова
+    свободна» — sent at the exact instant the session was busiest, with
+    their own message."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _long_wd(tmp_path, sess, clock, alerts)
+
+    wd.check_once()  # run starts
+    clock["now"] = 1061.0
+    wd.check_once()  # 🛠 heads-up
+    assert len(_start_hits(alerts)) == 1
+
+    # The owner writes in: the pane is still busy, the lock is now held.
+    sess._turn_active = True
+    for t in (1100.0, 1200.0, 1300.0):
+        clock["now"] = t
+        wd.check_once()
+    assert _ok_hits(alerts) == []
+
+
+def test_the_pause_does_not_re_announce_the_same_task(tmp_path):
+    """The cure must REMOVE a false message, not postpone it: when the
+    owner's turn ends, the same task must not announce its own start a
+    second time — and must not then announce a second ✅ either."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _long_wd(tmp_path, sess, clock, alerts)
+
+    wd.check_once()
+    clock["now"] = 1061.0
+    wd.check_once()
+    assert len(_start_hits(alerts)) == 1
+
+    sess._turn_active = True          # the owner's turn
+    clock["now"] = 1100.0
+    wd.check_once()
+    sess._turn_active = False         # ...and back to the cascade
+    for t in (1200.0, 1300.0, 2000.0):
+        clock["now"] = t
+        wd.check_once()
+
+    assert len(_start_hits(alerts)) == 1
+    assert _ok_hits(alerts) == []
+
+
+def test_the_real_end_of_the_task_still_says_so_once(tmp_path):
+    """THE REAL CASE: when the turn actually stops, ✅ arrives — once."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _long_wd(tmp_path, sess, clock, alerts)
+
+    wd.check_once()
+    clock["now"] = 1061.0
+    wd.check_once()
+    sess._turn_active = True          # they write during the run
+    clock["now"] = 1100.0
+    wd.check_once()
+    sess._turn_active = False
+    clock["now"] = 1200.0
+    wd.check_once()
+
+    sess.pane_text = _IDLE_PANE       # the task really finishes
+    clock["now"] = 1300.0
+    wd.check_once()
+    assert len(_ok_hits(alerts)) == 1
+    assert "мин" not in _ok_hits(alerts)[0]  # no number in the text
+
+    for t in (1400.0, 1500.0):
+        clock["now"] = t
+        wd.check_once()
+    assert len(_ok_hits(alerts)) == 1
+
+
+def test_the_free_claim_is_re_checked_against_the_pane_before_sending(tmp_path):
+    """The transition is computed from what the tick observed; «сессия
+    снова свободна» is a claim about the instant it is sent. Here the
+    cascade really did finish — and a turn of the owner's is in flight at
+    that very moment, so the session is not free and we say nothing rather
+    than say something untrue."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _long_wd(tmp_path, sess, clock, alerts)
+    wd.check_once()
+    clock["now"] = 1061.0
+    wd.check_once()
+    assert len(_start_hits(alerts)) == 1
+
+    sess.pane_text = _IDLE_PANE   # the cascade's turn is over ("ended")
+    sess._turn_active = True      # ...and he is mid-question right now
+    clock["now"] = 1200.0
+    wd.check_once()
+    assert _ok_hits(alerts) == []
+
+    # DEFERRED, NOT DROPPED. `ended` clears the `alerted` latch, so a ✅
+    # merely refused here would never be sent at all — and the acceptance
+    # criterion is that it arrives ONCE after the task actually finishes.
+    sess._turn_active = False
+    clock["now"] = 1260.0
+    wd.check_once()
+    assert len(_ok_hits(alerts)) == 1
+    for t in (1300.0, 1400.0):
+        clock["now"] = t
+        wd.check_once()
+    assert len(_ok_hits(alerts)) == 1
+
+
+def test_a_new_run_cancels_a_notice_still_owed_for_the_previous_one(tmp_path):
+    """The deferred ✅ must not surface in the middle of the NEXT cascade:
+    at that point the session is demonstrably not free."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _long_wd(tmp_path, sess, clock, alerts)
+    wd.check_once()
+    clock["now"] = 1061.0
+    wd.check_once()
+
+    sess.pane_text = _IDLE_PANE
+    sess._turn_active = True      # ended, but not free ⇒ ✅ owed
+    clock["now"] = 1200.0
+    wd.check_once()
+    assert _ok_hits(alerts) == []
+
+    sess.pane_text = _ACTIVE_PANE  # a brand-new unattended run
+    sess._turn_active = False
+    for t in (1300.0, 1400.0):
+        clock["now"] = t
+        wd.check_once()
+    assert _ok_hits(alerts) == []
+
+
+def test_an_unreadable_pane_never_claims_the_session_is_free(tmp_path):
+    """Unknown reads as NOT free. The cost is one missing nicety; the cost
+    of the opposite default is the false claim this whole item is about."""
+    clock = {"now": 1000.0}
+    sess = LongRunFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _long_wd(tmp_path, sess, clock, alerts)
+    wd.check_once()
+    clock["now"] = 1061.0
+    wd.check_once()
+
+    captures = {"n": 0}
+    real_capture = sess.capture_text
+
+    def flaky() -> str:
+        captures["n"] += 1
+        # The tracking capture works (so the run ends); the verification
+        # one, a moment later, cannot read the pane.
+        if captures["n"] == 1:
+            return _IDLE_PANE
+        raise RuntimeError("tmux gone")
+
+    sess.capture_text = flaky
+    clock["now"] = 1200.0
+    assert wd.check_once() is not None  # the tick survives
+    assert _ok_hits(alerts) == []
+    sess.capture_text = real_capture
+
+
+def test_the_hard_cap_never_interrupts_a_turn_the_owner_is_waiting_on(tmp_path):
+    """FALSE ALARM and worse — a regression the pause fix could have caused.
+    The tracked run now SURVIVES a human taking the lock, so without an
+    explicit guard the first thing the hard cap would do to a long task
+    is interrupt it the moment its owner wrote in to ask how it was going."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+
+    wd.check_once()
+    sess._turn_active = True          # his message takes the lock
+    for t in (1301.0, 1500.0, 2000.0):
+        clock["now"] = t
+        wd.check_once()
+    assert sess.interrupts == 0
+    assert [a for a in alerts if "закрыл его автоматически" in a] == []
+
+    # THE REAL CASE: back to unattended, and the cap does its job.
+    sess._turn_active = False
+    clock["now"] = 2100.0
+    wd.check_once()
+    assert sess.interrupts == 1
+
+
+# ── a late reply closes the health ledger ─────────────────────────────
+
+
+def test_a_late_reply_delivered_by_the_watchdog_closes_the_ledger(tmp_path):
+    """FALSE ALARM: ask() gave up on the turn and wrote `timeout`, and the
+    answer it was waiting on is delivered here, ticks later. Leaving the
+    ledger at `timeout` is what let three such turns mean «3 ответов подряд
+    не доставлено» while all three answers were in the owner's Telegram."""
+    from d_brain.services import ask_health
+
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1000.0)
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1030.0)
+    assert ask_health.read(tmp_path).fail_streak == 2
+
+    sess = FakeSession(orphan_reply="поздний ответ")
+    wd = make_wd(tmp_path, sess)
+    assert wd.check_once() == "healthy"
+
+    assert ask_health.read(tmp_path).last_status == "ok"
+    assert ask_health.read(tmp_path).fail_streak == 0
+
+
+def test_a_tick_with_nothing_to_deliver_leaves_the_ledger_alone(tmp_path):
+    """THE REAL CASE: the streak must survive an ordinary healthy tick.
+    Clearing it on liveness alone is exactly the 2026-08-20 mistake — a
+    green health signal while the person receives silence."""
+    from d_brain.services import ask_health
+
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1000.0)
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1030.0)
+    before = ask_health.path_for(tmp_path).read_bytes()
+
+    wd = make_wd(tmp_path, FakeSession())  # no orphan reply
+    assert wd.check_once() == "healthy"
+    assert ask_health.path_for(tmp_path).read_bytes() == before
+
+
+# ── only a send that LANDED is a delivery ─────────────────────────────
+
+
+class _RefusingAlerter:
+    """Stands in for `_telegram_alerter`, which RETURNS False (never raises)
+    when there is no admin chat id, the POST throws, or Telegram rejects
+    it."""
+
+    def __init__(self, ok: bool) -> None:
+        self.ok = ok
+        self.sent: list[str] = []
+
+    def __call__(self, msg: str) -> bool:
+        self.sent.append(msg)
+        return self.ok
+
+
+def test_an_orphan_reply_that_did_not_land_is_not_scored_as_delivered(tmp_path):
+    """THE REAL CASE. The rid is marked handled BEFORE the send, so a send
+    that quietly returned False loses the reply for good. Recording it as
+    `ok` would also wipe the streak — the last trace that anything went
+    wrong — and leave the health ledger green over a message nobody got."""
+    from d_brain.services import ask_health
+
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1000.0)
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1030.0)
+    before = ask_health.path_for(tmp_path).read_bytes()
+
+    alerter = _RefusingAlerter(ok=False)
+    wd = make_wd(tmp_path, FakeSession(orphan_reply="поздний ответ"))
+    wd._alert_fn = alerter
+    assert wd.check_once() == "healthy"
+
+    assert alerter.sent  # it was attempted
+    assert ask_health.path_for(tmp_path).read_bytes() == before
+
+
+def test_an_orphan_reply_that_landed_is_scored_as_delivered(tmp_path):
+    """NO FALSE ALARM: the same reply, actually delivered, closes the turn
+    that ask() had already written off as a timeout."""
+    from d_brain.services import ask_health
+
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1000.0)
+    ask_health.record(tmp_path, "timeout", clock_fn=lambda: 1030.0)
+
+    alerter = _RefusingAlerter(ok=True)
+    wd = make_wd(tmp_path, FakeSession(orphan_reply="поздний ответ"))
+    wd._alert_fn = alerter
+    assert wd.check_once() == "healthy"
+
+    assert ask_health.read(tmp_path).last_status == "ok"
+    assert ask_health.read(tmp_path).fail_streak == 0
+
+
+# ── the proven-loss path, which must always get through ──────────────
+
+
+def _bury(tmp_path, name: str) -> None:
+    dead = tmp_path / "outbox" / "dead"
+    dead.mkdir(parents=True, exist_ok=True)
+    (dead / name).write_text("{}")
+
+
+def _loss_hits(alerts):
+    return [a for a in alerts if "Сообщение не доставлено" in a]
+
+
+def test_a_reply_in_the_dead_queue_is_reported_once(tmp_path):
+    """The guarantee behind every gate added above: with a healthy unit,
+    a clean ledger and an idle pane, a message this install can PROVE it
+    failed to deliver still reaches the owner. Once per loss, not per
+    tick."""
+    alerts: list[str] = []
+    wd = make_wd(tmp_path, FakeSession())
+    wd._alert_fn = alerts.append
+    _bury(tmp_path, "0000000000000000001.json")
+
+    assert wd.check_once() == "healthy"
+    assert len(_loss_hits(alerts)) == 1
+    assert "мёртвой очереди" in _loss_hits(alerts)[0]
+
+    for _ in range(5):
+        wd.check_once()
+    assert len(_loss_hits(alerts)) == 1
+
+    _bury(tmp_path, "0000000000000000002.json")  # a NEW loss
+    wd.check_once()
+    assert len(_loss_hits(alerts)) == 2
+
+
+def test_a_healthy_install_reports_no_loss(tmp_path):
+    """NO FALSE ALARM: nothing in the queues, nothing said."""
+    alerts: list[str] = []
+    wd = make_wd(tmp_path, FakeSession())
+    wd._alert_fn = alerts.append
+    for _ in range(5):
+        wd.check_once()
+    assert _loss_hits(alerts) == []
+
+
+def test_a_loss_report_that_did_not_land_is_retried(tmp_path):
+    """Dead letters pile up exactly when Telegram sends fail. A latch
+    advanced on a report nobody received would consume the only warning."""
+    alerter = _RefusingAlerter(ok=False)
+    wd = make_wd(tmp_path, FakeSession())
+    wd._alert_fn = alerter
+    _bury(tmp_path, "0000000000000000001.json")
+
+    wd.check_once()
+    wd.check_once()
+    assert len(_loss_hits(alerter.sent)) == 2  # still owed
+
+    alerter.ok = True
+    wd.check_once()
+    wd.check_once()
+    assert len(_loss_hits(alerter.sent)) == 3  # reported, then quiet
+
+
+def test_the_long_run_notice_only_claims_the_channel_is_intact_when_it_is(tmp_path):
+    """The same rule applied to this text: «Канал доставки при этом
+    исправен» is a claim about the outside world, so it is made only when
+    the queues back it up."""
+    clock = {"now": 1000.0}
+    alerts: list[str] = []
+    wd = _long_wd(
+        tmp_path, LongRunFakeSession(pane_text=_ACTIVE_PANE), clock, alerts
+    )
+    wd.check_once()
+    clock["now"] = 1061.0
+    wd.check_once()
+    assert "исправен" in _start_hits(alerts)[0]
+
+    clock2 = {"now": 2000.0}
+    alerts2: list[str] = []
+    other = tmp_path / "other"
+    other.mkdir()
+    _bury(other, "0000000000000000001.json")
+    wd2 = _long_wd(
+        other, LongRunFakeSession(pane_text=_ACTIVE_PANE), clock2, alerts2
+    )
+    wd2.check_once()
+    clock2["now"] = 2061.0
+    wd2.check_once()
+    assert "исправен" not in _start_hits(alerts2)[0]
