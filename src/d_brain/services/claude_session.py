@@ -173,6 +173,8 @@ STATIC_TRUST_WINDOW = 1800.0
 # request_id prefix that marks a turn as maintenance (pipeline, doctor,
 # /process) — such turns are never steering targets for chat input.
 MAINT_PREFIX = "maint-"
+# See ClaudeSession.request_abort.
+ABORT_STAMP_NAME = "abort.stamp"
 # How stale a long_run.json marker (written by the watchdog) may be before
 # ask()'s fast busy-active path stops trusting it and falls back to the full
 # busy-wait — see long_run.is_active()'s docstring. Sized well above the
@@ -276,7 +278,11 @@ class AskResult:
     """Outcome of a single ask() round."""
 
     # "ok" | "rate_limited" | "logged_out" | "timeout" | "error" | "busy" |
-    # "busy_active"
+    # "busy_active" | "reset"
+    #
+    # "reset": the owner's /reset cut this turn short (see
+    # ClaudeSession.request_abort). Not a delivery failure — ask_health
+    # scores it as neutral.
     #
     # "busy_active" (agent-infra, 2026-09): the pane is busy
     # with a leftover turn that DEMONSTRABLY MADE PROGRESS across the whole
@@ -432,6 +438,9 @@ class ClaudeSession:
         self._pane_log = self.runtime_dir / "pane.log"
         self._ready_flag = self.runtime_dir / "ready"
         self._inflight = self.runtime_dir / "inflight"
+        # /reset's "stop whatever you are doing" signal — a FILE, so an ask()
+        # in another process (the nightly pipeline) hears it too.
+        self._abort_stamp = self.runtime_dir / ABORT_STAMP_NAME
         self._pane_lock = self.runtime_dir / "pane.lock"
         # Separate lock for handled_rids/pending_orphans bookkeeping — see
         # _state_locked(). Deliberately NOT pane.lock: that one is held for
@@ -1735,6 +1744,43 @@ class ClaudeSession:
         says nothing is in flight (Step D,)."""
         return is_main_turn_active(self.capture_text())
 
+    def activity_fingerprint(self) -> tuple[str, int]:
+        """What changes whenever the pane is alive: its chrome and the size
+        of the piped transcript. Two equal fingerprints a few seconds apart
+        mean nothing moved on screen at all — the same "real progress" test
+        ``ask()``'s busy-wait uses (chrome change OR pane.log growth)."""
+        return _chrome(self._capture()), self._pane_log_size()
+
+    def request_abort(self) -> None:
+        """Ask every ask() that is ALREADY running on this session to give
+        up at its next poll and release the pane lock (the owner's /reset).
+
+        Without this the lock is held by a turn nobody is waiting for any
+        more: an interrupted turn has no closing marker, so ask() sits out
+        its whole no-reply ceiling (minutes), and a busy-wait on a pane that
+        only LOOKS busy sits out the whole busy-wait budget. The stamp is a
+        wall-clock time in a file, so it reaches an ask() in another process
+        too, and a turn that starts after it is not affected."""
+        tmp = self._abort_stamp.with_name(self._abort_stamp.name + ".tmp")
+        try:
+            tmp.write_text(f"{time.time():.6f}\n")
+            os.replace(tmp, self._abort_stamp)
+        except OSError:
+            logger.warning("could not write the abort stamp", exc_info=True)
+
+    def _abort_requested(self, since: float) -> bool:
+        """True iff /reset asked turns started at ``since`` (wall clock) to
+        stop. Missing or unreadable stamp ⇒ False."""
+        try:
+            return float(self._abort_stamp.read_text().strip()) >= since
+        except (OSError, ValueError):
+            return False
+
+    def _aborted(self, log_id: str) -> AskResult:
+        logger.warning("ask %s cut short by /reset — releasing the pane", log_id)
+        self._inflight.unlink(missing_ok=True)
+        return AskResult("reset", detail="turn cut short by /reset")
+
     def is_steerable_turn(self) -> bool:
         """True iff the in-flight turn may receive steering input.
 
@@ -1984,6 +2030,8 @@ class ClaudeSession:
             self._inflight.write_text(
                 f"{MAINT_PREFIX}pending-{log_id}\n{self._clock()}\n"
             )
+            # Wall clock, for request_abort (a stamp from another process).
+            turn_started = time.time()
             try:
                 reused_cap = self._ensure_locked()
             except Exception as exc:  # noqa: BLE001 — must never escape ask()
@@ -2142,6 +2190,8 @@ class ClaudeSession:
                 # docstring above).
                 last_real_progress_ts = busy_wait_start
                 while self._clock() < deadline and is_main_turn_active(cap):
+                    if self._abort_requested(turn_started):
+                        return self._aborted(log_id)
                     if self._clock() >= busy_wait_deadline:
                         break
                     if self._clock() - busy_last_active > self._stall_timeout:
@@ -2298,6 +2348,8 @@ class ClaudeSession:
             # forensic pass over pane.log.
             salvage_blocked_logged = False
             while self._clock() < deadline:
+                if self._abort_requested(turn_started):
+                    return self._aborted(log_id)
                 cap = self._capture()
                 transcript_reply = None
                 if wrap:

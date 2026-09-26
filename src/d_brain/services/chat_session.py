@@ -9,7 +9,9 @@ the chat handlers don't need to change.
 """
 
 import asyncio
+import functools
 import html
+import json
 import logging
 import os
 import time
@@ -22,6 +24,7 @@ from d_brain.services import ask_health, long_run
 from d_brain.services.claude_session import (
     DEFAULT_LONG_RUN_STALE_AFTER,
     DEFAULT_TIMEOUT,
+    AskResult,
 )
 from d_brain.services.runtime import get_ask_lock, get_duty_session, get_session
 
@@ -61,6 +64,10 @@ _STATUS_MESSAGES = {
     # this message can honestly point the user at it.
     "busy_active": "🛠 Идёт длинная фоновая задача — сессия занята, но канал "
     "доставки в порядке. Напиши ещё раз позже. Прервать её — /stop.",
+    # The owner's /reset cut this very turn short (ClaudeSession
+    # .request_abort). Neutral in ask_health: not a delivery failure.
+    "reset": "⏹ Этот ход прерван командой /reset — если ответ ещё нужен, "
+    "повтори сообщение.",
 }
 # R2c (Fable audit, F2 class): the ceiling's honest message for "no reply
 # markers ever appeared at all" — distinguished from the generic "timeout"
@@ -141,6 +148,41 @@ TURN_LIMIT_STATUS = "turn_limit"
 # brain. Module-level so tests can shrink it.
 _MAIN_BUSY_CONFIRM_SECONDS = 3.0
 
+# /reset (circuit_reset): how long to wait for a turn to let go of a session
+# after it was told to stop, and the poll step for that wait and for the
+# read-back. Module-level so tests can shrink them.
+_RESET_RELEASE_WAIT = 60.0
+_RESET_READBACK_WAIT = 15.0
+_RESET_POLL_SECONDS = 1.0
+
+# Duty → main handoff. The duty session answers without the conversation's
+# context and is told to "accept, record, and hand long work to the main
+# session" — but that handoff used to be words only: nothing ever told the
+# main session (2026-09-25, 22:31/22:34 — two handoffs nobody picked up).
+# Now every message the duty session actually answered is noted here, and
+# the NEXT main turn carries the list, so the main session picks it up the
+# moment it is free. Cleared only after a main turn delivered a real reply.
+_HANDOFF_FILE = "duty-handoff.json"
+# Wall-clock time of the last /reset in this process. A main turn that was
+# already running then and came back without an answer was cut short by it —
+# reported as "reset" on BOTH engines (Claude's ask() says so itself via its
+# abort stamp; Codex's SIGINT'ed turn comes back as a plain "error").
+_last_reset_ts = 0.0
+# One /reset at a time: a second one would kill the sessions the first is
+# still reading back.
+_reset_running = False
+_HANDOFF_MAX = 10
+_HANDOFF_TEXT_CAP = 1500
+
+
+@dataclass(frozen=True)
+class ResetOutcome:
+    """What /reset did to ONE session, verified by reading it back."""
+
+    name: str  # "main" | "duty"
+    ok: bool  # recreated AND read back as up and idle
+    detail: str = ""
+
 # Stamp file (inside settings.duty_dir) holding the unix time of the last
 # duty turn — the input to the idle-reset decision.
 _DUTY_STAMP_NAME = "last_used"
@@ -211,6 +253,29 @@ def wrap_duty_prompt(text: str) -> str:
         "- Не трогай файлы, с которыми прямо сейчас может работать основная "
         "сессия:\n  projects/*/status.md, MEMORY.md, .session/handoff.md.\n\n"
         f"Сообщение пользователя:\n{text}"
+    )
+
+
+def with_duty_handoff(prompt: str, items: list[dict]) -> str:
+    """The main-session prompt with the duty session's pending handoff in
+    front of it (see ``_HANDOFF_FILE``)."""
+    lines = []
+    for item in items:
+        stamp = time.strftime("%d.%m %H:%M", time.localtime(float(item["ts"])))
+        text = " ".join(str(item["text"]).split())
+        lines.append(f"- [{stamp}] {text}")
+    return (
+        "[ПЕРЕДАЧА ОТ ДЕЖУРНОЙ СЕССИИ]\n"
+        "Пока ты был занят, на сообщения ниже отвечала дежурная сессия — без "
+        "контекста разговора. Всё, что она приняла «в очередь основной "
+        "сессии» или обещала передать, теперь твоё: прочитай её записи "
+        "«[дежурная сессия]» в сегодняшнем и вчерашнем daily, возьми "
+        "обещанное в работу (длинное — агентам) и в начале ответа одной "
+        "строкой скажи, что подхватил.\n\n"
+        "Сообщения, на которые отвечала дежурная:\n"
+        + "\n".join(lines)
+        + "\n\nНовое сообщение пользователя:\n"
+        + prompt
     )
 
 
@@ -355,10 +420,21 @@ class ChatSessionManager:
         ``busy`` counts as a failure, which is what arms the restart backstop
         for a genuinely wedged pane.
         """
+        handoff = self._pending_handoff()
+        main_prompt = with_duty_handoff(prompt, handoff) if handoff else prompt
+        started = time.time()
         async with get_ask_lock():
             res = await asyncio.to_thread(
-                self._session.ask, prompt, timeout=self._main_turn_timeout()
+                self._session.ask, main_prompt, timeout=self._main_turn_timeout()
             )
+        if (
+            not res.ok
+            and res.status not in ("busy", "busy_active", "reset")
+            and _last_reset_ts >= started
+        ):
+            res = AskResult("reset", detail=f"cut short by /reset ({res.status})")
+        if handoff and res.ok and (res.reply or "").strip():
+            self._clear_handoff(handoff[-1]["ts"])
         if res.status == "busy_active":
             self._record_health(res.status)
             logger.info(
@@ -410,9 +486,13 @@ class ChatSessionManager:
             # watchdog._is_hung → recovered_hung, and the long-run cap.
             # What this must never do is stay quiet while the person gets
             # nothing, and that case still scores `busy`.
-            self._record_health(
-                ask_health.SUCCESS_STATUS if answered else res.status
-            )
+            if answered:
+                status = ask_health.SUCCESS_STATUS
+            elif _last_reset_ts >= started:
+                status = "reset"  # the duty turn was cut short by /reset
+            else:
+                status = res.status
+            self._record_health(status)
         else:
             text = self._reply_text(user_id, res)
         # agent-infra: if this very turn had to park a pane
@@ -462,6 +542,19 @@ class ChatSessionManager:
             logger.warning("pane-activity probe failed", exc_info=True)
             return False
 
+    def _activity_fingerprint(self) -> Any | None:
+        """The engine's "did anything move" snapshot, or None when the
+        driver has none (Codex, test fakes) or it throws — None disables the
+        no-change check rather than guessing."""
+        probe = getattr(self._session, "activity_fingerprint", None)
+        if probe is None:
+            return None
+        try:
+            return probe()
+        except Exception:  # noqa: BLE001 — never gate a reply on a probe
+            logger.warning("pane activity fingerprint failed", exc_info=True)
+            return None
+
     async def is_main_busy(self) -> bool:
         """True iff the main brain is demonstrably mid UNATTENDED long turn —
         the pre-ask gate the chat handler uses so a user does not pay ask()'s
@@ -506,7 +599,9 @@ class ChatSessionManager:
         2. Two pane probes, ~3s apart: a turn that is about to finish must
            not cost the user a context-less duty reply. Both run in worker
            threads (the engine probe shells out), so the event loop stays
-           free.
+           free. Between them the pane must also visibly CHANGE (chrome or
+           pane.log growth, when the driver can say so): a frozen frame
+           with a busy signature on it is not a live turn.
 
         CODEX ENGINE: the watchdog's ``_track_long_run`` classifies a turn as
         active by running ``tmux_parse.is_main_turn_active`` over
@@ -551,10 +646,25 @@ class ChatSessionManager:
             return False
         if not active:
             return False
+        before = await asyncio.to_thread(self._activity_fingerprint)
         if not await asyncio.to_thread(self._pane_active):
             return False
         await asyncio.sleep(_MAIN_BUSY_CONFIRM_SECONDS)
         if not await asyncio.to_thread(self._pane_active):
+            return False
+        after = await asyncio.to_thread(self._activity_fingerprint)
+        if before is not None and before == after:
+            # A live turn moves SOMETHING in a few seconds (spinner counter,
+            # agent rows, the pane.log stream). A frozen frame that merely
+            # carries a busy signature is not grounds for promising
+            # "отвечу следом" (2026-09-25: a stale wait line parked every
+            # message for ~9 hours). Take the ordinary path into ask(),
+            # whose own busy-wait judges the pane and feeds the ledger.
+            logger.info(
+                "main session looks busy but nothing on the pane changed in "
+                "%.0fs — not parking, taking the ordinary path",
+                _MAIN_BUSY_CONFIRM_SECONDS,
+            )
             return False
         logger.info(
             "main session is mid unattended long run (~%.0fs) — parking this "
@@ -665,7 +775,10 @@ class ChatSessionManager:
                     request_id=f"duty-{user_id}-{int(now)}",
                 )
                 self._touch_duty(settings, time.time())
-            return self._duty_reply_text(duty, res, busy_seconds, legacy)
+            text, answered = self._duty_reply_text(duty, res, busy_seconds, legacy)
+            if answered:
+                self._note_handoff(prompt)
+            return text, answered
         except Exception:  # noqa: BLE001 — the duty path must never cost a reply
             logger.exception("duty session failed for user %d", user_id)
             return legacy, False
@@ -874,6 +987,229 @@ class ChatSessionManager:
             "force_recover requested by user %d -> %s", user_id, recovered
         )
         return recovered
+
+    # ── duty → main handoff ──────────────────────────────────────────
+
+    def _handoff_path(self) -> Path | None:
+        runtime_dir = self._runtime_dir()
+        return None if runtime_dir is None else Path(runtime_dir) / _HANDOFF_FILE
+
+    def _pending_handoff(self) -> list[dict]:
+        """Messages the duty session answered that the main session has not
+        seen yet, oldest first. Never raises; unreadable ⇒ none."""
+        path = self._handoff_path()
+        if path is None:
+            return []
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [
+            item
+            for item in raw
+            if isinstance(item, dict)
+            and isinstance(item.get("ts"), (int, float))
+            and isinstance(item.get("text"), str)
+        ]
+
+    def _write_handoff(self, items: list[dict]) -> None:
+        path = self._handoff_path()
+        if path is None:
+            return
+        try:
+            if not items:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(items, ensure_ascii=False))
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("could not write the duty handoff", exc_info=True)
+
+    def _note_handoff(self, prompt: str) -> None:
+        items = self._pending_handoff()
+        items.append({"ts": time.time(), "text": prompt[:_HANDOFF_TEXT_CAP]})
+        self._write_handoff(items[-_HANDOFF_MAX:])
+
+    def _clear_handoff(self, up_to_ts: float) -> None:
+        """Drop what the main session was shown; keep anything the duty
+        session answered while that main turn was running."""
+        self._write_handoff(
+            [item for item in self._pending_handoff() if item["ts"] > up_to_ts]
+        )
+
+    def pending_handoff_count(self) -> int:
+        return len(self._pending_handoff())
+
+    # ── /reset: the circuit breaker ──────────────────────────────────
+
+    @staticmethod
+    def reset_in_progress() -> bool:
+        return _reset_running
+
+    async def circuit_reset(self, user_id: int) -> list[ResetOutcome]:
+        """Owner's /reset: stop the current turn and recreate the main and
+        duty sessions from scratch, then prove they are up and idle.
+
+        Built from the pieces that already exist, in this order:
+
+        1. every session is told to stop — ``request_abort`` (the Claude
+           driver: an ask() already running gives up at its next poll and
+           releases the pane lock) plus ``interrupt`` (Escape / SIGINT);
+        2. the process-wide ask-lock is taken (bounded wait), so the chat
+           queue cannot start its next turn between the restart and the
+           read-back and make a clean session look busy;
+        3. ``force_recover`` — the /relogin and watchdog primitive: kill and
+           recreate under the pane lock — retried until the stopped turn has
+           let go (``_RESET_RELEASE_WAIT``);
+        4. the watchdog's long-run marker is removed, so nothing keeps
+           reporting the old run as live;
+        5. read-back: healthy, no turn holding the lock, nothing active on
+           the pane. Only that is reported as ``ok``.
+
+        Engine-neutral: under Codex ``interrupt`` SIGINTs the exec process
+        and ``force_recover`` kills a stray one; the thread is then dropped
+        too, so both engines come back with a clean context (new process,
+        new conversation — the vault is untouched). ``request_abort`` does
+        not exist there and is skipped.
+        """
+        global _last_reset_ts, _reset_running  # noqa: PLW0603
+        if _reset_running:
+            raise RuntimeError("перезапуск уже идёт")
+        _reset_running = True
+        try:
+            return await self._circuit_reset(user_id)
+        finally:
+            _reset_running = False
+
+    async def _circuit_reset(self, user_id: int) -> list[ResetOutcome]:
+        global _last_reset_ts  # noqa: PLW0603
+        _last_reset_ts = time.time()
+        logger.warning("/reset requested by user %d", user_id)
+        targets: list[tuple[str, Any]] = [("main", self._session)]
+        settings = self._config()
+        if settings is not None and getattr(settings, "duty_session_enabled", False):
+            duty = self._resolve_duty()
+            if duty is not None:
+                targets.append(("duty", duty))
+
+        for _name, session in targets:
+            await asyncio.to_thread(self._stop_turn, session)
+
+        lock = get_ask_lock()
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_RESET_RELEASE_WAIT)
+            held = True
+        except TimeoutError:
+            logger.warning("/reset: ask-lock still held — restarting without it")
+            held = False
+        try:
+            outcomes = []
+            for name, session in targets:
+                restart = functools.partial(
+                    self._restart_and_verify,
+                    name,
+                    session,
+                    drop_thread=self._engine() == "codex",
+                )
+                if name != "duty":
+                    outcomes.append(await asyncio.to_thread(restart))
+                    continue
+                # The duty path serializes on this lock, not on the ask-lock:
+                # hold it too, so a duty turn cannot start between the
+                # restart and the read-back.
+                try:
+                    await asyncio.wait_for(
+                        self._duty_lock.acquire(), timeout=_RESET_RELEASE_WAIT
+                    )
+                    duty_held = True
+                except TimeoutError:
+                    duty_held = False
+                try:
+                    outcomes.append(await asyncio.to_thread(restart))
+                finally:
+                    if duty_held:
+                        self._duty_lock.release()
+            runtime_dir = self._runtime_dir()
+            if runtime_dir is not None:
+                long_run.clear(runtime_dir)
+        finally:
+            if held:
+                lock.release()
+        logger.warning(
+            "/reset done: %s",
+            ", ".join(f"{o.name}={'ok' if o.ok else o.detail}" for o in outcomes),
+        )
+        return outcomes
+
+    @staticmethod
+    def _stop_turn(session: Any) -> None:
+        """Best effort: signal a running turn to stop. Never raises."""
+        for method in ("request_abort", "interrupt"):
+            fn = getattr(session, method, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 — a failed stop must not stop /reset
+                logger.warning("/reset: %s failed", method, exc_info=True)
+
+    @staticmethod
+    def _restart_and_verify(
+        name: str, session: Any, *, drop_thread: bool = False
+    ) -> ResetOutcome:
+        """Blocking: recreate one session, then read it back.
+
+        Claude: ``force_recover`` kills the tmux session and starts a NEW
+        ``claude`` process with a new session id — a clean context by
+        construction. Codex: ``force_recover`` kills the exec process but
+        deliberately keeps the thread, so ``drop_thread`` also sends the
+        engine's ``/clear`` (forget ``thread_id``) — the next turn starts a
+        fresh thread in a fresh process."""
+        deadline = time.monotonic() + _RESET_RELEASE_WAIT
+        recovered = False
+        error = ""
+        while True:
+            try:
+                recovered = bool(session.force_recover())
+            except Exception as exc:  # noqa: BLE001 — reported, not raised
+                logger.warning("/reset: %s force_recover failed", name, exc_info=True)
+                error = str(exc) or exc.__class__.__name__
+            if recovered or time.monotonic() >= deadline:
+                break
+            # Whoever holds the session now may be a turn that was only
+            # WAITING when /reset began (the pipeline, a queued ask) and so
+            # was not covered by the first stop — stop it too (review).
+            ChatSessionManager._stop_turn(session)
+            time.sleep(_RESET_POLL_SECONDS)
+        if not recovered:
+            return ResetOutcome(
+                name, False, error or "сессию так и не отпустил предыдущий ход"
+            )
+        if drop_thread:
+            try:
+                session.send_control("/clear")
+            except Exception as exc:  # noqa: BLE001 — reported, not raised
+                logger.warning("/reset: %s thread drop failed", name, exc_info=True)
+                return ResetOutcome(name, False, f"контекст не сброшен: {exc}")
+        deadline = time.monotonic() + _RESET_READBACK_WAIT
+        while True:
+            try:
+                if (
+                    session.is_healthy()
+                    and not session.is_turn_active()
+                    and not session.is_pane_turn_active()
+                ):
+                    return ResetOutcome(name, True)
+                detail = "после перезапуска сессия не выглядит свободной"
+            except Exception as exc:  # noqa: BLE001
+                detail = f"не удалось проверить сессию: {exc}"
+            if time.monotonic() >= deadline:
+                return ResetOutcome(name, False, detail)
+            time.sleep(_RESET_POLL_SECONDS)
 
     async def compact(self, user_id: int) -> str:
         """Durable-state-first: clearing is the compaction; memory lives in

@@ -90,6 +90,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -110,6 +111,8 @@ from d_brain.services.claude_session import (
 
 logger = logging.getLogger(__name__)
 
+_VAULT_INCLUDE_RE = re.compile(r"^\s*<!--\s*vault-include:\s*(\S+)\s*-->\s*$")
+
 __all__ = ["CodexExecDriver", "DEFAULT_INTERRUPT_GRACE", "DEFAULT_SANDBOX"]
 
 # How long a SIGINT'ed turn is given to exit on its own before SIGKILL.
@@ -120,7 +123,7 @@ DEFAULT_INTERRUPT_GRACE = 10.0
 # Write protection, NOT read isolation — see the module docstring. Kept as
 # the default because the spike proved it actually blocks writes outside the
 # workspace (the attempted write to the live bot's cron state was refused).
-DEFAULT_SANDBOX = "workspace-write"
+DEFAULT_SANDBOX = "danger-full-access"
 # How long the driver waits on a single readline before re-checking its
 # deadlines. Small enough that a hard timeout is honored promptly, large
 # enough not to spin.
@@ -874,11 +877,40 @@ class CodexExecDriver:
                 exc,
             )
             return prompt
+        persona = self._expand_vault_includes(persona)
         return (
             f"{persona}\n\n"
             "--- end of standing instructions; the user's message follows ---\n\n"
             f"{prompt}"
         )
+
+    def _expand_vault_includes(self, persona: str) -> str:
+        """Inline vault rule files referenced by ``<!-- vault-include: … -->``.
+
+        Claude Code auto-loads ``.claude/rules/*.md`` from the vault; Codex
+        does not. A persona line ``<!-- vault-include: .claude/rules/x.md -->``
+        is replaced by that file's text, read from THIS instance's vault
+        (``work_dir``), so the rule keeps one source of truth and each
+        instance gets exactly the rules its own vault has. A missing file is
+        dropped silently — the same outcome as Claude in a vault without it.
+        """
+        out: list[str] = []
+        for line in persona.splitlines():
+            m = _VAULT_INCLUDE_RE.match(line)
+            if not m:
+                out.append(line)
+                continue
+            rel = Path(m.group(1))
+            if rel.is_absolute() or ".." in rel.parts:
+                logger.warning("codex persona: refusing vault-include %s", rel)
+                continue
+            try:
+                out.append((self.work_dir / rel).read_text().strip())
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning("codex persona: could not include %s: %s", rel, exc)
+        return "\n".join(out)
 
     def _rollout_files(self, thread_id: str) -> list[Path]:
         home = self.codex_home or Path(

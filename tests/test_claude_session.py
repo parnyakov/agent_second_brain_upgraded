@@ -4302,3 +4302,85 @@ def test_a_broken_transcript_ends_the_turn_honestly_and_keeps_the_rid(
     handled_path = tmp_path / ".dbrain" / "handled_rids"
     handled = handled_path.read_text().split() if handled_path.exists() else []
     assert rid not in handled
+
+
+# ── /reset: request_abort cuts a running ask() short ────────────────────
+
+
+def _abort_after(clock: dict, session_box: list, at: float):
+    """A sleep_fn that fires request_abort once the fake clock passes ``at``
+    — i.e. /reset arriving from another thread mid-turn."""
+
+    def sleep_fn(seconds: float) -> None:
+        clock["now"] += seconds
+        if clock["now"] >= at and session_box and not session_box[1:]:
+            session_box[0].request_abort()
+            session_box.append("fired")
+
+    return sleep_fn
+
+
+def _session_with_sleep(tmp_path, fake, clock, sleep_fn, **over):
+    return ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / ".dbrain",
+        runner=fake,
+        sleep_fn=sleep_fn,
+        clock_fn=lambda: clock["now"],
+        rid_factory=lambda: "reset001",
+        poll_interval=1.0,
+        startup_timeout=30.0,
+        **over,
+    )
+
+
+def test_request_abort_ends_a_running_turn_and_frees_the_lock(tmp_path, clock):
+    """An interrupted turn has no closing marker, so without the abort its
+    ask() would sit out the whole no-reply ceiling holding the pane lock —
+    and /reset could not recreate the session under it."""
+    box: list = []
+    fake = FakeTmux([READY, THINKING], exists=True)
+    s = _session_with_sleep(
+        tmp_path, fake, clock, _abort_after(clock, box, 5.0), stall_timeout=5000.0
+    )
+    box.append(s)
+    res = s.ask("ping", timeout=3000)
+    assert res.status == "reset"
+    assert clock["now"] < 20
+    assert not (s.runtime_dir / "inflight").exists()
+    assert s.is_turn_active() is False
+
+
+def test_request_abort_ends_a_busy_wait_on_a_busy_looking_pane(tmp_path, clock):
+    """The 2026-09-25 shape: a queued message busy-waiting on a pane that
+    only LOOKS busy holds the lock for the whole budget unless told to stop."""
+    box: list = []
+    frames = [f"Warping… ({i}s · ↓{i}k tokens)\n" for i in range(1, 400)]
+    fake = FakeTmux(frames, exists=True)
+    s = _session_with_sleep(
+        tmp_path,
+        fake,
+        clock,
+        _abort_after(clock, box, 4.0),
+        stall_timeout=5000.0,
+        busy_wait_budget=300.0,
+    )
+    box.append(s)
+    res = s.ask("ping", timeout=5000)
+    assert res.status == "reset"
+    assert clock["now"] < 20
+    # Nothing was typed over the busy pane.
+    assert "paste-buffer" not in fake.sent_subcommands()
+
+
+def test_an_abort_stamp_older_than_the_turn_changes_nothing(tmp_path, clock):
+    rid = "abcd0002"
+    fake = FakeTmux([READY, THINKING, _complete(rid)], exists=True)
+    s = make_session(tmp_path, fake, clock, rid=rid)
+    s.request_abort()  # a /reset from before this turn started
+    import time as _time
+
+    _time.sleep(0.01)
+    res = s.ask("ping", timeout=60)
+    assert res.ok and res.reply == "PONG"

@@ -1,6 +1,8 @@
-"""Bot commands: /start, /help, /status, /onboarding, /new, /compact, /relogin."""
+"""Bot commands: /start, /help, /status, /onboarding, /new, /compact,
+/relogin, /reset."""
 
 import asyncio
+import logging
 from datetime import date
 
 from aiogram import Bot, Router
@@ -9,11 +11,13 @@ from aiogram.types import Message
 
 from d_brain.bot.handlers import chat
 from d_brain.config import get_settings
-from d_brain.services.chat_session import ChatSessionManager
+from d_brain.services import chat_queue
+from d_brain.services.chat_session import ChatSessionManager, ResetOutcome
 from d_brain.services.session import SessionStore
 from d_brain.services.storage import VaultStorage
 
 router = Router(name="commands")
+logger = logging.getLogger(__name__)
 
 
 @router.message(Command("start"))
@@ -26,7 +30,8 @@ async def cmd_start(message: Message) -> None:
         "<b>Команды:</b>\n"
         "/new — новый чат\n"
         "/compact — сжать контекст\n"
-        "/relogin — пересоздать сессию, если после dbrain login просит вход\n"
+        "/relogin — починить сессию, если разлогинилось\n"
+        "/reset — полный перезапуск, если бот завис или всё время «занят»\n"
         "/status — статус дня\n"
         "/work — что сейчас в работе\n"
         "/process — обработать записи\n"
@@ -46,7 +51,9 @@ async def cmd_help(message: Message) -> None:
         "<b>Команды:</b>\n"
         "/new — новый чат (сброс сессии)\n"
         "/compact — сжать контекст сессии\n"
-        "/relogin — пересоздать сессию, если после dbrain login просит вход\n"
+        "/relogin — починить сессию, если бот пишет «нужен повторный вход»\n"
+        "/reset — полный перезапуск: прервать ход, пересоздать основную и "
+        "дежурную сессии (контекст разговора начнётся заново, вольт на месте)\n"
         "/status — статус сегодняшнего дня\n"
         "/work — что сейчас в работе: идёт ли ход, сколько уже, где застряло\n"
         "/process — обработать записи дня\n"
@@ -179,6 +186,81 @@ async def cmd_relogin(message: Message) -> None:
             "⏳ Сейчас идёт другой ответ — подожди, пока он закончится, и "
             "попробуй /relogin ещё раз."
         )
+
+
+_RESET_NAMES = {"main": "основная", "duty": "дежурная"}
+
+
+def reset_report(
+    outcomes: list[ResetOutcome], waiting: int, handoff: int = 0
+) -> str:
+    """The /reset reply. "всё чисто" only when EVERY session read back as
+    up and idle — anything else names what did not come back."""
+    failed = [o for o in outcomes if not o.ok]
+    if failed:
+        lines = ["⚠️ Перезапуск прошёл не до конца:"]
+        for o in outcomes:
+            name = _RESET_NAMES.get(o.name, o.name)
+            state = "поднята и свободна" if o.ok else f"не поднялась ({o.detail})"
+            lines.append(f"• {name} сессия — {state}")
+        lines.append("Попробуй /reset ещё раз через минуту.")
+        text = "\n".join(lines)
+    else:
+        text = (
+            "🔌 Перезапущено, всё чисто: текущий ход прерван, сессии "
+            "пересозданы и проверены — свободны. Контекст разговора начнётся "
+            "заново, всё записанное в вольт на месте."
+        )
+    if waiting:
+        text += (
+            f"\n\n📨 В очереди ждут сообщений: {waiting}. Они не потеряны — "
+            "отвечу на них из новой сессии по порядку."
+        )
+    if handoff:
+        text += (
+            f"\n\n🔁 Дежурная сессия отвечала без контекста на {handoff} "
+            "сообщ. — передам их основной вместе с твоим следующим сообщением."
+        )
+    return text
+
+
+@router.message(Command("reset"))
+async def cmd_reset(message: Message) -> None:
+    """Circuit breaker for a session that is stuck or falsely "busy".
+
+    Like /relogin it never goes through the brain — the brain may be what
+    is broken. Unlike /relogin it does not give up when a turn holds the
+    session: it stops that turn first (ChatSessionManager.circuit_reset).
+    Uses the chat handler's own manager, so the duty lock it holds during
+    the duty restart is the same one the duty path takes.
+    """
+    if not message.from_user:
+        return
+    from d_brain.bot.handlers import chat
+
+    manager = chat._get_manager()
+    if manager.reset_in_progress():
+        await message.answer("🔌 Перезапуск уже идёт — дождись его отчёта.")
+        return
+    await message.answer("🔌 Перезапускаю: прерываю текущий ход и пересоздаю сессии…")
+    try:
+        outcomes = await manager.circuit_reset(message.from_user.id)
+    except Exception as exc:  # noqa: BLE001 — the owner must get an answer
+        logger.exception("/reset failed")
+        await message.answer(f"❌ Перезапуск не удался: {exc}")
+        return
+    queue = chat_queue.current()
+    waiting = 0
+    if queue is not None:
+        try:
+            waiting = queue.pending_count(message.chat.id)
+        except Exception:  # noqa: BLE001 — a count must not cost the report
+            logger.warning("/reset: could not read the chat queue", exc_info=True)
+    try:
+        handoff = manager.pending_handoff_count()
+    except Exception:  # noqa: BLE001
+        handoff = 0
+    await message.answer(reset_report(outcomes, waiting, handoff))
 
 
 @router.message(Command("compact"))

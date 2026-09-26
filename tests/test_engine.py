@@ -47,6 +47,9 @@ def _settings(tmp_path, **over):
         deepgram_api_key="d",
         vault_path=tmp_path / "vault",
         runtime_dir=tmp_path / "rt",
+        # Explicit, so a PROJECT_ROOT in the environment (the bot's own env)
+        # can never point the persona write below at the live checkout.
+        project_root=tmp_path,
         _env_file=None,
     )
     base.update(over)

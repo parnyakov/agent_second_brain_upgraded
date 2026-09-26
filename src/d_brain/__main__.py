@@ -11,6 +11,11 @@ logging.basicConfig(
 )
 logsafe.install()
 
+# httpx logs every request URL at INFO, and a Telegram Bot API URL
+# carries the bot token — keep it out of the journal / log files.
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 

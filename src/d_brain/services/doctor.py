@@ -284,6 +284,10 @@ def main() -> None:  # pragma: no cover
     from d_brain import logsafe
 
     logsafe.install()
+    # httpx logs every request URL at INFO, and a Telegram Bot API URL
+    # carries the bot token — keep it out of the journal / log files.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     from d_brain.config import get_settings
     from d_brain.services.runtime import get_session
     from d_brain.services.watchdog import _telegram_alerter

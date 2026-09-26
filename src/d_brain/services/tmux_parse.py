@@ -870,6 +870,41 @@ def _static_hint_outside_footer(chrome: str) -> bool:
     )
 
 
+# Stricter than _TURN_SUMMARY_RE on purpose (review): cutting at a line that
+# only LOOKS like a summary would hide a live spinner drawn above it. Only
+# the "✻" glyph (or none) may lead, and the duration must end the line or be
+# followed by "·" — so a todo row under a live spinner ("◻ Wait for 30s then
+# poll") or a queued input ("❯ Wait for 10s …") never cuts.
+_SUMMARY_CUT_RE = re.compile(
+    r"^\s*(?:✻\s*)?[A-Z][a-z]+ for (?:\d+h\s*)?(?:\d+m\s*)?\d+s(?:\s*·|\s*$)"
+)
+
+
+def _below_last_turn_summary(chrome: str) -> str:
+    """The part of ``chrome`` drawn AFTER the last turn-summary line
+    ("✻ Worked for 8m 12s · done 7:48 PM · …"), or all of it when there is
+    no summary line.
+
+    A summary line is printed only once a main turn has returned control, so
+    every activity signature ABOVE it is that finished turn's leftover
+    scrollback, not evidence of a live one. The 2026-09-25 incident: a turn
+    that had waited on a subagent left "✻ Waiting for 1 background agent to
+    finish" in the transcript a few rows above its own "Worked for 8m 12s"
+    summary; the pane then sat idle overnight without scrolling, so the line
+    stayed inside the bottom-``_CHROME_LINES`` window and
+    :func:`is_main_turn_active` kept reporting a live turn for ~9 hours —
+    every message was parked in the chat queue behind a turn that did not
+    exist. A turn that really is running draws its spinner / wait line at
+    the bottom of the conversation, i.e. below any earlier summary, so
+    cutting there never hides a live signal.
+    """
+    lines = chrome.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if _SUMMARY_CUT_RE.search(lines[i]):
+            return "\n".join(lines[i + 1 :])
+    return chrome
+
+
 def is_main_turn_active(text: str) -> bool:
     """True iff the pane shows the MAIN turn (the one `ask()` sent a prompt
     to) is still running — deliberately excluding background-agent list
@@ -883,8 +918,12 @@ def is_main_turn_active(text: str) -> bool:
     `is_working()` nor `is_working_progressing()` can ever go False while a
     background task is merely listed, so `ask()`'s stall loop never escaped
     a turn whose MAIN answer had already finished).
+
+    Only the chrome BELOW the last turn-summary line is judged (see
+    :func:`_below_last_turn_summary`) — anything above it belongs to a turn
+    that has already returned control.
     """
-    chrome = _chrome(text)
+    chrome = _below_last_turn_summary(_chrome(text))
     if _static_hint_outside_footer(chrome):
         return True
     if _MAIN_SPINNER_RE.search(chrome):

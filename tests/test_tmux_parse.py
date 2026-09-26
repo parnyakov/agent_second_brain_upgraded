@@ -1105,6 +1105,61 @@ def test_is_main_turn_active_false_on_bare_idle_prompt():
     assert is_main_turn_active(pane) is False
 
 
+# ── stale "Waiting for N background agent" above a finished turn ─────────
+#
+# 2026-09-25 incident: a turn that had waited on a subagent finished with
+# "✻ Worked for 8m 12s · done …", but its "✻ Waiting for 1 background agent
+# to finish" line stayed a few rows above that summary. The pane did not
+# scroll overnight, the line stayed inside the chrome window, and the main
+# session read as busy for ~9 hours: every message got "Принял — отвечу
+# следом", then five minutes of busy-wait, then the duty session. The
+# fixture is that pane's layout, reconstructed from ~/.dbrain/pane.log, with
+# neutral text in the reply bodies.
+
+
+def _stale_wait_pane() -> str:
+    return (_FIXTURES_DIR / "pane_stale_background_wait.txt").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_stale_background_wait_above_the_summary_is_not_a_live_turn():
+    pane = _stale_wait_pane()
+    # The fixture really has the old signature inside the chrome window —
+    # otherwise this test would pass without the fix.
+    assert "Waiting for 1 background agent" in "\n".join(
+        strip_reply_bodies(pane).splitlines()[-18:]
+    )
+    assert is_main_turn_active(pane) is False
+    assert main_turn_finished(pane) is True
+
+
+@pytest.mark.parametrize("verb", _SUMMARY_VERBS)
+def test_background_wait_below_the_last_summary_is_still_a_live_turn(verb):
+    """The cut is at the LAST summary: a new turn that is waiting on an
+    agent right now draws its wait line below any earlier summary."""
+    pane = (
+        f"✻ {verb} for 1m 3s · done 7:48 PM\n"
+        "\n"
+        "❯ next question\n"
+        "\n"
+        "✻ Waiting for 1 background agent to finish\n"
+        "\n" + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n" + _FOOTER_LINE
+    )
+    assert is_main_turn_active(pane) is True
+
+
+def test_live_spinner_below_an_old_summary_is_still_a_live_turn():
+    pane = (
+        "✻ Worked for 8m 12s · done 7:48 PM · 3 shells still running\n"
+        "\n"
+        "❯ next question\n"
+        "\n"
+        "✢ Pondering… (12s · ↓ 554 tokens)\n" + _FOOTER_LINE
+    )
+    assert is_main_turn_active(pane) is True
+
+
 def test_main_turn_finished_false_on_empty_or_whitespace():
     """Fails closed: an empty/garbled capture must never read as finished."""
     assert main_turn_finished("") is False
@@ -1915,3 +1970,15 @@ def test_main_area_working_survives_a_quoted_prompt_line_in_the_reply():
         f"{_MAW_BOX}\n❯\n{_MAW_BOX}\n{_MAW_FOOTER}"
     )
     assert main_area_working(pane) is True
+
+
+def test_a_todo_row_under_a_live_spinner_does_not_cut_it_away():
+    """Review: only a real summary line may cut — a todo row or a queued
+    input shaped like "Wait for 30s …" drawn below a live spinner must not
+    hide it."""
+    pane = (
+        "✢ Pondering… (12s · ↓ 554 tokens)\n"
+        "  ⎿  ◻ Wait for 30s then poll\n"
+        "❯ Wait for 10s and retry\n" + _FOOTER_LINE
+    )
+    assert is_main_turn_active(pane) is True

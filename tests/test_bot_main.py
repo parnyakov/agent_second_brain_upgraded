@@ -73,7 +73,7 @@ def test_bot_commands_has_expected_entries():
     from d_brain.bot.main import bot_commands
 
     commands = bot_commands()
-    assert len(commands) == 9
+    assert len(commands) == 10
 
     by_command = {c.command: c.description for c in commands}
     assert set(by_command) == {
@@ -86,6 +86,7 @@ def test_bot_commands_has_expected_entries():
         "resend",
         "work",
         "relogin",
+        "reset",
     }
     for description in by_command.values():
         assert description
@@ -205,3 +206,17 @@ def test_start_and_help_mention_onboarding():
         message = FakeMessage()
         asyncio.run(handler(message))
         assert "/onboarding" in message.calls[0][0][0]
+def test_reset_report_says_clean_only_when_every_session_read_back_ok():
+    from d_brain.bot.handlers.commands import reset_report
+    from d_brain.services.chat_session import ResetOutcome
+
+    clean = reset_report([ResetOutcome("main", True), ResetOutcome("duty", True)], 0)
+    assert "всё чисто" in clean.lower()
+    assert "очереди" not in clean
+
+    partial = reset_report(
+        [ResetOutcome("main", True), ResetOutcome("duty", False, "не поднялась")], 2
+    )
+    assert "всё чисто" not in partial.lower()
+    assert "дежурная" in partial
+    assert "В очереди ждут сообщений: 2" in partial

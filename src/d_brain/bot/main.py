@@ -135,6 +135,10 @@ def bot_commands() -> list[BotCommand]:
             command="relogin",
             description="Пересоздать сессию (если после dbrain login просит вход)",
         ),
+        BotCommand(
+            command="reset",
+            description="Полный перезапуск (если завис или всё время «занят»)",
+        ),
     ]
 
 

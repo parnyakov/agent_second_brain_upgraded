@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from d_brain.services.claude_session import AskResult
 
 
@@ -736,6 +738,33 @@ def test_is_main_busy_needs_two_confirming_probes(tmp_path, monkeypatch):
     assert asyncio.run(m.is_main_busy()) is True
 
 
+def test_is_main_busy_is_false_when_nothing_on_the_pane_moved(tmp_path, monkeypatch):
+    """2026-09-25: a frozen frame with a stale busy signature parked every
+    message for ~9 hours. Busy-looking but unchanged ⇒ not busy — the
+    message takes the ordinary ask() path instead of "отвечу следом"."""
+    from d_brain.services import chat_session
+
+    monkeypatch.setattr(chat_session, "_MAIN_BUSY_CONFIRM_SECONDS", 0.0)
+    m = _manager(tmp_path, AskResult("ok", reply="x"))
+    _fresh_long_run(tmp_path)
+
+    frames = [("same chrome", 100), ("same chrome", 100)]
+    m._session.activity_fingerprint = lambda: frames.pop(0)
+    m._session.pane_active_answers = [True, True]
+    assert asyncio.run(m.is_main_busy()) is False
+
+    frames = [("frame 1", 100), ("frame 1", 180)]  # pane.log grew: alive
+    m._session.pane_active_answers = [True, True]
+    assert asyncio.run(m.is_main_busy()) is True
+
+    def boom():
+        raise RuntimeError("no tmux")
+
+    m._session.activity_fingerprint = boom  # unknown ⇒ old behaviour
+    m._session.pane_active_answers = [True, True]
+    assert asyncio.run(m.is_main_busy()) is True
+
+
 def test_is_main_busy_needs_a_fresh_watchdog_marker(tmp_path, monkeypatch):
     """Blind review F1 (blocker): a busy-LOOKING pane is not enough.
 
@@ -886,3 +915,314 @@ def test_injected_main_session_never_auto_resolves_a_real_duty_session(tmp_path)
     )
     assert m._auto_duty is False
     assert m._resolve_duty() is None
+
+
+# ── /reset: circuit_reset ────────────────────────────────────────────────
+
+
+class ResetFake(FakeSession):
+    """A session that is 'stuck' until force_recover succeeds."""
+
+    def __init__(self, *, recover_after: int = 0, stays_busy: bool = False):
+        super().__init__(AskResult("ok", reply="x"))
+        self.events: list[str] = []
+        self.recover_after = recover_after
+        self.stays_busy = stays_busy
+        self.recovered = False
+
+    def request_abort(self) -> None:
+        self.events.append("abort")
+
+    def interrupt(self) -> None:
+        self.events.append("interrupt")
+
+    def force_recover(self) -> bool:
+        self.events.append("recover")
+        if self.recover_after > 0:
+            self.recover_after -= 1
+            return False
+        self.recovered = True
+        return True
+
+    def is_healthy(self) -> bool:
+        return self.recovered
+
+    def is_turn_active(self) -> bool:
+        return False
+
+    def is_pane_turn_active(self) -> bool:
+        return self.stays_busy
+
+
+def _reset_manager(tmp_path, monkeypatch, main, duty):
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ChatSessionManager
+
+    monkeypatch.setattr(chat_session, "_RESET_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(chat_session, "_RESET_RELEASE_WAIT", 0.2)
+    monkeypatch.setattr(chat_session, "_RESET_READBACK_WAIT", 0.0)
+    m = ChatSessionManager(
+        tmp_path, session=main, health_dir=tmp_path, duty_session=duty
+    )
+    m._settings = _duty_settings(tmp_path)
+    return m
+
+
+def test_circuit_reset_stops_restarts_and_reads_back_both_sessions(
+    tmp_path, monkeypatch
+):
+    from d_brain.services import long_run
+
+    main, duty = ResetFake(recover_after=2), ResetFake()
+    _fresh_long_run(tmp_path)
+    m = _reset_manager(tmp_path, monkeypatch, main, duty)
+
+    outcomes = asyncio.run(m.circuit_reset(1))
+
+    assert [(o.name, o.ok) for o in outcomes] == [("main", True), ("duty", True)]
+    # Told to stop BEFORE any restart attempt; retried until the turn let go.
+    assert main.events[:2] == ["abort", "interrupt"]
+    assert main.events.count("recover") == 3
+    assert duty.events[:2] == ["abort", "interrupt"]
+    # The stale long-run flag is gone.
+    assert long_run.read(tmp_path).since == 0.0
+
+
+def test_circuit_reset_never_claims_clean_when_the_read_back_fails(
+    tmp_path, monkeypatch
+):
+    main, duty = ResetFake(stays_busy=True), ResetFake(recover_after=10**6)
+    m = _reset_manager(tmp_path, monkeypatch, main, duty)
+
+    outcomes = {o.name: o for o in asyncio.run(m.circuit_reset(1))}
+
+    assert outcomes["main"].ok is False and outcomes["main"].detail
+    assert outcomes["duty"].ok is False and outcomes["duty"].detail
+
+
+def test_reset_turn_outcome_is_neutral_in_the_ledger_and_says_what_happened(
+    tmp_path,
+):
+    from d_brain.services import ask_health
+
+    ask_health.record(tmp_path, "error", clock_fn=lambda: 1.0)
+    m = _manager(tmp_path, AskResult("reset", detail="turn cut short by /reset"))
+    text = asyncio.run(m.send_message(1, "x"))
+    assert "/reset" in text
+    assert ask_health.read(tmp_path).fail_streak == 1  # untouched, not grown
+
+
+# ── duty → main handoff ──────────────────────────────────────────────────
+
+
+def test_what_the_duty_session_answered_reaches_the_next_main_turn(tmp_path):
+    """2026-09-25 22:31/22:34: the duty session "accepted into the main
+    session's queue" two requests and nothing ever told the main session.
+    Now the next main turn carries them, and they are dropped only once the
+    main session actually replied."""
+    m, duty = _duty_manager(
+        tmp_path,
+        AskResult("busy", busy_seconds=400.0),
+        AskResult("ok", reply="принято, передам основной"),
+    )
+    asyncio.run(m.send_message(1, "сделай кнопку reset"))
+    assert m.pending_handoff_count() == 1
+
+    # Main is free again: the next message carries the handoff.
+    m._session.result = AskResult("ok", reply="подхватил")
+    asyncio.run(m.send_message(1, "как дела с ресетом?"))
+    sent = m._session.prompts[-1]
+    assert sent.startswith("[ПЕРЕДАЧА ОТ ДЕЖУРНОЙ СЕССИИ]")
+    assert "сделай кнопку reset" in sent
+    assert sent.rstrip().endswith("как дела с ресетом?")
+    assert m.pending_handoff_count() == 0
+
+    # Nothing pending ⇒ the prompt is untouched.
+    asyncio.run(m.send_message(1, "ещё"))
+    assert m._session.prompts[-1] == "ещё"
+
+
+def test_the_handoff_survives_a_main_turn_that_did_not_reply(tmp_path):
+    m, _duty = _duty_manager(
+        tmp_path,
+        AskResult("busy", busy_seconds=400.0),
+        AskResult("ok", reply="принято"),
+    )
+    asyncio.run(m.send_message(1, "задача"))
+    m._session.result = AskResult("timeout", detail="x")
+    asyncio.run(m.send_message(1, "следующее"))
+    assert m.pending_handoff_count() == 1
+
+
+def test_a_duty_turn_that_answered_nothing_hands_nothing_off(tmp_path):
+    m, _duty = _duty_manager(
+        tmp_path,
+        AskResult("busy", busy_seconds=400.0),
+        AskResult("error"),
+    )
+    asyncio.run(m.send_message(1, "задача"))
+    assert m.pending_handoff_count() == 0
+
+
+def test_circuit_reset_under_codex_also_drops_the_thread(tmp_path, monkeypatch):
+    """Codex's force_recover keeps the thread on purpose; /reset promises a
+    clean context, so it must also forget it."""
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ChatSessionManager
+
+    monkeypatch.setattr(chat_session, "_RESET_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(chat_session, "_RESET_RELEASE_WAIT", 0.2)
+    monkeypatch.setattr(chat_session, "_RESET_READBACK_WAIT", 0.0)
+    main, duty = ResetFake(), ResetFake()
+    m = ChatSessionManager(
+        tmp_path, session=main, health_dir=tmp_path, duty_session=duty
+    )
+    m._settings = _duty_settings(tmp_path, chat_engine="codex")
+    outcomes = asyncio.run(m.circuit_reset(1))
+    assert all(o.ok for o in outcomes)
+    assert main.controls == ["/clear"] and duty.controls == ["/clear"]
+
+    # Claude: the recreated process already has a new session id — no /clear.
+    main2, duty2 = ResetFake(), ResetFake()
+    m2 = ChatSessionManager(
+        tmp_path, session=main2, health_dir=tmp_path, duty_session=duty2
+    )
+    m2._settings = _duty_settings(tmp_path)
+    asyncio.run(m2.circuit_reset(1))
+    assert main2.controls == [] and duty2.controls == []
+
+
+# ── the same /reset and handoff paths on the REAL Codex driver ──────────
+
+
+def _real_codex(tmp_path, name):
+    from d_brain.services.codex_driver import CodexExecDriver
+
+    (tmp_path / "vault").mkdir(parents=True, exist_ok=True)
+    return CodexExecDriver(
+        session_name=name,
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / name,
+        instructions_file=None,
+        sleep_fn=lambda _s: None,
+        poll_interval=0.001,
+        interrupt_grace=0.0,
+    )
+
+
+def test_circuit_reset_on_real_codex_drivers_leaves_a_clean_idle_brain(
+    tmp_path, monkeypatch
+):
+    """Codex has no pane: 'idle' is 'no turn lock, no live exec pid', and a
+    clean context is 'no thread_id on disk'. Both drivers are real."""
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ChatSessionManager
+
+    monkeypatch.setattr(
+        "d_brain.services.codex_driver.shutil.which", lambda n: f"/usr/bin/{n}"
+    )
+    monkeypatch.setattr(chat_session, "_RESET_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(chat_session, "_RESET_READBACK_WAIT", 0.0)
+    main, duty = _real_codex(tmp_path, "main"), _real_codex(tmp_path, "duty")
+    for drv in (main, duty):
+        drv._atomic_write(drv._thread_file, "thread-old\n")
+    m = ChatSessionManager(
+        tmp_path, session=main, health_dir=tmp_path, duty_session=duty
+    )
+    m._settings = _duty_settings(tmp_path, chat_engine="codex")
+
+    outcomes = asyncio.run(m.circuit_reset(1))
+
+    assert [(o.name, o.ok) for o in outcomes] == [("main", True), ("duty", True)]
+    assert not main._thread_file.exists() and not duty._thread_file.exists()
+    assert main.is_turn_active() is False and main.is_pane_turn_active() is False
+
+
+def test_circuit_reset_on_codex_waits_for_the_stopped_turn_to_let_go(
+    tmp_path, monkeypatch
+):
+    """A Codex turn holds its flock until the SIGINT'ed process is reaped;
+    /reset retries until it is free and never claims clean before that."""
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ChatSessionManager
+
+    monkeypatch.setattr(
+        "d_brain.services.codex_driver.shutil.which", lambda n: f"/usr/bin/{n}"
+    )
+    monkeypatch.setattr(chat_session, "_RESET_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(chat_session, "_RESET_RELEASE_WAIT", 0.05)
+    monkeypatch.setattr(chat_session, "_RESET_READBACK_WAIT", 0.0)
+    main = _real_codex(tmp_path, "main")
+    fd = main._try_lock()  # a turn that never lets go
+    try:
+        m = ChatSessionManager(tmp_path, session=main, health_dir=tmp_path)
+        m._settings = _duty_settings(
+            tmp_path, chat_engine="codex", duty_session_enabled=False
+        )
+        (outcome,) = asyncio.run(m.circuit_reset(1))
+        assert outcome.ok is False and outcome.detail
+    finally:
+        main._unlock(fd)
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_a_turn_cut_short_by_reset_says_so_on_both_engines(tmp_path, engine):
+    """Claude's ask() returns 'reset' itself; a SIGINT'ed Codex turn comes
+    back as a plain 'error'. Both must read as 'cut short by /reset' and
+    stay neutral in the ledger."""
+    from d_brain.services import ask_health, chat_session
+
+    status = "reset" if engine == "claude" else "error"
+    m, _duty = _duty_manager(
+        tmp_path, AskResult(status, detail="x"), AskResult("ok"), chat_engine=engine
+    )
+
+    def ask_during_reset(prompt, **kwargs):
+        chat_session._last_reset_ts = __import__("time").time()
+        return AskResult(status, detail="x")
+
+    m._session.ask = ask_during_reset
+    text = asyncio.run(m.send_message(1, "x"))
+    assert "/reset" in text
+    assert ask_health.read(tmp_path).fail_streak == 0
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_duty_handoff_reaches_main_on_both_engines(tmp_path, engine):
+    m, _duty = _duty_manager(
+        tmp_path,
+        AskResult("busy", busy_seconds=400.0),
+        AskResult("ok", reply="принято"),
+        chat_engine=engine,
+    )
+    asyncio.run(m.send_message(1, "задача для основной"))
+    m._session.result = AskResult("ok", reply="подхватил")
+    asyncio.run(m.send_message(1, "дальше"))
+    assert "задача для основной" in m._session.prompts[-1]
+    assert m.pending_handoff_count() == 0
+
+
+def test_reset_restops_whoever_takes_the_session_while_it_waits(
+    tmp_path, monkeypatch
+):
+    """Review: a turn that was only WAITING when /reset began gets the pane
+    next; every failed retry stops the current holder again."""
+    main, duty = ResetFake(recover_after=2), ResetFake()
+    m = _reset_manager(tmp_path, monkeypatch, main, duty)
+    asyncio.run(m.circuit_reset(1))
+    assert main.events == [
+        "abort", "interrupt",
+        "recover", "abort", "interrupt",
+        "recover", "abort", "interrupt",
+        "recover",
+    ]
+
+
+def test_a_second_reset_while_one_runs_is_refused(tmp_path, monkeypatch):
+    from d_brain.services import chat_session
+
+    m = _reset_manager(tmp_path, monkeypatch, ResetFake(), ResetFake())
+    monkeypatch.setattr(chat_session, "_reset_running", True)
+    assert m.reset_in_progress() is True
+    with pytest.raises(RuntimeError):
+        asyncio.run(m.circuit_reset(1))

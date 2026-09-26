@@ -324,6 +324,29 @@ def test_persona_is_injected_only_on_the_first_turn_of_a_thread(tmp_path):
     assert popen.prompts[1] == "второй вопрос"
 
 
+def test_persona_inlines_vault_rules_and_skips_missing_ones(tmp_path):
+    """Codex does not auto-load .claude/rules; a vault-include line makes a
+    rule reach the prompt from its single source in the instance's vault."""
+    rules = tmp_path / "vault" / ".claude" / "rules"
+    rules.mkdir(parents=True)
+    (rules / "style.md").write_text("# Стиль\nКоротко.\n")
+    persona = tmp_path / "codex-agents.md"
+    persona.write_text(
+        "# d-brain codex agent contract\n"
+        "<!-- vault-include: .claude/rules/style.md -->\n"
+        "<!-- vault-include: .claude/rules/absent.md -->\n"
+        "<!-- vault-include: ../secret.md -->\n"
+        "Хвост.\n"
+    )
+    popen = FakePopen({"lines": stream_ok()})
+    make_driver(tmp_path, popen, instructions_file=persona).ask("вопрос")
+
+    prompt = popen.prompts[0]
+    assert "# Стиль\nКоротко." in prompt
+    assert "vault-include" not in prompt
+    assert "Хвост." in prompt and prompt.endswith("вопрос")
+
+
 def test_wrap_never_alters_the_prompt_on_this_engine(tmp_path):
     """The marker contract exists to find a reply in a screen scrape. Here
     the reply is a discrete event, so wrap must be a genuine no-op."""
