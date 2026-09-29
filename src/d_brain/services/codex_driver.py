@@ -111,7 +111,33 @@ from d_brain.services.claude_session import (
 
 logger = logging.getLogger(__name__)
 
-_VAULT_INCLUDE_RE = re.compile(r"^\s*<!--\s*vault-include:\s*(\S+)\s*-->\s*$")
+_VAULT_INCLUDE_RE = re.compile(r"^\s*<!--\s*vault-include:\s*(.+?)\s*-->\s*$")
+
+
+
+def _markdown_section(text: str, heading: str) -> str:
+    """The ``# … heading`` section of ``text``, heading line included; ""
+    if absent. Ends at the next heading of the same or higher level; fenced
+    code blocks are skipped so a ``#`` comment inside one is not a heading."""
+    lines = text.splitlines()
+    start = level = None
+    fenced = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        hm = re.match(r"^(#{1,6})\s+(.*?)\s*$", line)
+        if not hm:
+            continue
+        if start is None:
+            if hm.group(2) == heading:
+                start, level = i, len(hm.group(1))
+        elif len(hm.group(1)) <= level:
+            return "\n".join(lines[start:i])
+    return "" if start is None else "\n".join(lines[start:])
+
 
 __all__ = ["CodexExecDriver", "DEFAULT_INTERRUPT_GRACE", "DEFAULT_SANDBOX"]
 
@@ -885,14 +911,22 @@ class CodexExecDriver:
         )
 
     def _expand_vault_includes(self, persona: str) -> str:
-        """Inline vault rule files referenced by ``<!-- vault-include: … -->``.
+        """Inline vault files referenced by ``<!-- vault-include: … -->``.
 
-        Claude Code auto-loads ``.claude/rules/*.md`` from the vault; Codex
-        does not. A persona line ``<!-- vault-include: .claude/rules/x.md -->``
-        is replaced by that file's text, read from THIS instance's vault
-        (``work_dir``), so the rule keeps one source of truth and each
-        instance gets exactly the rules its own vault has. A missing file is
-        dropped silently — the same outcome as Claude in a vault without it.
+        Claude Code auto-loads ``.claude/rules/*.md`` and ``.claude/CLAUDE.md``
+        from the vault; Codex does not. A persona line
+        ``<!-- vault-include: .claude/rules/x.md -->`` is replaced by that
+        file's text, read from THIS instance's vault (``work_dir``), so the
+        text keeps one source of truth and each instance gets exactly what
+        its own vault has.
+
+        ``path#Heading`` inlines only that markdown section (heading line up
+        to the next heading of the same or higher level). Alternatives are
+        separated by ``|`` and the first one that resolves wins — this is how
+        the per-bot identity is pulled in: a dedicated identity file if the
+        vault has one, else the ``## Identity`` section of its CLAUDE.md, the
+        very text the Claude engine reads. Nothing resolving is dropped
+        silently — the same outcome as Claude in a vault without it.
         """
         out: list[str] = []
         for line in persona.splitlines():
@@ -900,17 +934,29 @@ class CodexExecDriver:
             if not m:
                 out.append(line)
                 continue
-            rel = Path(m.group(1))
-            if rel.is_absolute() or ".." in rel.parts:
-                logger.warning("codex persona: refusing vault-include %s", rel)
-                continue
-            try:
-                out.append((self.work_dir / rel).read_text().strip())
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                logger.warning("codex persona: could not include %s: %s", rel, exc)
+            for alt in m.group(1).split("|"):
+                text = self._read_vault_include(alt.strip())
+                if text:
+                    out.append(text)
+                    break
         return "\n".join(out)
+
+    def _read_vault_include(self, spec: str) -> str | None:
+        path, _, heading = spec.partition("#")
+        rel = Path(path)
+        if not path or rel.is_absolute() or ".." in rel.parts:
+            logger.warning("codex persona: refusing vault-include %s", spec)
+            return None
+        try:
+            text = (self.work_dir / rel).read_text()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            logger.warning("codex persona: could not include %s: %s", spec, exc)
+            return None
+        if heading:
+            text = _markdown_section(text, heading.strip())
+        return text.strip() or None
 
     def _rollout_files(self, thread_id: str) -> list[Path]:
         home = self.codex_home or Path(

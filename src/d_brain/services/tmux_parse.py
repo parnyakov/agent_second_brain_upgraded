@@ -838,7 +838,7 @@ _WAITING_FOR_AGENTS_RE = re.compile(
 # practice), which makes it STRICTER than the old substring match: a model's
 # own prose "…it worked for 30s…" mid-sentence cannot match.
 _TURN_SUMMARY_RE = re.compile(
-    r"(?m)^\s*(?:[^\w\s]\s*)?[A-Z][a-z]+ for (?:\d+h\s*)?(?:\d+m\s*)?\d+s\b"
+    r"(?m)^\s*(?:[^\w\s]\s*)?[A-Z][^\W\d_]+ for (?:\d+h\s*)?(?:\d+m\s*)?\d+s\b"
 )
 # A run of box-drawing characters — the TUI's horizontal rule between the
 # transcript and the footer.
@@ -875,8 +875,12 @@ def _static_hint_outside_footer(chrome: str) -> bool:
 # the "✻" glyph (or none) may lead, and the duration must end the line or be
 # followed by "·" — so a todo row under a live spinner ("◻ Wait for 30s then
 # poll") or a queued input ("❯ Wait for 10s …") never cuts.
+# The verb may carry non-ASCII letters: "✻ Sautéed for 8m 4s · done 11:08 AM"
+# (2026-09-27) failed `[a-z]+`, no cut happened, and the stale "Waiting for
+# 1 background agent" above it kept the main session "busy" for ~19.5h.
+# `[^\W\d_]` = any Unicode letter; the capital + " for <N>s" anchor stays.
 _SUMMARY_CUT_RE = re.compile(
-    r"^\s*(?:✻\s*)?[A-Z][a-z]+ for (?:\d+h\s*)?(?:\d+m\s*)?\d+s(?:\s*·|\s*$)"
+    r"^\s*(?:✻\s*)?[A-Z][^\W\d_]+ for (?:\d+h\s*)?(?:\d+m\s*)?\d+s(?:\s*·|\s*$)"
 )
 
 

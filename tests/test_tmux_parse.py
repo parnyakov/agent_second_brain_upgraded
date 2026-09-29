@@ -1060,6 +1060,8 @@ _SUMMARY_VERBS = (
     "Crunched",
     "Churned",
     "Cogitated",
+    # Non-ASCII verb, seen live 2026-09-27 (see _SUMMARY_CUT_RE).
+    "Sautéed",
 )
 
 
@@ -1147,6 +1149,21 @@ def test_background_wait_below_the_last_summary_is_still_a_live_turn(verb):
         "\n" + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n" + _FOOTER_LINE
     )
     assert is_main_turn_active(pane) is True
+
+
+def test_non_ascii_summary_verb_cuts_the_stale_background_wait():
+    """2026-09-27 incident: "✻ Sautéed for 8m 4s" did not match `[a-z]+`,
+    so the stale wait line above it read as a live turn for ~19.5h."""
+    pane = (
+        "✻ Waiting for 1 background agent to finish\n"
+        "\n"
+        '● Agent "Prep data" finished · 7m 34s\n'
+        "\n"
+        "✻ Sautéed for 8m 4s · done 11:08 AM\n"
+        "\n" + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n" + _FOOTER_LINE
+    )
+    assert is_main_turn_active(pane) is False
+    assert main_turn_finished(pane) is True
 
 
 def test_live_spinner_below_an_old_summary_is_still_a_live_turn():

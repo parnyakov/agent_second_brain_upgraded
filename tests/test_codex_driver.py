@@ -309,18 +309,18 @@ def test_a_fresh_driver_reuses_the_thread_left_on_disk(tmp_path):
 
 def test_persona_is_injected_only_on_the_first_turn_of_a_thread(tmp_path):
     persona = tmp_path / "codex-agents.md"
-    persona.write_text("# d-brain codex agent contract\nТы — ассистент.\n")
+    persona.write_text("# d-brain codex agent contract\nТы — Орион.\n")
     popen = FakePopen({"lines": stream_ok()}, {"lines": stream_ok()})
     drv = make_driver(tmp_path, popen, instructions_file=persona)
 
     drv.ask("первый вопрос")
     drv.ask("второй вопрос")
 
-    assert "Ты — ассистент." in popen.prompts[0]
+    assert "Ты — Орион." in popen.prompts[0]
     assert popen.prompts[0].endswith("первый вопрос")
     # The thread carries the persona in its replayed context from here on;
     # re-sending it every turn would be pure waste.
-    assert "Ты — ассистент." not in popen.prompts[1]
+    assert "Ты — Орион." not in popen.prompts[1]
     assert popen.prompts[1] == "второй вопрос"
 
 
@@ -345,6 +345,83 @@ def test_persona_inlines_vault_rules_and_skips_missing_ones(tmp_path):
     assert "# Стиль\nКоротко." in prompt
     assert "vault-include" not in prompt
     assert "Хвост." in prompt and prompt.endswith("вопрос")
+
+
+REAL_CODEX_AGENTS = Path(__file__).resolve().parents[1] / "deploy" / "codex-agents.md"
+
+ORION_CLAUDE_MD = """# Agent Second Brain
+
+## Identity
+
+Ты — Орион. Мужской грамматический род о себе: «сделал».
+
+## Mission
+
+Миссия.
+"""
+
+VEGA_CLAUDE_MD = """# Второй мозг
+
+## Identity
+
+Ты — Вега. Женский грамматический род о себе: «сделала».
+Имя несклоняемое.
+
+## Mission
+
+Миссия.
+"""
+
+
+def _first_prompt(tmp_path: Path, claude_md: str | None = None, **files) -> str:
+    vault = tmp_path / "vault"
+    (vault / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
+    if claude_md is not None:
+        (vault / ".claude" / "CLAUDE.md").write_text(claude_md)
+    for rel, text in files.items():
+        (vault / ".claude" / "rules" / rel).write_text(text)
+    popen = FakePopen({"lines": stream_ok()})
+    make_driver(tmp_path, popen, instructions_file=REAL_CODEX_AGENTS).ask("вопрос")
+    return popen.prompts[0]
+
+
+def test_shared_codex_contract_carries_no_identity_of_its_own():
+    """codex-agents.md is shared by every instance; a name or gender in it
+    would make the other bot present itself as this one."""
+    text = REAL_CODEX_AGENTS.read_text()
+    for word in ("Орион", "Orion", "Вега", "Vega", "мужск", "женск"):
+        assert word not in text, word
+
+
+def test_first_user_instance_prompt_is_orion_from_its_own_vault(tmp_path):
+    prompt = _first_prompt(tmp_path, ORION_CLAUDE_MD)
+    assert "Ты — Орион." in prompt and "Мужской" in prompt
+    assert "Вега" not in prompt and "Женский" not in prompt
+    # Only the Identity section, not the whole CLAUDE.md.
+    assert "Миссия." not in prompt
+
+
+def test_second_user_instance_prompt_is_vega_from_its_own_vault(tmp_path):
+    prompt = _first_prompt(tmp_path, VEGA_CLAUDE_MD)
+    assert "Ты — Вега." in prompt and "Женский" in prompt
+    assert "Орион" not in prompt and "Orion" not in prompt
+    assert "Мужской" not in prompt
+
+
+def test_dedicated_identity_file_wins_over_claude_md_section(tmp_path):
+    prompt = _first_prompt(
+        tmp_path,
+        ORION_CLAUDE_MD,
+        **{"identity.md": "# Identity\nТы — Вега, «сделала»."},
+    )
+    assert "Ты — Вега" in prompt
+    assert "Орион" not in prompt
+
+
+def test_vault_without_identity_gets_no_identity_rather_than_a_foreign_one(tmp_path):
+    prompt = _first_prompt(tmp_path, "# Vault\n\n## Mission\n\nМиссия.\n")
+    assert "Орион" not in prompt and "Вега" not in prompt
+    assert "vault-include" not in prompt
 
 
 def test_wrap_never_alters_the_prompt_on_this_engine(tmp_path):
