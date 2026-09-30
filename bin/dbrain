@@ -7,6 +7,11 @@
 # and the next thing to try if something is wrong.
 set -euo pipefail
 
+# The installer puts uv/claude in ~/.local/bin (and node in nvm) and adds that
+# to ~/.bashrc, but the terminal it ran in keeps the old PATH. Without this,
+# `dbrain onboarding resume` right after setup fails with "uv: command not found".
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | tail -1)/bin:$PATH"
+
 RUNTIME_DIR="${DBRAIN_RUNTIME_DIR:-$HOME/.dbrain}"
 # Same Claude config dir as the systemd units, for doctor/login/onboarding.
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -14,6 +19,12 @@ PROJECT_FILE="$RUNTIME_DIR/project.path"
 PROJECT_DIR="${DBRAIN_PROJECT:-$( [ -f "$PROJECT_FILE" ] && cat "$PROJECT_FILE" || echo "$HOME/projects/dbrain" )}"
 NAME_FILE="$RUNTIME_DIR/brain.name"
 BRAIN="$( [ -f "$NAME_FILE" ] && cat "$NAME_FILE" || echo "dbrain" )"
+# The bot's own tmux server (Settings.tmux_socket / DBRAIN_TMUX_SOCKET).
+# Empty = the default server — today's behavior. Must match the bot's value,
+# or every command below looks at the wrong server.
+TMUX_SOCKET="${DBRAIN_TMUX_SOCKET:-$(grep -E '^DBRAIN_TMUX_SOCKET=' "${DBRAIN_ENV_FILE:-$PROJECT_DIR/.env}" 2>/dev/null | tail -1 | cut -d= -f2 || true)}"
+TMUX_CMD=(tmux)
+if [ -n "$TMUX_SOCKET" ]; then TMUX_CMD=(tmux -L "$TMUX_SOCKET"); fi
 
 # ── C9: instance / scope awareness ──────────────────────────────────────
 # All three default to today's single-instance install, so an operator who
@@ -71,12 +82,12 @@ case "$cmd" in
       else
         echo "— мозг:     Codex, НУЖЕН ВХОД → dbrain login"
       fi
-    elif tmux has-session -t "=$BRAIN:" 2>/dev/null; then
+    elif "${TMUX_CMD[@]}" has-session -t "=$BRAIN:" 2>/dev/null; then
       echo "— мозг:     жив ($BRAIN)"
     else
       echo "— мозг:     НЕ запущен"
     fi
-    if tmux has-session -t "=${BRAIN}_duty:" 2>/dev/null; then echo "— дежурный: жив (${BRAIN}_duty)"; else echo "— дежурный: не поднят (нормально, поднимается по надобности)"; fi
+    if "${TMUX_CMD[@]}" has-session -t "=${BRAIN}_duty:" 2>/dev/null; then echo "— дежурный: жив (${BRAIN}_duty)"; else echo "— дежурный: не поднят (нормально, поднимается по надобности)"; fi
     echo "Полная проверка с ответом агента: dbrain doctor"
     ;;
   restart)
@@ -117,15 +128,15 @@ case "$cmd" in
     _uv python -m d_brain.services.doctor
     ;;
   clear)
-    if tmux has-session -t "=$BRAIN:" 2>/dev/null; then
-      tmux send-keys -t "=$BRAIN:" "/clear" Enter
+    if "${TMUX_CMD[@]}" has-session -t "=$BRAIN:" 2>/dev/null; then
+      "${TMUX_CMD[@]}" send-keys -t "=$BRAIN:" "/clear" Enter
       echo "🧹 Память сессии очищена (durable-данные в файлах не тронуты)."
     else
       echo "Мозг не запущен — нечего чистить. Попробуй: dbrain repair"
     fi
     ;;
   attach)
-    exec tmux attach -t "=$BRAIN:"
+    exec "${TMUX_CMD[@]}" attach -t "=$BRAIN:"
     ;;
   repair)
     echo "🔧 Чиню: сброс ошибок + перезапуск…"
@@ -153,9 +164,9 @@ case "$cmd" in
     # keeps the brain alive). Recreate BOTH sessions so the bot rebuilds them
     # with the fresh login on the next message / cron job.
     echo "♻️  Пересоздаю сессию, чтобы она подхватила новый вход…"
-    tmux kill-session -t "=$BRAIN:" 2>/dev/null || true
-    tmux kill-session -t "=${BRAIN}_cron:" 2>/dev/null || true
-    tmux kill-session -t "=${BRAIN}_duty:" 2>/dev/null || true
+    "${TMUX_CMD[@]}" kill-session -t "=$BRAIN:" 2>/dev/null || true
+    "${TMUX_CMD[@]}" kill-session -t "=${BRAIN}_cron:" 2>/dev/null || true
+    "${TMUX_CMD[@]}" kill-session -t "=${BRAIN}_duty:" 2>/dev/null || true
     echo "Готово. Бот поднимет сессию заново при следующем сообщении. Проверь: dbrain status"
     ;;
   onboarding)

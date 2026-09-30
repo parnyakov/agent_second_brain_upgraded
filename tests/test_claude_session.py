@@ -330,7 +330,10 @@ def test_new_session_pins_session_id_via_session_id_flag(tmp_path, clock):
     assert sid  # a UUID was generated
     new_session_calls = [c for c in fake.calls if len(c) > 1 and c[1] == "new-session"]
     assert new_session_calls
-    start_command = new_session_calls[0][-1]
+    call = new_session_calls[0]
+    # The start command is new-session's last argument; the `;`-chained
+    # `set-option remain-on-exit on` follows it in the same invocation.
+    start_command = call[call.index(";") - 1]
     assert f"--session-id {sid}" in start_command
 
 
@@ -4384,3 +4387,271 @@ def test_an_abort_stamp_older_than_the_turn_changes_nothing(tmp_path, clock):
     _time.sleep(0.01)
     res = s.ask("ping", timeout=60)
     assert res.ok and res.reply == "PONG"
+
+
+# ── /reset: preflight, tmux socket, create-then-swap (2026-09-26) ──────────
+
+
+def _auth(logged_in: bool | None, rc: int = 0):
+    calls = []
+
+    def run(args, **kwargs):  # noqa: ANN001
+        calls.append(list(args))
+        out = "" if logged_in is None else json.dumps({"loggedIn": logged_in})
+        return subprocess.CompletedProcess(args, rc, stdout=out, stderr="boom")
+
+    run.calls = calls
+    return run
+
+
+def _preflight_session(tmp_path, *, which=lambda n: "/opt/bin/claude", auth=None):
+    return ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / ".dbrain",
+        runner=FakeTmux([READY]),
+        which_fn=which,
+        cli_runner=auth or _auth(True),
+    )
+
+
+def _onboarded(monkeypatch, tmp_path, done=True):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    cfg = Path.home() / ".claude.json"
+    cfg.write_text(json.dumps({"hasCompletedOnboarding": done}))
+    return cfg
+
+
+def test_claude_bin_is_resolved_to_an_absolute_path_at_construction(tmp_path):
+    s = _preflight_session(tmp_path, which=lambda n: "/opt/bin/claude")
+    assert s.claude_bin == "/opt/bin/claude" and s.claude_bin_error is None
+    assert s._start_command("sid").split(" && ")[1].startswith("/opt/bin/claude ")
+
+
+def test_preflight_fails_loudly_when_claude_is_not_found(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(
+        "d_brain.services.claude_session._claude_fallback_paths", lambda: []
+    )
+    _onboarded(monkeypatch, tmp_path)
+    auth = _auth(True)
+    with caplog.at_level(logging.ERROR):
+        s = _preflight_session(tmp_path, which=lambda n: None, auth=auth)
+    assert s.claude_bin_error and "claude CLI not resolved" in caplog.text
+    assert "не найден" in s.preflight()
+    assert auth.calls == []  # nothing is even run
+
+
+def test_preflight_requires_completed_onboarding(tmp_path, monkeypatch):
+    _onboarded(monkeypatch, tmp_path, done=False)
+    s = _preflight_session(tmp_path)
+    assert "hasCompletedOnboarding" in s.preflight()
+    (Path.home() / ".claude.json").unlink()
+    assert "первичную настройку" in s.preflight()
+
+
+def test_preflight_reads_onboarding_from_claude_config_dir(tmp_path, monkeypatch):
+    _onboarded(monkeypatch, tmp_path, done=False)  # ~/.claude.json says no
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / ".claude.json").write_text(json.dumps({"hasCompletedOnboarding": True}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+    assert _preflight_session(tmp_path).preflight() is None
+
+
+def test_preflight_requires_claude_auth_status_logged_in(tmp_path, monkeypatch):
+    _onboarded(monkeypatch, tmp_path)
+    auth = _auth(True)
+    assert _preflight_session(tmp_path, auth=auth).preflight() is None
+    assert auth.calls == [["/opt/bin/claude", "auth", "status"]]
+
+    out = _preflight_session(tmp_path, auth=_auth(False, rc=1)).preflight()
+    assert "не авторизован" in out
+    out = _preflight_session(tmp_path, auth=_auth(None, rc=127)).preflight()
+    assert "кодом 127" in out
+
+
+def test_tmux_socket_flag_is_off_by_default_and_prefixes_every_call(tmp_path, clock):
+    fake = FakeTmux([READY], exists=False)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.calls and all(c[1] != "-L" for c in fake.calls)
+
+    seen: list[list[str]] = []
+
+    def runner(args, **kwargs):  # noqa: ANN001
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+
+    s2 = ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / ".dbrain2",
+        runner=runner,
+        tmux_socket="dbrain",
+    )
+    s2.is_healthy()
+    s2.capture_text()
+    s2.interrupt()
+    assert seen and all(c[:3] == ["tmux", "-L", "dbrain"] for c in seen)
+
+
+def test_runtime_passes_the_tmux_socket_only_when_configured(tmp_path, monkeypatch):
+    from d_brain.config import Settings
+    from d_brain.services import runtime as rt
+
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / "brain-system.md").write_text("# d-brain session contract\n")
+    base = dict(
+        telegram_bot_token="t",
+        deepgram_api_key="d",
+        vault_path=tmp_path / "vault",
+        runtime_dir=tmp_path / "rt",
+        brain_session_name="dbrain_x",
+    )
+    off = rt._build_session(
+        Settings(**base), session_name="dbrain_x", runtime_dir=tmp_path / "rt"
+    )
+    on = rt._build_session(
+        Settings(**base, tmux_socket="dbrain"),
+        session_name="dbrain_x",
+        runtime_dir=tmp_path / "rt",
+    )
+    assert off.tmux_socket is None and on.tmux_socket == "dbrain"
+
+
+def test_is_starting_reads_existing_state_only(tmp_path, clock):
+    fake = FakeTmux([READY], exists=False)
+    s = make_session(tmp_path, fake, clock)
+    assert s.is_starting() is False  # nobody holds the lock
+    with s._locked():
+        assert s.is_starting() is True  # lock held, no ready flag, no pane
+        s._ready_flag.write_text("ready\n")
+        assert s.is_starting() is False  # an ordinary turn
+
+
+def test_boot_standby_never_touches_the_live_sessions_files(tmp_path, clock):
+    fake = FakeTmux([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    s._session_id_file.write_text("old-sid\n")
+    s._ready_flag.write_text("ready\n")
+
+    standby = s.boot_standby()
+
+    assert standby.ok and standby.name == "dbrain_test_reset"
+    assert s._session_id_file.read_text() == "old-sid\n"
+    new = next(c for c in fake.calls if "new-session" in c)
+    assert new[new.index("-s") + 1] == "dbrain_test_reset"
+    # The live session was never killed, renamed or re-piped.
+    assert not any(
+        c[1] in ("kill-session", "rename-session", "pipe-pane") and "=dbrain_test:" in c
+        for c in fake.calls
+    )
+
+
+def _fake_claude(tmp_path, body: str) -> Path:
+    path = tmp_path / "fake-claude"
+    path.write_text(body)
+    path.chmod(0o755)
+    return path
+
+
+def _real_session(tmp_path, runner, claude_bin):
+    (tmp_path / "vault").mkdir(exist_ok=True)
+    return ClaudeSession(
+        session_name="dbrain_test",
+        work_dir=tmp_path / "vault",
+        runtime_dir=tmp_path / ".dbrain",
+        claude_bin=str(claude_bin),
+        runner=runner,
+        poll_interval=0.1,
+        paste_settle=0.0,
+        startup_timeout=10.0,
+    )
+
+
+def _sessions(runner) -> list[str]:
+    return runner(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+def test_swap_replaces_the_live_session_only_after_the_new_one_is_ready_real_tmux(
+    tmp_path, isolated_tmux
+):
+    """Real (isolated) tmux, fake `claude`: the standby boots next to the
+    live session, then takes its exact name; the cron sibling is untouched."""
+    claude = _fake_claude(
+        tmp_path, f"#!/bin/sh\nprintf '%s' '{READY}'\nexec sleep 600\n"
+    )
+    for name, cmd in (
+        ("dbrain_test_cron", "sleep 600"),
+        ("dbrain_test", "echo OLD; sleep 600"),
+    ):
+        isolated_tmux(
+            ["tmux", "new-session", "-d", "-s", name, cmd],
+            capture_output=True,
+            check=True,
+        )
+    s = _real_session(tmp_path, isolated_tmux, claude)
+
+    standby = s.boot_standby()
+    assert standby.ok, standby.detail
+    assert {"dbrain_test", "dbrain_test_reset", "dbrain_test_cron"} <= set(
+        _sessions(isolated_tmux)
+    )
+    swapped, why = s.promote_standby(standby)
+
+    assert swapped is True, why
+    assert sorted(_sessions(isolated_tmux)) == ["dbrain_test", "dbrain_test_cron"]
+    assert "OLD" not in s.capture_text()
+    assert s._session_id_file.read_text().strip() == standby.session_id
+    assert s._ready_flag.exists()
+    # remain-on-exit was switched off after the successful start.
+    shown = isolated_tmux(
+        ["tmux", "show-options", "-t", "=dbrain_test:", "-v", "remain-on-exit"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert shown in ("", "off")
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+def test_failed_standby_leaves_the_live_session_and_shows_the_real_error_real_tmux(
+    tmp_path, isolated_tmux
+):
+    """The incident shape: the CLI cannot start. remain-on-exit keeps the
+    pane long enough to read WHY; the standby is killed, the live one stays."""
+    claude = _fake_claude(
+        tmp_path, "#!/bin/sh\necho 'sh: 1: claude: not found' >&2\nexit 127\n"
+    )
+    isolated_tmux(
+        ["tmux", "new-session", "-d", "-s", "dbrain_test", "echo OLD; sleep 600"],
+        capture_output=True,
+        check=True,
+    )
+    s = _real_session(tmp_path, isolated_tmux, claude)
+    s._session_id_file.write_text("old-sid\n")
+
+    standby = s.boot_standby()
+
+    assert standby.ok is False
+    assert "claude: not found" in standby.detail
+    assert _sessions(isolated_tmux) == ["dbrain_test"]
+    assert "OLD" in s.capture_text()
+    assert s._session_id_file.read_text() == "old-sid\n"
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+def test_ensure_session_reports_the_real_start_error_and_leaves_no_dead_pane_real_tmux(
+    tmp_path, isolated_tmux
+):
+    """Item 9 on the ordinary (watchdog) create path: the error text reaches
+    the exception, and the dead pane is not left behind to look healthy."""
+    claude = _fake_claude(tmp_path, "#!/bin/sh\necho 'claude: not found'\nexit 127\n")
+    s = _real_session(tmp_path, isolated_tmux, claude)
+    with pytest.raises(RuntimeError, match="claude: not found"):
+        s.ensure_session()
+    assert s.is_healthy() is False

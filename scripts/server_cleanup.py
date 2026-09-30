@@ -113,14 +113,16 @@ def manage_protection(action: str, name: str | None) -> None:
 
 
 def idle_prompt(name: str) -> bool:
-    panes = command("tmux", "list-panes", "-t", name, "-F",
+    # `=name:` is an EXACT session target: a bare name falls back to a
+    # prefix match and can hit another session (e.g. `dbrain_x` for `db`).
+    panes = command("tmux", "list-panes", "-t", f"={name}:", "-F",
                     "#{pane_dead}\t#{pane_current_command}")
     if panes.returncode != 0 or len(panes.stdout.splitlines()) != 1:
         return False
     dead, current = panes.stdout.strip().split("\t", 1)
     if dead != "0" or current not in {"node", "codex", "claude"}:
         return False
-    capture = command("tmux", "capture-pane", "-p", "-t", name, "-S", "-60")
+    capture = command("tmux", "capture-pane", "-p", "-t", f"={name}:", "-S", "-60")
     if capture.returncode != 0:
         return False
     tail = capture.stdout.splitlines()[-30:]
@@ -516,7 +518,7 @@ def run_cleanup(dry_run: bool) -> dict:
         if not fresh or reason_to_skip(fresh, protected_sessions(), time.time()):
             report["skipped"][name] = "state changed before close"
             continue
-        result = command("tmux", "kill-session", "-t", name)
+        result = command("tmux", "kill-session", "-t", f"={name}:")
         if result.returncode == 0:
             report["closed"].append(name)
         else:

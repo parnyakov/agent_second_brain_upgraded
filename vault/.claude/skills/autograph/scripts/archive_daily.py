@@ -8,16 +8,23 @@ declutters the active daily/ folder. A note is archived ONLY when all hard
 gates pass — otherwise it's left alone and reported, never silently moved:
 
   1. age       — note's date is at least --days days in the past (default 30)
-  2. processed — the file ends with the `processed:` marker block that the
-                  daily pipeline writes after CAPTURE/EXECUTE/REFLECT
-                  (see .claude/rules/daily-format.md)
-  3. reflected — a system weekly reflection file exists for that ISO week
-                  (thoughts/reflections/YYYY-WNN-system-reflection.md)
+  2. processed — the file carries a `processed:` marker block written by the
+                  daily pipeline (see daily-format rule). The block is found
+                  ANYWHERE in the file, not only at the very end: entries
+                  that arrive after the evening run are appended below it,
+                  and some older blocks are not closed with `---`. The
+                  pipeline's `<!-- ✓ processed -->` comment also counts.
+  3. reflected — that ISO week has a weekly reflection in either of the two
+                  formats the vault actually uses:
+                  a) personal weekly reflection
+                     personal/reflection/<year>/<month>/Неделя N, DD.MM - DD.MM.md
+                     (date range in the file name covers the note's date;
+                     day may lack a leading zero, comma may be missing)
+                  b) system reflection
+                     thoughts/reflections/YYYY-WNN-system-reflection.md
 
-A softer, non-blocking check also looks for a personal weekly reflection
-covering that week (personal/reflection/**) — if none is found, the note
-still archives (that process is intentionally freeform/optional) but it's called out in the
-report so a human can decide whether to do that reflection first.
+If only (b) exists the note archives but is flagged in the report as having
+no personal reflection for that week.
 
 On archive, any reference elsewhere in the vault to `daily/YYYY-MM-DD`
 (wikilink or literal path, with or without .md) is rewritten to the new
@@ -36,7 +43,11 @@ from pathlib import Path
 from common import walk_vault, rel_path
 
 DAILY_NAME_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})\.md$')
-PROCESSED_MARKER_RE = re.compile(r'\n---\s*\nprocessed:\s*\S+.*?\n---\s*$', re.DOTALL)
+# `---` line followed by `processed: <timestamp>` anywhere in the file
+# (entries appended after the evening run sit below the block; some blocks
+# were never closed with `---`), or the pipeline's HTML-comment marker.
+PROCESSED_MARKER_RE = re.compile(r'(?:^|\n)---[ \t]*\nprocessed:[ \t]*\d{4}-\d{2}-\d{2}\S*')
+PROCESSED_COMMENT_RE = re.compile(r'<!--\s*✓\s*processed\b')
 
 
 def iso_week_reflection_path(vault_dir: Path, d: date) -> Path:
@@ -44,26 +55,52 @@ def iso_week_reflection_path(vault_dir: Path, d: date) -> Path:
     return vault_dir / 'thoughts' / 'reflections' / f'{iso_year}-W{iso_week:02d}-system-reflection.md'
 
 
-def personal_reflection_exists(vault_dir: Path, d: date) -> bool:
-    """Best-effort: does any personal/reflection/** file's name mention this
-    week's Mon/Sun day.month? Freeform naming, so this is advisory only."""
+PERSONAL_WEEK_RE = re.compile(
+    r'^Неделя\s+(?:\d+\s*,?\s*)?(\d{1,2})\.(\d{1,2})\s*-\s*(\d{1,2})\.(\d{1,2})'
+)
+
+
+def _personal_week_ranges(vault_dir: Path):
+    """Yield (start, end, path) for every personal weekly reflection file
+    named `Неделя N, D.MM - D.MM.md` under personal/reflection/<year>/."""
     refl_dir = vault_dir / 'personal' / 'reflection'
     if not refl_dir.is_dir():
-        return False
-    iso_year, iso_week, _ = d.isocalendar()
-    monday = date.fromisocalendar(iso_year, iso_week, 1)
-    sunday = date.fromisocalendar(iso_year, iso_week, 7)
-    monday_tag = monday.strftime('%d.%m')
-    sunday_tag = sunday.strftime('%d.%m')
+        return
     for f in refl_dir.rglob('*.md'):
-        name = f.name
-        if monday_tag in name or sunday_tag in name:
-            return True
-    return False
+        m = PERSONAL_WEEK_RE.match(f.stem)
+        if not m:
+            continue
+        year = next((int(p) for p in f.relative_to(refl_dir).parts[:-1]
+                     if p.isdigit() and len(p) == 4), None)
+        if year is None:
+            continue
+        d1, m1, d2, m2 = (int(x) for x in m.groups())
+        try:
+            if (m2, d2) < (m1, d1):  # week crosses New Year
+                # folder may be named after either the start or the end year
+                candidates = [(date(year, m1, d1), date(year + 1, m2, d2)),
+                              (date(year - 1, m1, d1), date(year, m2, d2))]
+            else:
+                candidates = [(date(year, m1, d1), date(year, m2, d2))]
+        except ValueError:
+            continue
+        for start, end in candidates:
+            yield start, end, f
+
+
+def personal_reflection_for(vault_dir: Path, d: date, _cache={}) -> Path | None:
+    """Personal weekly reflection file whose date range covers `d`, or None."""
+    key = str(vault_dir)
+    if key not in _cache:
+        _cache[key] = list(_personal_week_ranges(vault_dir))
+    for start, end, f in _cache[key]:
+        if start <= d <= end:
+            return f
+    return None
 
 
 def is_processed(content: str) -> bool:
-    return bool(PROCESSED_MARKER_RE.search(content))
+    return bool(PROCESSED_MARKER_RE.search(content) or PROCESSED_COMMENT_RE.search(content))
 
 
 def rewrite_references(vault_dir: Path, old_rel: str, new_rel: str) -> int:
@@ -110,11 +147,12 @@ def run(vault_dir: Path, days: int, dry_run: bool) -> None:
             continue
 
         refl_path = iso_week_reflection_path(vault_dir, d)
-        if not refl_path.exists():
+        personal = personal_reflection_for(vault_dir, d)
+        if personal is None and not refl_path.exists():
             skipped_unreflected.append((md.name, rel_path(refl_path, vault_dir)))
             continue
 
-        if not personal_reflection_exists(vault_dir, d):
+        if personal is None:
             flagged_no_personal.append(md.name)
 
         target_dir = daily_dir / 'archive' / f'{d.year:04d}-{d.month:02d}'
@@ -146,9 +184,9 @@ def run(vault_dir: Path, days: int, dry_run: bool) -> None:
     print(f"  skipped (not yet processed by daily pipeline): {len(skipped_unprocessed)}")
     for name in skipped_unprocessed:
         print(f"    {name}")
-    print(f"  skipped (week not yet system-reflected):        {len(skipped_unreflected)}")
+    print(f"  skipped (week has no weekly reflection):        {len(skipped_unreflected)}")
     for name, refl in skipped_unreflected:
-        print(f"    {name} (needs {refl})")
+        print(f"    {name} (needs personal/reflection/<year>/<month>/Неделя N, DD.MM - DD.MM.md or {refl})")
 
 
 def main():

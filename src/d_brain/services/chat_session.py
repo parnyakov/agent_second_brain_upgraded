@@ -9,12 +9,12 @@ the chat handlers don't need to change.
 """
 
 import asyncio
-import functools
 import html
 import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -171,6 +171,11 @@ _last_reset_ts = 0.0
 # One /reset at a time: a second one would kill the sessions the first is
 # still reading back.
 _reset_running = False
+# Wall-clock time of the last /reset that got past its checks — the input to
+# the cooldown (Settings.reset_cooldown_seconds). 2026-09-26: a second /reset
+# twenty minutes after the first killed the main session the watchdog had
+# just brought back.
+_last_reset_attempt = 0.0
 _HANDOFF_MAX = 10
 _HANDOFF_TEXT_CAP = 1500
 
@@ -182,6 +187,16 @@ class ResetOutcome:
     name: str  # "main" | "duty"
     ok: bool  # recreated AND read back as up and idle
     detail: str = ""
+    # Not ok, and the session that was running before /reset still runs —
+    # the new one never replaced it (create-then-swap).
+    kept_old: bool = False
+    # Not ok, and there was no old session to keep either.
+    old_missing: bool = False
+
+
+class ResetRefused(RuntimeError):
+    """/reset did not start — nothing was stopped or killed. The message is
+    the owner-facing reason."""
 
 # Stamp file (inside settings.duty_dir) holding the unix time of the last
 # duty turn — the input to the idle-reset decision.
@@ -1050,33 +1065,101 @@ class ChatSessionManager:
     def reset_in_progress() -> bool:
         return _reset_running
 
+    def _reset_targets(self) -> list[tuple[str, Any]]:
+        targets: list[tuple[str, Any]] = [("main", self._session)]
+        settings = self._config()
+        if settings is not None and getattr(settings, "duty_session_enabled", False):
+            duty = self._resolve_duty()
+            if duty is not None:
+                targets.append(("duty", duty))
+        return targets
+
+    def _reset_cooldown(self) -> float:
+        settings = self._config()
+        return float(getattr(settings, "reset_cooldown_seconds", 300.0) or 0.0)
+
+    @staticmethod
+    def _alive(session: Any) -> bool:
+        try:
+            return bool(session.is_healthy())
+        except Exception:  # noqa: BLE001 — unknown ⇒ not claimed alive
+            return False
+
+    def _refusal(self, reason: str) -> str:
+        if self._alive(self._session):
+            return f"Не перезапустил, текущая сессия работает, причина: {reason}."
+        return (
+            f"Не перезапустил, причина: {reason}. Текущей сессии сейчас нет — "
+            "её поднимет watchdog."
+        )
+
+    def reset_refusal(self) -> str | None:
+        """The quick reasons /reset must not start — cooldown, or the
+        watchdog creating the session right now — as owner-facing text, or
+        None. Blocking (tmux/lock probes): call it off the event loop."""
+        cooldown = self._reset_cooldown()
+        since = time.time() - _last_reset_attempt
+        if cooldown > 0 and since < cooldown:
+            wait = int(cooldown - since) + 1
+            return self._refusal(
+                f"предыдущий /reset был {int(since)} с назад, следующий можно "
+                f"через {wait} с"
+            )
+        for name, session in self._reset_targets():
+            starting = getattr(session, "is_starting", None)
+            try:
+                busy = bool(starting()) if starting is not None else False
+            except Exception:  # noqa: BLE001 — a probe must not block /reset
+                busy = False
+            if busy:
+                who = "основную" if name == "main" else "дежурную"
+                return self._refusal(f"watchdog прямо сейчас поднимает {who} сессию")
+        return None
+
+    def _preflight(self, targets: list[tuple[str, Any]]) -> str | None:
+        """Engine-specific environment check (ClaudeSession: CLI resolved,
+        onboarding done, `claude auth status` logged in; Codex: CLI resolved,
+        `codex login status` ok). Sessions of one engine share the
+        environment, so the first answer is the answer."""
+        for _name, session in targets:
+            check = getattr(session, "preflight", None)
+            if check is None:
+                continue
+            try:
+                return check()
+            except Exception as exc:  # noqa: BLE001 — a crashed check blocks
+                logger.warning("/reset: preflight crashed", exc_info=True)
+                return f"проверка окружения упала: {exc}"
+        return None
+
     async def circuit_reset(self, user_id: int) -> list[ResetOutcome]:
-        """Owner's /reset: stop the current turn and recreate the main and
-        duty sessions from scratch, then prove they are up and idle.
+        """Owner's /reset: replace the main (and duty) session with a fresh
+        one, and prove the result is up and idle. Raises ``ResetRefused``
+        when it did not start — then nothing was stopped or killed.
 
-        Built from the pieces that already exist, in this order:
-
-        1. every session is told to stop — ``request_abort`` (the Claude
-           driver: an ask() already running gives up at its next poll and
-           releases the pane lock) plus ``interrupt`` (Escape / SIGINT);
-        2. the process-wide ask-lock is taken (bounded wait), so the chat
-           queue cannot start its next turn between the restart and the
-           read-back and make a clean session look busy;
-        3. ``force_recover`` — the /relogin and watchdog primitive: kill and
-           recreate under the pane lock — retried until the stopped turn has
-           let go (``_RESET_RELEASE_WAIT``);
-        4. the watchdog's long-run marker is removed, so nothing keeps
-           reporting the old run as live;
-        5. read-back: healthy, no turn holding the lock, nothing active on
+        1. refusals: a /reset already running, the cooldown, the watchdog
+           creating the session right now (``reset_refusal``);
+        2. preflight for the ACTIVE engine (``_preflight``) — a failed one
+           touches nothing;
+        3. Claude (tmux): create-then-swap. A standby session is booted next
+           to the live one and must read back READY; only then is the
+           running turn stopped (``request_abort`` + ``interrupt``), the
+           ask-lock taken, and ``promote_standby`` kills the old session and
+           renames the standby into its place under the pane lock. A standby
+           that does not come up is killed and the old session is left
+           exactly as it was — including its running turn;
+        4. Codex (no pane; ``force_recover`` only kills a stray exec process
+           and keeps the thread): the turn is stopped, ``force_recover`` is
+           retried until the stopped turn lets go, and the thread is dropped
+           with ``/clear`` — a new process and a new conversation;
+        5. the watchdog's long-run marker is removed;
+        6. read-back: healthy, no turn holding the lock, nothing active on
            the pane. Only that is reported as ``ok``.
 
-        Engine-neutral: under Codex ``interrupt`` SIGINTs the exec process
-        and ``force_recover`` kills a stray one; the thread is then dropped
-        too, so both engines come back with a clean context (new process,
-        new conversation — the vault is untouched). ``request_abort`` does
-        not exist there and is skipped.
+        The watchdog's own ``force_recover`` (kill, then create) is not used
+        on the Claude path and is not changed by it.
         """
-        global _last_reset_ts, _reset_running  # noqa: PLW0603
+        global _reset_running  # noqa: PLW0603
         if _reset_running:
             raise RuntimeError("перезапуск уже идёт")
         _reset_running = True
@@ -1086,19 +1169,42 @@ class ChatSessionManager:
             _reset_running = False
 
     async def _circuit_reset(self, user_id: int) -> list[ResetOutcome]:
-        global _last_reset_ts  # noqa: PLW0603
-        _last_reset_ts = time.time()
+        global _last_reset_attempt  # noqa: PLW0603
         logger.warning("/reset requested by user %d", user_id)
-        targets: list[tuple[str, Any]] = [("main", self._session)]
-        settings = self._config()
-        if settings is not None and getattr(settings, "duty_session_enabled", False):
-            duty = self._resolve_duty()
-            if duty is not None:
-                targets.append(("duty", duty))
+        refusal = await asyncio.to_thread(self.reset_refusal)
+        if refusal:
+            logger.warning("/reset refused: %s", refusal)
+            raise ResetRefused(refusal)
+        targets = self._reset_targets()
+        reason = await asyncio.to_thread(self._preflight, targets)
+        if reason:
+            logger.warning("/reset refused by preflight: %s", reason)
+            raise ResetRefused(self._refusal(reason))
+        _last_reset_attempt = time.time()
+        swap = all(
+            hasattr(session, "boot_standby") and hasattr(session, "promote_standby")
+            for _name, session in targets
+        )
+        if swap:
+            outcomes = await self._swap_reset(targets)
+        else:
+            outcomes = await self._recover_reset(targets)
+        logger.warning(
+            "/reset done: %s",
+            ", ".join(f"{o.name}={'ok' if o.ok else o.detail}" for o in outcomes),
+        )
+        return outcomes
 
-        for _name, session in targets:
-            await asyncio.to_thread(self._stop_turn, session)
-
+    async def _holding_locks(
+        self,
+        targets: list[tuple[str, Any]],
+        work: Callable[[str, Any], ResetOutcome],
+    ) -> list[ResetOutcome]:
+        """Run ``work(name, session)`` for every target with the process
+        ask-lock held (bounded wait), and the duty lock around the duty
+        session — so neither the chat queue nor a duty turn can start
+        between the restart and the read-back and make a clean session look
+        busy. Then the watchdog's long-run marker is removed."""
         lock = get_ask_lock()
         try:
             await asyncio.wait_for(lock.acquire(), timeout=_RESET_RELEASE_WAIT)
@@ -1109,18 +1215,9 @@ class ChatSessionManager:
         try:
             outcomes = []
             for name, session in targets:
-                restart = functools.partial(
-                    self._restart_and_verify,
-                    name,
-                    session,
-                    drop_thread=self._engine() == "codex",
-                )
                 if name != "duty":
-                    outcomes.append(await asyncio.to_thread(restart))
+                    outcomes.append(await asyncio.to_thread(work, name, session))
                     continue
-                # The duty path serializes on this lock, not on the ask-lock:
-                # hold it too, so a duty turn cannot start between the
-                # restart and the read-back.
                 try:
                     await asyncio.wait_for(
                         self._duty_lock.acquire(), timeout=_RESET_RELEASE_WAIT
@@ -1129,7 +1226,7 @@ class ChatSessionManager:
                 except TimeoutError:
                     duty_held = False
                 try:
-                    outcomes.append(await asyncio.to_thread(restart))
+                    outcomes.append(await asyncio.to_thread(work, name, session))
                 finally:
                     if duty_held:
                         self._duty_lock.release()
@@ -1139,11 +1236,55 @@ class ChatSessionManager:
         finally:
             if held:
                 lock.release()
-        logger.warning(
-            "/reset done: %s",
-            ", ".join(f"{o.name}={'ok' if o.ok else o.detail}" for o in outcomes),
-        )
         return outcomes
+
+    async def _swap_reset(self, targets: list[tuple[str, Any]]) -> list[ResetOutcome]:
+        global _last_reset_ts  # noqa: PLW0603
+        standbys: dict[str, Any] = {}
+        failed: dict[str, ResetOutcome] = {}
+        for name, session in targets:
+            try:
+                standby = await asyncio.to_thread(session.boot_standby)
+            except Exception as exc:  # noqa: BLE001 — reported, not raised
+                logger.warning("/reset: %s standby failed", name, exc_info=True)
+                failed[name] = self._not_swapped(name, session, str(exc))
+                continue
+            if standby.ok:
+                standbys[name] = standby
+            else:
+                failed[name] = self._not_swapped(name, session, standby.detail)
+        swapping = [(n, s) for n, s in targets if n in standbys]
+        done: dict[str, ResetOutcome] = {}
+        if swapping:
+            # Only now, with a READY replacement in hand, is anything stopped.
+            _last_reset_ts = time.time()
+            for _name, session in swapping:
+                await asyncio.to_thread(self._stop_turn, session)
+            outcomes = await self._holding_locks(
+                swapping,
+                lambda name, session: self._swap_and_verify(
+                    name, session, standbys[name]
+                ),
+            )
+            done = {o.name: o for o in outcomes}
+        return [done.get(name) or failed[name] for name, _s in targets]
+
+    async def _recover_reset(
+        self, targets: list[tuple[str, Any]]
+    ) -> list[ResetOutcome]:
+        """The path for an engine without a pane to swap (Codex): stop,
+        recover, drop the thread, read back — as before create-then-swap."""
+        global _last_reset_ts  # noqa: PLW0603
+        _last_reset_ts = time.time()
+        for _name, session in targets:
+            await asyncio.to_thread(self._stop_turn, session)
+        drop = self._engine() == "codex"
+        return await self._holding_locks(
+            targets,
+            lambda name, session: self._restart_and_verify(
+                name, session, drop_thread=drop
+            ),
+        )
 
     @staticmethod
     def _stop_turn(session: Any) -> None:
@@ -1157,18 +1298,77 @@ class ChatSessionManager:
             except Exception:  # noqa: BLE001 — a failed stop must not stop /reset
                 logger.warning("/reset: %s failed", method, exc_info=True)
 
+    @classmethod
+    def _not_swapped(cls, name: str, session: Any, detail: str) -> ResetOutcome:
+        alive = cls._alive(session)
+        return ResetOutcome(
+            name,
+            False,
+            detail or "новая сессия не поднялась",
+            kept_old=alive,
+            old_missing=not alive,
+        )
+
+    @classmethod
+    def _swap_and_verify(
+        cls, name: str, session: Any, standby: Any
+    ) -> ResetOutcome:
+        """Blocking: swap a READY standby in (retrying while the stopped turn
+        still holds the pane lock), then read it back. A swap that cannot
+        happen kills the standby and leaves the old session running."""
+        deadline = time.monotonic() + _RESET_RELEASE_WAIT
+        while True:
+            try:
+                swapped, why = session.promote_standby(standby)
+            except Exception as exc:  # noqa: BLE001 — reported, not raised
+                logger.warning("/reset: %s swap failed", name, exc_info=True)
+                swapped, why = False, str(exc) or exc.__class__.__name__
+            if swapped is not None:
+                break
+            if time.monotonic() >= deadline:
+                swapped, why = False, "текущий ход так и не отпустил сессию"
+                break
+            # Whoever holds the pane now may be a turn that was only WAITING
+            # when /reset began (the pipeline, a queued ask) — stop it too.
+            cls._stop_turn(session)
+            time.sleep(_RESET_POLL_SECONDS)
+        if not swapped:
+            try:
+                session.discard_standby(standby.name)
+            except Exception:  # noqa: BLE001
+                logger.warning("/reset: could not discard standby", exc_info=True)
+            return cls._not_swapped(name, session, why)
+        return cls._read_back(name, session)
+
+    @staticmethod
+    def _read_back(name: str, session: Any) -> ResetOutcome:
+        deadline = time.monotonic() + _RESET_READBACK_WAIT
+        while True:
+            try:
+                if (
+                    session.is_healthy()
+                    and not session.is_turn_active()
+                    and not session.is_pane_turn_active()
+                ):
+                    return ResetOutcome(name, True)
+                detail = "после перезапуска сессия не выглядит свободной"
+            except Exception as exc:  # noqa: BLE001
+                detail = f"не удалось проверить сессию: {exc}"
+            if time.monotonic() >= deadline:
+                return ResetOutcome(name, False, detail)
+            time.sleep(_RESET_POLL_SECONDS)
+
     @staticmethod
     def _restart_and_verify(
         name: str, session: Any, *, drop_thread: bool = False
     ) -> ResetOutcome:
-        """Blocking: recreate one session, then read it back.
+        """Blocking: recreate one session, then read it back — the path for
+        an engine without a pane to swap (Codex).
 
-        Claude: ``force_recover`` kills the tmux session and starts a NEW
-        ``claude`` process with a new session id — a clean context by
-        construction. Codex: ``force_recover`` kills the exec process but
-        deliberately keeps the thread, so ``drop_thread`` also sends the
-        engine's ``/clear`` (forget ``thread_id``) — the next turn starts a
-        fresh thread in a fresh process."""
+        ``force_recover`` kills the exec process but deliberately keeps the
+        thread, so ``drop_thread`` also sends the engine's ``/clear`` (forget
+        ``thread_id``) — the next turn starts a fresh thread in a fresh
+        process."""
         deadline = time.monotonic() + _RESET_RELEASE_WAIT
         recovered = False
         error = ""
@@ -1195,21 +1395,7 @@ class ChatSessionManager:
             except Exception as exc:  # noqa: BLE001 — reported, not raised
                 logger.warning("/reset: %s thread drop failed", name, exc_info=True)
                 return ResetOutcome(name, False, f"контекст не сброшен: {exc}")
-        deadline = time.monotonic() + _RESET_READBACK_WAIT
-        while True:
-            try:
-                if (
-                    session.is_healthy()
-                    and not session.is_turn_active()
-                    and not session.is_pane_turn_active()
-                ):
-                    return ResetOutcome(name, True)
-                detail = "после перезапуска сессия не выглядит свободной"
-            except Exception as exc:  # noqa: BLE001
-                detail = f"не удалось проверить сессию: {exc}"
-            if time.monotonic() >= deadline:
-                return ResetOutcome(name, False, detail)
-            time.sleep(_RESET_POLL_SECONDS)
+        return ChatSessionManager._read_back(name, session)
 
     async def compact(self, user_id: int) -> str:
         """Durable-state-first: clearing is the compaction; memory lives in

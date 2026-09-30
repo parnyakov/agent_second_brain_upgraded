@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 import uuid
@@ -264,6 +265,86 @@ _TITLE_FIELDS = {
 }
 
 
+# /reset's create-then-swap (ChatSessionManager.circuit_reset): the new
+# session boots under ``<name>`` + this suffix, next to the old one, and only
+# replaces it once it has read back READY. The name still starts with the
+# bot's own ``dbrain_`` prefix, so the nightly server cleanup leaves it alone.
+STANDBY_SUFFIX = "_reset"
+# How long preflight gives `claude auth status` / `codex login status`.
+_PREFLIGHT_TIMEOUT = 30.0
+
+
+def tmux_argv(socket: str | None, *args: str) -> list[str]:
+    """The ONE place a tmux argv is built. ``socket`` (Settings.tmux_socket)
+    puts the bot on its own tmux server (``tmux -L <socket>``), so nothing
+    run against the default server — a human's sessions, a crash of that
+    server — can reach the bot's sessions, and the bot can never reach
+    anyone else's. Empty/None = the default server, today's behavior."""
+    return ["tmux", *(["-L", socket] if socket else []), *args]
+
+
+def _claude_fallback_paths() -> list[Path]:
+    """Where the Claude Code installer and nvm put the binary when it is not
+    on the unit's PATH (the 2026-09-26 incident: the bot's PATH had no nvm
+    dir, `claude` was "not found" and /reset killed the live brain)."""
+    home = Path.home()
+    nvm = sorted((home / ".nvm" / "versions" / "node").glob("*/bin/claude"))
+    return [
+        home / ".local" / "bin" / "claude",
+        home / ".claude" / "local" / "claude",
+        *nvm[::-1],
+    ]
+
+
+def resolve_claude_bin(
+    claude_bin: str, which_fn: Callable[[str], str | None] = shutil.which
+) -> tuple[str, str | None]:
+    """``(path, error)``: the absolute path of the CLI, or the name as given
+    plus a human-readable error when it cannot be found. An explicit path
+    (Settings.claude_bin) must exist and be executable; a bare name is looked
+    up on PATH, then — for the stock ``claude`` only — in the installer's
+    usual places."""
+    if os.sep in claude_bin:
+        path = Path(claude_bin).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path), None
+        return claude_bin, f"{claude_bin} не найден или не исполняемый"
+    found = which_fn(claude_bin)
+    if found:
+        return str(Path(found).absolute()), None
+    if claude_bin == "claude":
+        for path in _claude_fallback_paths():
+            if path.is_file() and os.access(path, os.X_OK):
+                logger.warning(
+                    "`claude` is not on PATH — using %s (set CLAUDE_BIN to pin it)",
+                    path,
+                )
+                return str(path), None
+    return claude_bin, f"`{claude_bin}` не найден в PATH ({os.environ.get('PATH', '')})"
+
+
+def claude_config_file() -> Path:
+    """The ``.claude.json`` the CLI reads: under ``$CLAUDE_CONFIG_DIR`` when
+    that is set (the systemd units set it) and the file exists there,
+    otherwise ``~/.claude.json``."""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        candidate = Path(config_dir).expanduser() / ".claude.json"
+        if candidate.exists():
+            return candidate
+    return Path.home() / ".claude.json"
+
+
+@dataclass(frozen=True)
+class Standby:
+    """A session booted next to the live one by ``boot_standby``."""
+
+    name: str
+    session_id: str
+    ok: bool
+    detail: str = ""
+
+
 def exact_target(session_name: str) -> str:
     """tmux ``-t`` value that matches ONLY ``session_name`` (its active pane).
 
@@ -324,6 +405,9 @@ class ClaudeSession:
         model: str | None = None,
         claude_bin: str = "claude",
         runner: Runner = subprocess.run,
+        cli_runner: Runner = subprocess.run,
+        which_fn: Callable[[str], str | None] = shutil.which,
+        tmux_socket: str | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         clock_fn: Callable[[], float] = time.monotonic,
         rid_factory: Callable[[], str] | None = None,
@@ -360,7 +444,26 @@ class ClaudeSession:
             Path(system_prompt_file) if system_prompt_file else None
         )
         self.model = model
-        self.claude_bin = claude_bin
+        # Resolved ONCE, to an absolute path: the tmux server starts the
+        # command with ITS environment, not ours, so a bare "claude" works
+        # only while both PATHs happen to contain it (2026-09-26: they did
+        # not). Not found is logged loudly and kept as an error for
+        # preflight(); the start path is left as it was, so the watchdog's
+        # recovery behaves exactly as before and the pane now shows why.
+        self.claude_bin, self.claude_bin_error = resolve_claude_bin(
+            claude_bin, which_fn
+        )
+        if self.claude_bin_error:
+            logger.error(
+                "claude CLI not resolved for %s: %s — sessions cannot start; "
+                "set CLAUDE_BIN or fix the unit's PATH",
+                session_name,
+                self.claude_bin_error,
+            )
+        self._cli_runner = cli_runner
+        # Settings.tmux_socket — see tmux_argv(). Every tmux call of this
+        # object goes through _tmux(), so this is the whole switch.
+        self.tmux_socket = tmux_socket or None
         self._runner = runner
         self._sleep = sleep_fn
         self._clock = clock_fn
@@ -495,7 +598,7 @@ class ClaudeSession:
         self, *args: str, input_text: str | None = None
     ) -> subprocess.CompletedProcess:
         proc = self._runner(
-            ["tmux", *args],
+            tmux_argv(self.tmux_socket, *args),
             capture_output=True,
             text=True,
             check=False,
@@ -511,6 +614,12 @@ class ClaudeSession:
         return proc
 
     def _capture(self) -> str:
+        # has-session first: a session that vanished is never addressed by
+        # capture-pane (tmux 3.2a crashed its WHOLE server on a display to a
+        # missing `=name` target on 2026-09-26). A missing session reads as
+        # an empty pane, exactly what the failed capture returned before.
+        if not self._session_exists():
+            return ""
         return self._tmux(
             "capture-pane", "-t", self._target, "-p", "-S", _CAPTURE_SCROLLBACK
         ).stdout
@@ -565,6 +674,140 @@ class ClaudeSession:
 
     def _send_enter(self) -> None:
         self._tmux("send-keys", "-t", self._target, "Enter")
+
+    # ── session creation (shared by _ensure_locked and boot_standby) ──
+
+    def _exists(self, name: str) -> bool:
+        return self._tmux("has-session", "-t", exact_target(name)).returncode == 0
+
+    def _pane_dead(self, name: str) -> bool:
+        """True iff the pane's command has exited (only observable while
+        remain-on-exit keeps the pane). Caller has checked has-session."""
+        out = self._tmux(
+            "display-message", "-p", "-t", exact_target(name), "#{pane_dead}"
+        ).stdout
+        return out.strip() == "1"
+
+    def _capture_named(self, name: str) -> str:
+        """capture-pane of an arbitrary session, has-session first: a pane
+        that may have vanished is never addressed blind (tmux 3.2a crashed
+        its whole server on a display to a missing session)."""
+        if not self._exists(name):
+            return ""
+        return self._tmux(
+            "capture-pane", "-t", exact_target(name), "-p", "-S", _CAPTURE_SCROLLBACK
+        ).stdout
+
+    def _pane_tail(self, name: str, lines: int = 8) -> str:
+        text = [ln for ln in self._capture_named(name).splitlines() if ln.strip()]
+        return "\n".join(text[-lines:])
+
+    def _create_session(self, name: str, session_id: str) -> None:
+        """``new-session`` for ``name`` running a fresh ``claude``.
+
+        ``remain-on-exit on`` is set in the SAME tmux invocation (``;``
+        chains commands inside one server round, before the server can
+        process the child's exit), so a command that dies instantly —
+        ``claude: not found`` — leaves its pane and the error text behind
+        instead of an empty tail. _wait_ready() turns it off again once the
+        session is READY."""
+        # R4 fix (Fable audit, verified live 2026-08-22 on the installed
+        # tmux 3.2a): history-limit is fixed at WINDOW CREATION time, and only
+        # `-g` (global default) applied BEFORE `new-session` is honored by a
+        # window created afterward. Bigger scrollback so long replies stay
+        # within capture range; global is safe here since this process is the
+        # only thing creating dbrain tmux sessions on this server.
+        self._tmux("set-option", "-g", "history-limit", "50000")
+        args = [
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-x",
+            self._pane_width,
+            "-y",
+            self._pane_height,
+            self._start_command(session_id),
+            ";",
+            "set-option",
+            "-t",
+            exact_target(name),
+            "remain-on-exit",
+            "on",
+        ]
+        # B4 fix: on a COLD start (no tmux server yet) the `-g set-option`
+        # above silently fails before any server exists to hold the global
+        # default, so `new-session` would fall back to tmux's own built-in
+        # history-limit (2000). `-f` on THIS SAME invocation makes tmux read
+        # deploy/tmux.conf (which sets the same `-g history-limit 50000`) as
+        # part of starting the new server — verified live to produce
+        # history_limit=50000 from cold. Harmless on a warm start: an
+        # already-running server ignores a client's `-f`.
+        if self.tmux_config is not None and self.tmux_config.exists():
+            self._tmux("-f", str(self.tmux_config), *args)
+        else:
+            if self.tmux_config is not None:
+                logger.warning(
+                    "tmux config %s not found — history-limit relies solely "
+                    "on the -g set-option above, which is a no-op on a cold "
+                    "tmux server",
+                    self.tmux_config,
+                )
+            self._tmux(*args)
+
+    def _wait_ready(self, name: str) -> tuple[bool, PaneState | None, str]:
+        """Drive a just-created session to READY (trust / bypass prompts
+        answered). ``(ok, last_state, detail)``; on failure ``detail`` holds
+        the pane's own last lines. A pane whose command EXITED is killed
+        here — with remain-on-exit it would otherwise stay "existing" and
+        read as a healthy session to has-session. A pane still running
+        after the deadline is left alone (a slow start is not a dead one).
+        remain-on-exit is switched off again on every non-dead outcome."""
+        target = exact_target(name)
+        deadline = self._clock() + self._startup_timeout
+        last_state: PaneState | None = None
+        while self._clock() < deadline:
+            if not self._exists(name):
+                return False, last_state, "сессия закрылась сразу после старта"
+            if self._pane_dead(name):
+                tail = self._pane_tail(name)
+                self._tmux("kill-session", "-t", target)
+                return False, last_state, f"процесс завершился при старте:\n{tail}"
+            cap = self._tmux(
+                "capture-pane", "-t", target, "-p", "-S", _CAPTURE_SCROLLBACK
+            ).stdout
+            state = classify_state(cap)
+            # Debounce: only Enter on the transition INTO the trust prompt,
+            # never on every poll (avoids stray blank submissions).
+            if state == PaneState.TRUST_PROMPT:
+                if last_state != PaneState.TRUST_PROMPT:
+                    self._tmux("send-keys", "-t", target, "Enter")
+                last_state = state
+                self._sleep(self._poll_interval)
+                continue
+            # Bypass-permissions accept screen (fresh config dir): unlike TRUST,
+            # the safe default ❯ sits on "1. No, exit", so we must actively pick
+            # "2. Yes, I accept". Debounced to the transition like TRUST.
+            if state == PaneState.BYPASS_PROMPT:
+                if last_state != PaneState.BYPASS_PROMPT:
+                    self._tmux("send-keys", "-t", target, "2")
+                    self._tmux("send-keys", "-t", target, "Enter")
+                last_state = state
+                self._sleep(self._poll_interval)
+                continue
+            if state == PaneState.READY:
+                self._tmux("set-option", "-t", target, "-u", "remain-on-exit")
+                return True, state, ""
+            last_state = state
+            self._sleep(self._poll_interval)
+        tail = self._pane_tail(name)
+        if self._exists(name):
+            if self._pane_dead(name):
+                self._tmux("kill-session", "-t", target)
+            else:
+                self._tmux("set-option", "-t", target, "-u", "remain-on-exit")
+        detail = f"не готова за {self._startup_timeout:.0f} с; pane tail:\n{tail}"
+        return False, last_state, detail
 
     # ── file locks ───────────────────────────────────────────────────
 
@@ -878,92 +1121,23 @@ class ClaudeSession:
                     f"({view!r}) and could be neither parked nor killed"
                 )
         self._ready_flag.unlink(missing_ok=True)
-        # R4 fix (Fable audit, verified live 2026-08-22 on the installed
-        # tmux 3.2a): history-limit is fixed at WINDOW CREATION time. The
-        # previous code set it via `set-option -t <session>` AFTER
-        # `new-session`, which is a silent no-op for the window just
-        # created — a throwaway session reproduced this exactly (the
-        # post-creation call left history_limit at tmux's own default,
-        # 2000, never 50000). Only `-g` (global default), applied BEFORE
-        # `new-session`, is honored by a window created afterward — verified
-        # the same way. Bigger scrollback so long replies stay within
-        # capture range; global is safe here since this process is the only
-        # thing creating dbrain tmux sessions.
-        self._tmux("set-option", "-g", "history-limit", "50000")
+        # (history-limit and the tmux.conf `-f` are applied in _create_session.)
         # R1 step 1: a brand-new `claude` process needs a brand-new pinned
         # session id — see _new_session_id's docstring for why this is only
         # done on THIS branch (session doesn't exist yet), never when an
         # existing tmux session is merely being re-attached to.
         session_id = self._new_session_id()
-        new_session_args = [
-            "new-session",
-            "-d",
-            "-s",
-            self.session_name,
-            "-x",
-            self._pane_width,
-            "-y",
-            self._pane_height,
-            self._start_command(session_id),
-        ]
-        # B4 fix: on a COLD start (no tmux server yet) the `-g set-option`
-        # above silently fails before any server exists to hold the global
-        # default, so `new-session` below would fall back to tmux's own
-        # built-in history-limit (2000) — see tmux_config's docstring in
-        # __init__ for the live-verified repro. `-f` on THIS SAME invocation
-        # makes tmux read deploy/tmux.conf (which sets the same `-g
-        # history-limit 50000`) as part of starting the new server, before
-        # the session is created — verified live to produce history_limit
-        # =50000 from cold. Harmless on a warm start: an already-running
-        # server ignores a client's `-f`, since config files are only read
-        # at server startup — so the `-g set-option` above remains the
-        # thing actually doing the work in that (more common) case.
-        if self.tmux_config is not None and self.tmux_config.exists():
-            self._tmux("-f", str(self.tmux_config), *new_session_args)
-        else:
-            if self.tmux_config is not None:
-                logger.warning(
-                    "tmux config %s not found — history-limit relies solely "
-                    "on the -g set-option above, which is a no-op on a cold "
-                    "tmux server",
-                    self.tmux_config,
-                )
-            self._tmux(*new_session_args)
+        self._create_session(self.session_name, session_id)
         self._attach_pipe()
 
-        deadline = self._clock() + self._startup_timeout
-        last_state: PaneState | None = None
-        while self._clock() < deadline:
-            cap = self._capture()
-            state = classify_state(cap)
-            # Debounce: only Enter on the transition INTO the trust prompt,
-            # never on every poll (avoids stray blank submissions).
-            if state == PaneState.TRUST_PROMPT:
-                if last_state != PaneState.TRUST_PROMPT:
-                    self._send_enter()
-                last_state = state
-                self._sleep(self._poll_interval)
-                continue
-            # Bypass-permissions accept screen (fresh config dir): unlike TRUST,
-            # the safe default ❯ sits on "1. No, exit", so we must actively pick
-            # "2. Yes, I accept". Debounced to the transition like TRUST.
-            if state == PaneState.BYPASS_PROMPT:
-                if last_state != PaneState.BYPASS_PROMPT:
-                    self._tmux("send-keys", "-t", self._target, "2")
-                    self._send_enter()
-                last_state = state
-                self._sleep(self._poll_interval)
-                continue
-            if state == PaneState.READY:
-                self._ready_flag.write_text("ready\n")
-                logger.info("Claude session %s is ready", self.session_name)
-                return None
-            last_state = state
-            self._sleep(self._poll_interval)
+        ok, last_state, detail = self._wait_ready(self.session_name)
+        if ok:
+            self._ready_flag.write_text("ready\n")
+            logger.info("Claude session %s is ready", self.session_name)
+            return None
         raise RuntimeError(
             f"session {self.session_name} not ready in {self._startup_timeout}s; "
-            f"last state={last_state}; pane tail:\n"
-            + "\n".join(self._capture().splitlines()[-8:])
+            f"last state={last_state}; {detail}"
         )
 
     def _attach_pipe(self) -> None:
@@ -1668,6 +1842,148 @@ class ClaudeSession:
             self._inflight.unlink(missing_ok=True)
             self._ensure_locked()
             return True
+
+    # ── /reset: preflight + create-then-swap ─────────────────────────
+    #
+    # force_recover() above stays the watchdog's primitive (kill, then
+    # create). /reset must never do it in that order: on 2026-09-26 the CLI
+    # could not start (the bot's PATH had no `claude`), and every /reset
+    # killed a working brain and left nothing in its place. The /reset path
+    # therefore checks the environment first, boots the new session NEXT TO
+    # the old one, and only swaps once the new one reads back READY.
+
+    def preflight(self) -> str | None:
+        """Can a fresh session start at all? ``None`` = yes, else the reason
+        (Russian, for the owner). Read-only: touches no session."""
+        if self.claude_bin_error:
+            return f"не найден Claude Code: {self.claude_bin_error}"
+        config = claude_config_file()
+        try:
+            data = json.loads(config.read_text())
+        except FileNotFoundError:
+            return f"нет {config} — Claude Code не прошёл первичную настройку"
+        except (OSError, ValueError) as exc:
+            return f"не читается {config}: {exc}"
+        if not (isinstance(data, dict) and data.get("hasCompletedOnboarding")):
+            return (
+                f"в {config} нет hasCompletedOnboarding — новая сессия "
+                "остановится на экране первичной настройки"
+            )
+        try:
+            proc = self._cli_runner(
+                [self.claude_bin, "auth", "status"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_PREFLIGHT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return f"`claude auth status` не ответил за {_PREFLIGHT_TIMEOUT:.0f} с"
+        except OSError as exc:
+            return f"Claude Code не запускается: {exc}"
+        try:
+            info = json.loads(proc.stdout or "")
+        except ValueError:
+            info = None
+        if isinstance(info, dict) and "loggedIn" in info:
+            if info["loggedIn"] is True:
+                return None
+            return "Claude Code не авторизован (нужен dbrain login)"
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+            return (
+                f"`claude auth status` завершился с кодом {proc.returncode}"
+                + (f": {err[0]}" if err else "")
+            )
+        logger.warning("claude auth status: unrecognised output — treated as ok")
+        return None
+
+    def is_starting(self) -> bool:
+        """True while someone (the watchdog's force_recover, a first ask())
+        is creating this session right now: the pane lock is held, the
+        ready flag is gone, and the pane is missing or still booting. Read
+        from existing state only; never blocks."""
+        if self._ready_flag.exists() or not self.is_turn_active():
+            return False
+        if not self._session_exists():
+            return True
+        state = classify_state(self._capture())
+        return state in (
+            PaneState.STARTING,
+            PaneState.TRUST_PROMPT,
+            PaneState.BYPASS_PROMPT,
+            PaneState.UNKNOWN,
+        )
+
+    def standby_name(self) -> str:
+        return f"{self.session_name}{STANDBY_SUFFIX}"
+
+    def boot_standby(self) -> Standby:
+        """Create a fresh session under ``standby_name()`` next to the live
+        one and wait for it to read back READY. Takes NO pane lock and
+        touches none of the live session's files (session_id, pane.log,
+        ready flag): until promote_standby() the live session is exactly as
+        it was. A failed standby is killed here."""
+        name = self.standby_name()
+        if self._exists(name):  # left over from an interrupted /reset
+            self._tmux("kill-session", "-t", exact_target(name))
+        session_id = str(uuid.uuid4())
+        self._create_session(name, session_id)
+        ok, last_state, detail = self._wait_ready(name)
+        if not ok:
+            self.discard_standby(name)
+            logger.warning("standby %s did not come up: %s", name, detail)
+            return Standby(name, session_id, False, detail or f"state={last_state}")
+        logger.info("standby %s is ready", name)
+        return Standby(name, session_id, True)
+
+    def discard_standby(self, name: str | None = None) -> None:
+        """Kill the standby by its exact name, if it exists. Never the live
+        session: the name always carries STANDBY_SUFFIX."""
+        name = name or self.standby_name()
+        if not name.endswith(STANDBY_SUFFIX):
+            raise ValueError(f"not a standby session name: {name!r}")
+        if self._exists(name):
+            self._tmux("kill-session", "-t", exact_target(name))
+
+    def promote_standby(self, standby: Standby) -> tuple[bool | None, str]:
+        """Swap a READY standby in for the live session, under the pane lock
+        (non-blocking). Returns ``(None, "")`` when a turn still holds the
+        lock (the caller stops it and retries), ``(True, "")`` on success,
+        ``(False, reason)`` when the swap did not happen — then the live
+        session, if there was one, is untouched."""
+        with self._locked(blocking=False) as got:
+            if not got:
+                return None, ""
+            if not self._exists(standby.name):
+                return False, "новая сессия пропала до переключения"
+            if self._session_exists():
+                self._tmux("kill-session", "-t", self._target)
+                if self._session_exists():
+                    self.discard_standby(standby.name)
+                    return False, "старую сессию не удалось закрыть"
+            renamed = self._tmux(
+                "rename-session", "-t", exact_target(standby.name), self.session_name
+            )
+            if renamed.returncode != 0:
+                # The old one is already gone: never leave nothing behind.
+                self.discard_standby(standby.name)
+                self._ready_flag.unlink(missing_ok=True)
+                self._inflight.unlink(missing_ok=True)
+                try:
+                    self._ensure_locked()
+                except Exception as exc:  # noqa: BLE001 — reported
+                    return False, f"переименование не удалось, пересоздание тоже: {exc}"
+                return True, ""
+            if not self._atomic_write(self._session_id_file, standby.session_id + "\n"):
+                logger.error("could not persist swapped-in session id")
+            self._inflight.unlink(missing_ok=True)
+            self._attach_pipe()
+            self._ready_flag.write_text("ready\n")
+            logger.warning(
+                "/reset: %s swapped in as %s", standby.name, self.session_name
+            )
+            return True, ""
 
     def nudge(self, text: str = "Continue") -> bool:
         """Type a neutral prompt into an idle-but-parked session.

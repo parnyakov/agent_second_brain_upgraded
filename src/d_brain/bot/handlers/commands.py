@@ -2,6 +2,7 @@
 /relogin, /reset."""
 
 import asyncio
+import html
 import logging
 from datetime import date
 
@@ -12,7 +13,11 @@ from aiogram.types import Message
 from d_brain.bot.handlers import chat
 from d_brain.config import get_settings
 from d_brain.services import chat_queue
-from d_brain.services.chat_session import ChatSessionManager, ResetOutcome
+from d_brain.services.chat_session import (
+    ChatSessionManager,
+    ResetOutcome,
+    ResetRefused,
+)
 from d_brain.services.session import SessionStore
 from d_brain.services.storage import VaultStorage
 
@@ -191,20 +196,52 @@ async def cmd_relogin(message: Message) -> None:
 _RESET_NAMES = {"main": "основная", "duty": "дежурная"}
 
 
+def _reset_line(o: ResetOutcome) -> str:
+    name = _RESET_NAMES.get(o.name, o.name)
+    detail = html.escape(o.detail)
+    if o.ok:
+        return f"• {name} сессия — пересоздана и свободна"
+    if o.kept_old:
+        return f"• {name} сессия — не перезапустил, текущая работает. Причина: {detail}"
+    if o.old_missing:
+        after = (
+            "восстановление передал watchdog"
+            if o.name == "main"
+            else "поднимется при следующем обращении"
+        )
+        return (
+            f"• {name} сессия — новая не поднялась ({detail}), старой не было; "
+            f"{after}"
+        )
+    return f"• {name} сессия — не поднялась ({detail})"
+
+
 def reset_report(
     outcomes: list[ResetOutcome], waiting: int, handoff: int = 0
 ) -> str:
     """The /reset reply. "всё чисто" only when EVERY session read back as
-    up and idle — anything else names what did not come back."""
+    up and idle — anything else names what did not come back and whether the
+    old session still runs. Never asks to repeat /reset: a failed swap left
+    the working session in place, and repeating is what killed it on
+    2026-09-26."""
     failed = [o for o in outcomes if not o.ok]
     if failed:
-        lines = ["⚠️ Перезапуск прошёл не до конца:"]
-        for o in outcomes:
-            name = _RESET_NAMES.get(o.name, o.name)
-            state = "поднята и свободна" if o.ok else f"не поднялась ({o.detail})"
-            lines.append(f"• {name} сессия — {state}")
-        lines.append("Попробуй /reset ещё раз через минуту.")
-        text = "\n".join(lines)
+        main = next((o for o in outcomes if o.name == "main"), None)
+        if len(outcomes) == 1 and main is not None and main.kept_old:
+            text = (
+                "Не перезапустил, текущая сессия работает, причина: "
+                f"{html.escape(main.detail)}"
+            )
+        elif len(outcomes) == 1 and main is not None and main.old_missing:
+            text = (
+                f"Не перезапустил: новая сессия не поднялась "
+                f"({html.escape(main.detail)}), а старой не было. "
+                "Восстановление передал watchdog."
+            )
+        else:
+            lines = ["⚠️ Перезапуск прошёл не до конца:"]
+            lines += [_reset_line(o) for o in outcomes]
+            text = "\n".join(lines)
     else:
         text = (
             "🔌 Перезапущено, всё чисто: текущий ход прерван, сессии "
@@ -229,10 +266,12 @@ async def cmd_reset(message: Message) -> None:
     """Circuit breaker for a session that is stuck or falsely "busy".
 
     Like /relogin it never goes through the brain — the brain may be what
-    is broken. Unlike /relogin it does not give up when a turn holds the
-    session: it stops that turn first (ChatSessionManager.circuit_reset).
-    Uses the chat handler's own manager, so the duty lock it holds during
-    the duty restart is the same one the duty path takes.
+    is broken. It checks first (cooldown, the watchdog mid-recovery, the
+    engine's preflight) and refuses without touching anything; on the Claude
+    engine the new session is created and verified BEFORE the old one is
+    replaced (ChatSessionManager.circuit_reset). Uses the chat handler's own
+    manager, so the duty lock it holds during the duty restart is the same
+    one the duty path takes.
     """
     if not message.from_user:
         return
@@ -242,12 +281,22 @@ async def cmd_reset(message: Message) -> None:
     if manager.reset_in_progress():
         await message.answer("🔌 Перезапуск уже идёт — дождись его отчёта.")
         return
-    await message.answer("🔌 Перезапускаю: прерываю текущий ход и пересоздаю сессии…")
+    refusal = await asyncio.to_thread(manager.reset_refusal)
+    if refusal:
+        await message.answer(html.escape(refusal))
+        return
+    await message.answer(
+        "🔌 Перезапускаю: проверяю окружение, поднимаю новую сессию рядом со "
+        "старой и переключаю только после проверки…"
+    )
     try:
         outcomes = await manager.circuit_reset(message.from_user.id)
+    except ResetRefused as exc:
+        await message.answer(html.escape(str(exc)))
+        return
     except Exception as exc:  # noqa: BLE001 — the owner must get an answer
         logger.exception("/reset failed")
-        await message.answer(f"❌ Перезапуск не удался: {exc}")
+        await message.answer(f"❌ Перезапуск не удался: {html.escape(str(exc))}")
         return
     queue = chat_queue.current()
     waiting = 0

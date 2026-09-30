@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from d_brain import logsafe
+from d_brain.log_redact import quiet_http_logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,10 +12,8 @@ logging.basicConfig(
 )
 logsafe.install()
 
-# httpx logs every request URL at INFO, and a Telegram Bot API URL
-# carries the bot token — keep it out of the journal / log files.
-for _name in ("httpx", "httpcore"):
-    logging.getLogger(_name).setLevel(logging.WARNING)
+# A Telegram Bot API URL carries the bot token — keep it out of logs.
+quiet_http_logging()
 
 logger = logging.getLogger(__name__)
 

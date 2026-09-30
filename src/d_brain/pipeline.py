@@ -31,12 +31,11 @@ def run(cmd: str, proc: Any) -> tuple[str, bool]:
 def main() -> None:  # pragma: no cover
     logging.basicConfig(level=logging.INFO)
     from d_brain import logsafe
+    from d_brain.log_redact import quiet_http_logging
 
     logsafe.install()
-    # httpx logs every request URL at INFO, and a Telegram Bot API URL
-    # carries the bot token — keep it out of the journal / log files.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    # A Telegram Bot API URL carries the bot token — keep it out of logs.
+    quiet_http_logging()
     from d_brain.config import get_settings
     from d_brain.services.runtime import get_processor
 

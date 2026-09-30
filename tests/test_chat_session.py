@@ -1,6 +1,7 @@
 """Tests for ChatSessionManager — chat messages routed to the shared session."""
 
 import asyncio
+import subprocess
 
 import pytest
 
@@ -920,6 +921,14 @@ def test_injected_main_session_never_auto_resolves_a_real_duty_session(tmp_path)
 # ── /reset: circuit_reset ────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _no_reset_cooldown_carryover(monkeypatch):
+    """The cooldown stamp is process-global; every test starts without one."""
+    from d_brain.services import chat_session
+
+    monkeypatch.setattr(chat_session, "_last_reset_attempt", 0.0)
+
+
 class ResetFake(FakeSession):
     """A session that is 'stuck' until force_recover succeeds."""
 
@@ -1083,6 +1092,7 @@ def test_circuit_reset_under_codex_also_drops_the_thread(tmp_path, monkeypatch):
     assert main.controls == ["/clear"] and duty.controls == ["/clear"]
 
     # Claude: the recreated process already has a new session id — no /clear.
+    monkeypatch.setattr(chat_session, "_last_reset_attempt", 0.0)  # cooldown
     main2, duty2 = ResetFake(), ResetFake()
     m2 = ChatSessionManager(
         tmp_path, session=main2, health_dir=tmp_path, duty_session=duty2
@@ -1107,6 +1117,8 @@ def _real_codex(tmp_path, name):
         sleep_fn=lambda _s: None,
         poll_interval=0.001,
         interrupt_grace=0.0,
+        # /reset's preflight runs `codex login status`: logged in.
+        cli_runner=lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""),
     )
 
 
@@ -1226,3 +1238,251 @@ def test_a_second_reset_while_one_runs_is_refused(tmp_path, monkeypatch):
     assert m.reset_in_progress() is True
     with pytest.raises(RuntimeError):
         asyncio.run(m.circuit_reset(1))
+
+
+# ── /reset: preflight, create-then-swap, cooldown (2026-09-26 incident) ──
+
+
+class SwapFake(ResetFake):
+    """A Claude-shaped session with the create-then-swap surface. Records
+    every step in ``events`` so a test can prove what was (not) touched."""
+
+    def __init__(
+        self,
+        *,
+        preflight: str | None = None,
+        standby_ok: bool = True,
+        standby_detail: str = "",
+        alive: bool = True,
+        locked_polls: int = 0,
+        starting: bool = False,
+    ):
+        super().__init__()
+        self.preflight_reason = preflight
+        self.standby_ok = standby_ok
+        self.standby_detail = standby_detail
+        self.alive = alive  # the OLD session exists
+        self.locked_polls = locked_polls
+        self.starting = starting
+
+    def preflight(self):
+        self.events.append("preflight")
+        return self.preflight_reason
+
+    def is_starting(self):
+        return self.starting
+
+    def boot_standby(self):
+        from d_brain.services.claude_session import Standby
+
+        self.events.append("boot")
+        return Standby("x_reset", "sid-new", self.standby_ok, self.standby_detail)
+
+    def promote_standby(self, standby):
+        if self.locked_polls > 0:
+            self.locked_polls -= 1
+            self.events.append("promote-locked")
+            return None, ""
+        self.events.append("promote")
+        self.alive = True
+        return True, ""
+
+    def discard_standby(self, name=None):
+        self.events.append("discard")
+
+    def force_recover(self):  # must never be used on the swap path
+        self.events.append("KILL-force_recover")
+        return True
+
+    def is_healthy(self):
+        return self.alive
+
+
+def _swap_manager(tmp_path, monkeypatch, main, duty=None, **over):
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ChatSessionManager
+
+    monkeypatch.setattr(chat_session, "_RESET_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(chat_session, "_RESET_RELEASE_WAIT", 0.2)
+    monkeypatch.setattr(chat_session, "_RESET_READBACK_WAIT", 0.0)
+    m = ChatSessionManager(
+        tmp_path, session=main, health_dir=tmp_path, duty_session=duty
+    )
+    if duty is None:
+        over.setdefault("duty_session_enabled", False)
+    m._settings = _duty_settings(tmp_path, **over)
+    return m
+
+
+def test_reset_preflight_failure_touches_nothing(tmp_path, monkeypatch):
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ResetRefused
+
+    main = SwapFake(preflight="не найден Claude Code: `claude` не найден в PATH")
+    duty = SwapFake()
+    m = _swap_manager(tmp_path, monkeypatch, main, duty)
+    cut_short_before = chat_session._last_reset_ts
+
+    with pytest.raises(ResetRefused) as err:
+        asyncio.run(m.circuit_reset(1))
+
+    text = str(err.value)
+    assert text.startswith("Не перезапустил, текущая сессия работает, причина:")
+    assert "claude" in text and "ещё раз" not in text
+    # Nothing was stopped, booted, swapped or killed — on either session.
+    assert main.events == ["preflight"]
+    assert duty.events == []
+    # A refused /reset arms no cooldown and marks no turn as "cut short".
+    assert chat_session._last_reset_attempt == 0.0
+    assert chat_session._last_reset_ts == cut_short_before
+
+
+def test_reset_failed_swap_keeps_the_old_session_and_its_turn(tmp_path, monkeypatch):
+    from d_brain.bot.handlers.commands import reset_report
+
+    main = SwapFake(
+        standby_ok=False,
+        standby_detail="процесс завершился при старте:\nclaude: not found",
+    )
+    m = _swap_manager(tmp_path, monkeypatch, main)
+
+    (outcome,) = asyncio.run(m.circuit_reset(1))
+
+    assert outcome.ok is False and outcome.kept_old is True
+    assert "claude: not found" in outcome.detail
+    # Only the standby was booted; the running turn was never stopped and the
+    # old session never killed or swapped.
+    assert main.events == ["preflight", "boot"]
+    report = reset_report([outcome], 0)
+    assert report.startswith("Не перезапустил, текущая сессия работает, причина:")
+    assert "ещё раз" not in report and "через минуту" not in report
+
+
+def test_reset_failed_swap_without_an_old_session_hands_over_to_watchdog(
+    tmp_path, monkeypatch
+):
+    from d_brain.bot.handlers.commands import reset_report
+
+    main = SwapFake(standby_ok=False, standby_detail="не готова", alive=False)
+    m = _swap_manager(tmp_path, monkeypatch, main)
+
+    (outcome,) = asyncio.run(m.circuit_reset(1))
+
+    assert outcome.ok is False and outcome.old_missing is True
+    report = reset_report([outcome], 0)
+    assert "старой не было" in report and "watchdog" in report
+    assert "ещё раз" not in report
+
+
+def test_reset_successful_swap_boots_first_then_stops_then_swaps(
+    tmp_path, monkeypatch
+):
+    from d_brain.services import chat_session, long_run
+
+    main = SwapFake(locked_polls=2)  # the stopped turn lets go on the 3rd try
+    duty = SwapFake()
+    _fresh_long_run(tmp_path)
+    m = _swap_manager(tmp_path, monkeypatch, main, duty)
+
+    outcomes = asyncio.run(m.circuit_reset(1))
+
+    assert [(o.name, o.ok) for o in outcomes] == [("main", True), ("duty", True)]
+    assert main.events == [
+        "preflight",
+        "boot",  # the new session is READY before anything is stopped
+        "abort", "interrupt",
+        "promote-locked", "abort", "interrupt",
+        "promote-locked", "abort", "interrupt",
+        "promote",
+    ]
+    assert duty.events == ["boot", "abort", "interrupt", "promote"]
+    assert not any("KILL" in e for e in main.events + duty.events)
+    assert long_run.read(tmp_path).since == 0.0
+    assert chat_session._last_reset_attempt > 0
+
+
+def test_reset_swap_that_never_gets_the_pane_discards_the_standby(
+    tmp_path, monkeypatch
+):
+    main = SwapFake(locked_polls=10**6)
+    m = _swap_manager(tmp_path, monkeypatch, main)
+
+    (outcome,) = asyncio.run(m.circuit_reset(1))
+
+    assert outcome.ok is False and outcome.kept_old is True
+    assert main.events[-1] == "discard"
+    assert "promote" not in main.events
+
+
+def test_reset_cooldown_refuses_a_second_reset(tmp_path, monkeypatch):
+    from d_brain.services import chat_session
+    from d_brain.services.chat_session import ResetRefused
+
+    main = SwapFake()
+    m = _swap_manager(tmp_path, monkeypatch, main, reset_cooldown_seconds=300.0)
+    asyncio.run(m.circuit_reset(1))
+    events = list(main.events)
+
+    assert "предыдущий /reset" in (m.reset_refusal() or "")
+    with pytest.raises(ResetRefused, match="следующий можно через"):
+        asyncio.run(m.circuit_reset(1))
+    assert main.events == events  # the refused one touched nothing
+
+    # Past the cooldown it runs again.
+    monkeypatch.setattr(
+        chat_session, "_last_reset_attempt", chat_session._last_reset_attempt - 301
+    )
+    assert m.reset_refusal() is None
+    asyncio.run(m.circuit_reset(1))
+    assert main.events.count("promote") == 2
+
+
+def test_reset_cooldown_is_configurable_and_zero_disables_it(tmp_path, monkeypatch):
+    main = SwapFake()
+    m = _swap_manager(tmp_path, monkeypatch, main, reset_cooldown_seconds=0.0)
+    asyncio.run(m.circuit_reset(1))
+    asyncio.run(m.circuit_reset(1))
+    assert main.events.count("promote") == 2
+
+
+def test_reset_is_refused_while_the_watchdog_is_bringing_the_session_up(
+    tmp_path, monkeypatch
+):
+    from d_brain.services.chat_session import ResetRefused
+
+    main = SwapFake(starting=True, alive=False)
+    m = _swap_manager(tmp_path, monkeypatch, main)
+    with pytest.raises(ResetRefused, match="watchdog прямо сейчас поднимает"):
+        asyncio.run(m.circuit_reset(1))
+    assert main.events == []
+
+
+def test_reset_on_codex_runs_the_codex_preflight_not_claude_auth(
+    tmp_path, monkeypatch
+):
+    """Engine switch must not break /reset: under Codex the preflight is
+    `codex login status`; nothing asks for `claude`. A failed one refuses
+    and leaves the thread (the conversation) alone."""
+    from d_brain.services.chat_session import ChatSessionManager, ResetRefused
+
+    monkeypatch.setattr(
+        "d_brain.services.codex_driver.shutil.which", lambda n: f"/usr/bin/{n}"
+    )
+    calls = []
+
+    def logged_out(args, **kw):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 1, "", "Not logged in")
+
+    main = _real_codex(tmp_path, "main")
+    main._cli_runner = logged_out
+    main._atomic_write(main._thread_file, "thread-old\n")
+    m = ChatSessionManager(tmp_path, session=main, health_dir=tmp_path)
+    m._settings = _duty_settings(
+        tmp_path, chat_engine="codex", duty_session_enabled=False
+    )
+
+    with pytest.raises(ResetRefused, match="Codex не авторизован"):
+        asyncio.run(m.circuit_reset(1))
+    assert calls == [["/usr/bin/codex", "login", "status"]]
+    assert main._thread_file.read_text() == "thread-old\n"

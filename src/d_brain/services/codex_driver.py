@@ -269,6 +269,7 @@ class CodexExecDriver:
         codex_bin: str = "codex",
         codex_home: Path | None = None,
         popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+        cli_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         sleep_fn: Callable[[float], None] = time.sleep,
         clock_fn: Callable[[], float] = time.monotonic,
         rid_factory: Callable[[], str] | None = None,
@@ -296,6 +297,7 @@ class CodexExecDriver:
         self.codex_bin = codex_bin
         self.codex_home = Path(codex_home) if codex_home else None
         self._popen = popen
+        self._cli_runner = cli_runner
         self._sleep = sleep_fn
         self._clock = clock_fn
         self._rid_factory = rid_factory or (lambda: uuid.uuid4().hex[:8])
@@ -496,6 +498,33 @@ class CodexExecDriver:
                 f"codex instructions file missing: {self.instructions_file} — "
                 "refusing to start a personality-less brain"
             )
+
+    def preflight(self) -> str | None:
+        """/reset's pre-check for THIS engine: can a turn start at all?
+        ``None`` = yes, else the reason. The CLI must resolve and
+        ``codex login status`` must succeed. Nothing Claude-specific is
+        checked here — on Codex there is no ``claude`` to find or log in."""
+        path = shutil.which(self.codex_bin)
+        if path is None:
+            return f"не найден Codex CLI (`{self.codex_bin}` не в PATH)"
+        try:
+            proc = self._cli_runner(
+                [path, "login", "status"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return "`codex login status` не ответил за 30 с"
+        except OSError as exc:
+            return f"Codex CLI не запускается: {exc}"
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+            return "Codex не авторизован или не запускается" + (
+                f": {err[0]}" if err else ""
+            )
+        return None
 
     def is_healthy(self) -> bool:
         """Cheap liveness probe.

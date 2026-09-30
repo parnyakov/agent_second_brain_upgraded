@@ -173,6 +173,12 @@ def _build_session(
         # that sets neither env var is unchanged (see Settings.pane_width).
         pane_width=settings.pane_width,
         pane_height=settings.pane_height,
+        # Passed only when set, so an unconfigured install builds the
+        # session with exactly the arguments it did before ("claude" looked
+        # up on PATH, the default tmux server) — see Settings.claude_bin /
+        # Settings.tmux_socket.
+        **({"claude_bin": settings.claude_bin} if settings.claude_bin else {}),
+        **({"tmux_socket": settings.tmux_socket} if settings.tmux_socket else {}),
         **_stall_kwarg(stall_timeout),
     )
 

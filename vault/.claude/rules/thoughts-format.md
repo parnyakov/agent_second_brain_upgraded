@@ -96,6 +96,15 @@ Related to [[Voice Agents]] and [[goals/1-yearly-2025#AI Development]].
 - Emotional processing
 - Gratitude, wins
 
+**Исключение — личная еженедельная рефлексия.** Если в вольте есть личный
+дневник (`personal/reflection/` с файлами `Неделя N, …` или правило
+`personal-weekly-reflection.md`), то явный итог недели и переживания о
+собственной жизни и состоянии (самочувствие, семья, усталость, радость)
+сюда НЕ попадают. Они дословно дописываются в файл недели в
+`personal/reflection/` по правилу `personal-weekly-reflection.md`. В
+`reflections/` остаются уроки, выводы и эмоции о проекте или задаче
+(«бесит, что Директ не конвертит» — вывод по проекту, это сюда).
+
 ### projects/
 - Project-specific notes
 - Meeting notes

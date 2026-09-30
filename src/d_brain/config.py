@@ -93,6 +93,35 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── CLI path, tmux server, /reset (2026-09-26 /reset incident) ───
+    claude_bin: str = Field(
+        default="",
+        validation_alias=AliasChoices("DBRAIN_CLAUDE_BIN", "CLAUDE_BIN", "claude_bin"),
+        description=(
+            "Absolute path to the `claude` CLI. Empty → looked up on PATH, "
+            "then in the installer's usual places, and resolved to an "
+            "absolute path once at start-up."
+        ),
+    )
+    tmux_socket: str = Field(
+        default="",
+        validation_alias=AliasChoices("DBRAIN_TMUX_SOCKET", "tmux_socket"),
+        description=(
+            "Name of a private tmux server for the bot's sessions (`tmux -L "
+            "<name>`). Empty → the default server, today's behavior. Every "
+            "process that talks to the bot's sessions (bot, watchdog, doctor, "
+            "pipeline, `dbrain`) must see the same value."
+        ),
+    )
+    reset_cooldown_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DBRAIN_RESET_COOLDOWN", "reset_cooldown_seconds"
+        ),
+        description="How long /reset refuses to run again after the last one.",
+    )
+
     # ── multi-instance parameterization (C1, second-instance rollout plan) ──
     # Every field here defaults to EXACTLY today's single-instance behavior.
     # Setting none of them must be a byte-for-byte no-op.
