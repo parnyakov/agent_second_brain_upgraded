@@ -1005,6 +1005,33 @@ def turn_auth_error(text: str, rid: str) -> bool:
     return _auth_error_block(lines)
 
 
+def is_agents_wait_only(text: str) -> bool:
+    """True iff the main turn has already CLOSED and the CLI is only
+    waiting on background agents it launched, with the input box free.
+
+    Measured live 2026-10-01 (Claude Code 2.1.287): after
+    the closing marker the pane shows "✻ Waiting for 1 background agent to
+    finish" directly above an empty ``❯`` box, no "(Ns · ↓" spinner. A
+    prompt typed in this state is answered at once (~2s), and the agent's
+    task-notification still arrives later; Esc here is a no-op. So this is
+    "free for input", not "busy". Deliberately NOT folded into
+    :func:`is_main_turn_active`: salvage after send must keep treating the
+    wait as live (test_ask_does_not_salvage_while_waiting_for_background_agent).
+    """
+    chrome = _below_last_turn_summary(_chrome(text))
+    if _static_hint_outside_footer(chrome) or _MAIN_SPINNER_RE.search(chrome):
+        return False
+    lines = chrome.splitlines()
+    box = next(
+        (i for i in range(len(lines) - 1, -1, -1) if _IDLE_BARE_RE.search(lines[i])),
+        None,
+    )
+    if box is None:
+        return False
+    above = [ln for ln in lines[:box] if ln.strip() and not _BOX_RULE_RE.match(ln)]
+    return bool(above) and bool(_WAITING_FOR_AGENTS_RE.search(above[-1]))
+
+
 def main_area_working(text: str) -> bool:
     """True iff a PROGRESS signature (a live elapsed-time + token counter, or
     a background-agent wait) is visible in the conversation area — the lines

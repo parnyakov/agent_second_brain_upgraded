@@ -36,6 +36,7 @@ from d_brain.services import ask_health, delivery_proof, long_run
 from d_brain.services.systemd_notify import notify, watchdog_interval
 from d_brain.services.tmux_parse import (
     PaneState,
+    is_agents_wait_only,
     is_main_turn_active,
     reset_epoch,
     unmarked_reset_banner,
@@ -549,7 +550,7 @@ class Watchdog:
             return
         try:
             cap = self.session.capture_text()
-            main_turn_active = is_main_turn_active(cap)
+            main_turn_active = is_main_turn_active(cap) and not is_agents_wait_only(cap)
             attended = self.session.is_turn_active()
         except Exception:  # noqa: BLE001 — duck-typed session, never fatal
             return
@@ -685,7 +686,8 @@ class Watchdog:
         the session is idle.
         """
         try:
-            if is_main_turn_active(self.session.capture_text()):
+            cap = self.session.capture_text()
+            if is_main_turn_active(cap) and not is_agents_wait_only(cap):
                 return False
             return not self.session.is_turn_active()
         except Exception:  # noqa: BLE001 — duck-typed session, never fatal

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E501
 """Live credential checks for setup.sh (standard library only, pre-uv).
 
 Secrets arrive via the environment (TELEGRAM_BOT_TOKEN, DEEPGRAM_API_KEY,

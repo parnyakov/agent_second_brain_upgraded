@@ -47,6 +47,7 @@ from d_brain.services.tmux_parse import (
     has_survey_prompt,
     input_box_text,
     is_agents_list_view,
+    is_agents_wait_only,
     is_complete,
     is_idle,
     is_main_turn_active,
@@ -2058,7 +2059,8 @@ class ClaudeSession:
         exists to describe. ``chat.py`` uses this so a user's stop-word can
         reach the interrupt path even when the lock-based ``is_turn_active``
         says nothing is in flight (Step D,)."""
-        return is_main_turn_active(self.capture_text())
+        cap = self.capture_text()
+        return is_main_turn_active(cap) and not is_agents_wait_only(cap)
 
     def activity_fingerprint(self) -> tuple[str, int]:
         """What changes whenever the pane is alive: its chrome and the size
@@ -2392,7 +2394,13 @@ class ClaudeSession:
                     "idle for %s — sending anyway instead of waiting",
                     log_id,
                 )
-            if is_main_turn_active(pre_cap):
+            if is_agents_wait_only(pre_cap):
+                logger.info(
+                    "pre-send: main turn closed, CLI only waiting on "
+                    "background agents — sending %s now",
+                    log_id,
+                )
+            elif is_main_turn_active(pre_cap):
                 # A PREVIOUS ask() can have released the pane lock on a
                 # stall (2026-08-20 fix) while its own turn kept running —
                 # is_turn_active() is lock-based, so acquiring the lock here

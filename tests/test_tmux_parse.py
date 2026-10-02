@@ -27,6 +27,7 @@ from d_brain.services.tmux_parse import (
     has_marker,
     input_box_text,
     is_agents_list_view,
+    is_agents_wait_only,
     is_complete,
     is_main_turn_active,
     is_working,
@@ -1999,3 +2000,40 @@ def test_a_todo_row_under_a_live_spinner_does_not_cut_it_away():
         "❯ Wait for 10s and retry\n" + _FOOTER_LINE
     )
     assert is_main_turn_active(pane) is True
+
+
+# ── is_agents_wait_only: main turn closed, CLI only waits on bg agents ──
+# Real frames captured live 2026-10-01 (Claude Code 2.1.287). In the
+# "wait only" state a typed prompt is answered at once, so the
+# bot may send instead of queueing behind the agent.
+
+
+def _agents_wait_fixture(name: str) -> str:
+    return (_FIXTURES_DIR / f"pane_agents_wait_{name}.txt").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_agents_wait_only_true_when_turn_closed_and_box_free() -> None:
+    pane = _agents_wait_fixture("free_box")
+    assert is_agents_wait_only(pane) is True
+    # is_main_turn_active stays True on purpose (salvage keeps the wait live).
+    assert is_main_turn_active(pane) is True
+
+
+@pytest.mark.parametrize("name", ["live_turn", "notification_turn"])
+def test_agents_wait_only_false_while_main_turn_runs(name: str) -> None:
+    # Spinner "(0s · thinking)" + "esc to interrupt": a real turn is live,
+    # even though a stale "Waiting for 1 background agent" line is above.
+    assert is_agents_wait_only(_agents_wait_fixture(name)) is False
+
+
+def test_agents_wait_only_false_in_rewind_menu() -> None:
+    # Double Esc opens the Rewind picker in place of the input box — typing
+    # there would select a rewind point, so the bot must not send.
+    assert is_agents_wait_only(_agents_wait_fixture("rewind_menu")) is False
+
+
+def test_agents_wait_only_false_without_wait_line() -> None:
+    pane = "● done\n✻ Brewed for 3s · done 10:15 PM\n" + _FOOTER_LINE
+    assert is_agents_wait_only(pane) is False

@@ -58,7 +58,7 @@ exit 0
 """,
     "codex": "#!/bin/bash\necho \"codex $*\" >> \"$STUB_LOG\"\n"
     "[ \"$1 $2\" = \"login status\" ] && echo 'Logged in using ChatGPT' >&2\nexit 0\n",
-    "node": "#!/bin/bash\necho v20.11.0\n",
+    "node": "#!/bin/bash\necho v22.12.0\n",
     "systemctl": "#!/bin/bash\necho \"systemctl $*\" >> \"$STUB_LOG\"\nexit 0\n",
     "timedatectl": "#!/bin/bash\necho Europe/Moscow\n",
     "tmux": "#!/bin/bash\nexit 0\n",

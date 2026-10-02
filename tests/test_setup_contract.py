@@ -141,3 +141,10 @@ def test_cleanup_units_ship_with_the_project():
     service = (ROOT / "deploy/dbrain-cleanup.service").read_text()
     # Same path placeholder upgrade.sh rewrites for every other unit.
     assert "%h/projects/dbrain" in service
+
+
+def test_setup_installs_node_22_for_current_claude_code():
+    # Under Node 20 npm silently installs a stale Claude Code release.
+    assert "setup_22.x" in SETUP
+    assert "setup_20.x" not in SETUP
+    assert '-ge 22 ]' in SETUP

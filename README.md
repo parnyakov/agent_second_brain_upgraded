@@ -69,8 +69,19 @@ engine (1 Codex, default; 2 Claude Code) and the permission profile (1 full
 access on a dedicated server, default; 2 standard), and creates a private
 GitHub repository for the vault. Then send `/onboarding` to the bot.
 
-Setup is not unattended: it needs you three times on another device (GitHub
-device code, pressing Start in your bot, the ChatGPT or Claude device login).
+Time: about an hour of preparation (accounts, subscription, renting the
+server), then 20–40 minutes for the install itself.
+
+Setup is not unattended: it needs you twice on another device (GitHub device
+code, the ChatGPT or Claude device login). Open your bot and press Start right
+after creating it in @BotFather, otherwise setup stops and asks you to.
+
+Node.js 22 is installed (current Claude Code requires it). For a 24/7 agent on
+Claude, plan for Claude Max: Pro hits its limits quickly (`CLAUDE_MODEL=sonnet`
+in `.env` eases it). No morning plan is scheduled by default: the agent offers
+one at the end of `/onboarding`, or ask the bot "every weekday at 9:00 send my
+day plan". Paying for the server and the subscription from Russia is covered
+in section 2.6 of the Russian install guide.
 It reports success only after the agent answers a health-check question;
 otherwise it prints what to do and is safe to re-run. There are no built-in
 integrations with Google, Notion and similar services and no connection

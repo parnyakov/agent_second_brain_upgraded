@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E501
 """Conservative daily cleanup of abandoned interactive sessions and caches."""
 
 from __future__ import annotations
@@ -621,4 +622,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"server cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

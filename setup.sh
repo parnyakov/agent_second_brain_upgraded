@@ -160,12 +160,17 @@ install_uv() {
 }
 
 install_nodejs() {
-    step "Node.js 20 (нужен для Codex и Claude Code)"
-    if check_command node && [ "$(node --version | cut -d'v' -f2 | cut -d'.' -f1)" -ge 18 ]; then
-        success "Node.js $(node --version) уже установлен"
-        return
+    step "Node.js 22 (нужен для Codex и Claude Code)"
+    # Свежему Claude Code нужен Node 22+: под Node 20 npm молча ставит старую
+    # версию. Более старый Node обновляем, а не оставляем.
+    if check_command node; then
+        if [ "$(node --version | cut -d'v' -f2 | cut -d'.' -f1)" -ge 22 ]; then
+            success "Node.js $(node --version) уже установлен"
+            return
+        fi
+        info "Node.js $(node --version) устарел, обновляю до 22"
     fi
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - || fail "Не удалось подключить репозиторий Node.js."
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - || fail "Не удалось подключить репозиторий Node.js."
     sudo apt-get install -y -qq nodejs || fail "Не удалось установить Node.js."
     success "Node.js $(node --version) установлен"
 }
@@ -611,6 +616,8 @@ print_outro() {
     echo "     прерываться и продолжать той же командой."
     echo "  2. Памятка о возможностях: файл vault/GUIDE.md и команда /help в боте."
     echo "  3. Альтернатива без Telegram: dbrain onboarding resume"
+    echo "  4. Утренний план дня по умолчанию не присылается. Агент предложит его в конце"
+    echo "     знакомства; включить сразу: напишите боту «Каждый будний день в 9:00 присылай план дня»."
     echo ""
     echo "  Команды на сервере:"
     echo "    dbrain status       состояние"
@@ -623,7 +630,7 @@ print_outro() {
 
 main() {
     echo -e "${BOLD}Agent Second Brain: установка${NC}"
-    echo "  Займёт 10–20 минут. Можно прервать Ctrl+C и запустить снова: готовое не повторится."
+    echo "  Займёт 20–40 минут. Можно прервать Ctrl+C и запустить снова: готовое не повторится."
     check_user_and_os
     install_system_deps
     install_uv
