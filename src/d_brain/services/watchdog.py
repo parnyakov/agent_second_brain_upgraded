@@ -550,7 +550,7 @@ class Watchdog:
             return
         try:
             cap = self.session.capture_text()
-            main_turn_active = is_main_turn_active(cap) and not is_agents_wait_only(cap)
+            main_turn_active = self._turn_open(cap)
             attended = self.session.is_turn_active()
         except Exception:  # noqa: BLE001 — duck-typed session, never fatal
             return
@@ -687,12 +687,21 @@ class Watchdog:
         """
         try:
             cap = self.session.capture_text()
-            if is_main_turn_active(cap) and not is_agents_wait_only(cap):
+            if self._turn_open(cap):
                 return False
             return not self.session.is_turn_active()
         except Exception:  # noqa: BLE001 — duck-typed session, never fatal
             logger.info("long-run: could not verify the pane is free — staying quiet")
             return False
+
+    def _turn_open(self, cap: str) -> bool:
+        """Main-turn-open predicate. A ClaudeSession answers from the
+        hook-written turn-state.json (screen as fallback); any other driver
+        (Codex, test fakes) keeps the plain screen predicate."""
+        fn = getattr(type(self.session), "_turn_open", None)
+        if callable(fn):
+            return bool(fn(self.session, cap))
+        return is_main_turn_active(cap) and not is_agents_wait_only(cap)
 
     def _enforce_long_run_cap(
         self, since: float, now: float, *, attended: bool = False

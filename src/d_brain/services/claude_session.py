@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from d_brain.services import long_run
+from d_brain.services import long_run, turn_state
 from d_brain.services.tmux_parse import (
     PaneState,
     _chrome,
@@ -273,6 +273,18 @@ _TITLE_FIELDS = {
 STANDBY_SUFFIX = "_reset"
 # How long preflight gives `claude auth status` / `codex login status`.
 _PREFLIGHT_TIMEOUT = 30.0
+
+
+def _main_turn_blocks_input(cap: str) -> bool:
+    """True iff a pre-send wait must keep waiting: the main turn is live AND
+    the CLI is not merely waiting on background agents with a free box.
+
+    is_main_turn_active stays True in the agents-wait state on purpose (the
+    post-send salvage needs that), but a message that arrived while the main
+    turn was still running must go in the moment that turn closes, not sit
+    out the whole busy-wait budget behind the agent (2026-10-03, fix A).
+    """
+    return is_main_turn_active(cap) and not is_agents_wait_only(cap)
 
 
 def tmux_argv(socket: str | None, *args: str) -> list[str]:
@@ -880,13 +892,27 @@ class ClaudeSession:
             ]
         if self.model:
             parts += ["--model", shlex.quote(self.model)]
+        # Turn-state hooks (busy detection by CLI hooks, not by screen).
+        # Best effort: a failure here must never block the session start.
+        try:
+            from d_brain.services.turn_hooks import write_hook_settings
+
+            hook_settings = write_hook_settings(self.runtime_dir)
+            if hook_settings is not None:
+                parts += ["--settings", shlex.quote(str(hook_settings))]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("turn-state hooks disabled: %s", exc)
         # A tmux server started earlier without CLAUDE_CONFIG_DIR (an old
         # doctor run, a plain `tmux`) does not pass the client's environment
         # to new sessions: pin it on the command line so the brain always
         # uses the same login and first-run state as the services.
         config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
         env = f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} " if config_dir else ""
-        return f"cd {shlex.quote(str(self.work_dir))} && " + env + " ".join(parts)
+        return (
+            f"cd {shlex.quote(str(self.work_dir))} && DISABLE_AUTOUPDATER=1 "
+            + env
+            + " ".join(parts)
+        )
 
     # ── R1: pinned session id / transcript path ─────────────────────────
 
@@ -1841,6 +1867,7 @@ class ClaudeSession:
             self._tmux("kill-session", "-t", self._target)
             self._ready_flag.unlink(missing_ok=True)
             self._inflight.unlink(missing_ok=True)
+            turn_state.close(self.runtime_dir, event="restart", reason="force_recover")
             self._ensure_locked()
             return True
 
@@ -2022,6 +2049,7 @@ class ClaudeSession:
                 self._tmux("kill-session", "-t", self._target)
                 self._ready_flag.unlink(missing_ok=True)
                 self._inflight.unlink(missing_ok=True)
+                turn_state.close(self.runtime_dir, event="restart", reason="kill")
 
     # ── steering (concurrent input into a live turn) ─────────────────
 
@@ -2042,6 +2070,7 @@ class ClaudeSession:
         double-C-c exit sequence; Escape only ever cancels the response.
         """
         self._tmux("send-keys", "-t", self._target, "Escape")
+        turn_state.close(self.runtime_dir, event="bot_interrupt", reason="interrupt")
 
     def is_turn_active(self) -> bool:
         """True iff a turn is in flight (the pane lock is held)."""
@@ -2060,7 +2089,17 @@ class ClaudeSession:
         reach the interrupt path even when the lock-based ``is_turn_active``
         says nothing is in flight (Step D,)."""
         cap = self.capture_text()
-        return is_main_turn_active(cap) and not is_agents_wait_only(cap)
+        return self._turn_open(cap)
+
+    def _turn_open(self, cap: str) -> bool:
+        """Is the main turn open? Hook-written turn-state.json first, the
+        pane screen as fallback (see services/turn_state.py)."""
+        return turn_state.turn_open(
+            self.runtime_dir,
+            cap,
+            self._read_session_id(),
+            capture_again=self.capture_text,
+        )
 
     def activity_fingerprint(self) -> tuple[str, int]:
         """What changes whenever the pane is alive: its chrome and the size
@@ -2182,6 +2221,7 @@ class ClaudeSession:
         `/compact`), gets the resync for free.
         """
         self.send_control("/clear")
+        turn_state.close(self.runtime_dir, event="restart", reason="clear")
 
     # ── sending ──────────────────────────────────────────────────────
 
@@ -2394,13 +2434,16 @@ class ClaudeSession:
                     "idle for %s — sending anyway instead of waiting",
                     log_id,
                 )
-            if is_agents_wait_only(pre_cap):
+            pre_open = self._turn_open(pre_cap)
+            if is_agents_wait_only(pre_cap) and not pre_open:
                 logger.info(
                     "pre-send: main turn closed, CLI only waiting on "
                     "background agents — sending %s now",
                     log_id,
                 )
-            elif is_main_turn_active(pre_cap):
+            elif pre_open:
+                # pre_open is the hook file when valid (closed => type now,
+                # whatever the screen shows), else the screen predicate.
                 # A PREVIOUS ask() can have released the pane lock on a
                 # stall (2026-08-20 fix) while its own turn kept running —
                 # is_turn_active() is lock-based, so acquiring the lock here
@@ -2466,7 +2509,7 @@ class ClaudeSession:
                         cap = new_cap
                         if confirmed:
                             break
-                    if confirmed and is_main_turn_active(cap):
+                    if confirmed and self._turn_open(cap):
                         logger.info(
                             "pane busy with a live, progressing turn "
                             "(long-run marker confirmed, ~%.0fs elapsed) — "
@@ -2513,7 +2556,7 @@ class ClaudeSession:
                 # silently reopen the same hole (see this constant's
                 # docstring above).
                 last_real_progress_ts = busy_wait_start
-                while self._clock() < deadline and is_main_turn_active(cap):
+                while self._clock() < deadline and self._turn_open(cap):
                     if self._abort_requested(turn_started):
                         return self._aborted(log_id)
                     if self._clock() >= busy_wait_deadline:
@@ -2546,7 +2589,7 @@ class ClaudeSession:
                     cap = new_cap
                 recent_window = self._poll_interval * _RECENT_PROGRESS_POLLS
                 saw_progress = (self._clock() - last_real_progress_ts) <= recent_window
-                if is_main_turn_active(cap):
+                if self._turn_open(cap):
                     self._inflight.unlink(missing_ok=True)
                     busy_seconds = self._clock() - busy_wait_start
                     if saw_progress:

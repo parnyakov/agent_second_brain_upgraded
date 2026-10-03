@@ -1703,6 +1703,33 @@ def test_ask_waits_out_a_stale_leftover_turn_before_sending(tmp_path, clock):
     assert res.reply == "PONG"
 
 
+def test_ask_sends_as_soon_as_leftover_turn_closes_into_agents_wait(tmp_path, clock):
+    """Fix A (2026-10-03): a message that arrived while the main turn was
+    still running must go into the pane the moment that turn closes and the
+    CLI only waits on background agents — even with the CLI's "Update
+    installed · Restart to apply" toast above the box — instead of riding out
+    the busy-wait behind the agent (the old loop exited only once
+    is_main_turn_active cleared, i.e. when the agent itself finished)."""
+    rid = "wait0037"
+    box = "──────────\n❯\n──────────\n" + READY.splitlines()[-1] + "\n"
+    wait = "✻ Waiting for 1 background agent to finish\n"
+    spin1 = wait + "✢ Pondering… (3s · ↓ 10 tokens)\n" + box
+    spin2 = wait + "✢ Pondering… (4s · ↓ 20 tokens)\n" + box
+    toast = (
+        Path(__file__).parent / "fixtures" / "pane_agents_wait_update_toast.txt"
+    ).read_text(encoding="utf-8")
+    fake = FakeTmux([spin1, spin2] + [toast] * 8 + [_complete(rid)], exists=True)
+    s = make_session(tmp_path, fake, clock, rid=rid, stall_timeout=60.0)
+    res = s.ask("ping", timeout=600)
+    assert res.status == "ok"
+    assert res.reply == "PONG"
+    subs = fake.sent_subcommands()
+    first_paste = subs.index("paste-buffer")
+    # Typed right after the first agents-wait frame: 3 pre-send captures
+    # (two spinner frames, one toast frame), not after all 8 wait frames.
+    assert subs[:first_paste].count("capture-pane") <= 4
+
+
 def test_ask_gives_up_if_the_leftover_turn_never_clears(tmp_path, clock):
     """Busy-panel UX finding (2026-08-22): a legitimately busy panel is not
     an error — status is the distinct 'busy', not 'error', so chat_session.py
@@ -4425,7 +4452,9 @@ def _onboarded(monkeypatch, tmp_path, done=True):
 def test_claude_bin_is_resolved_to_an_absolute_path_at_construction(tmp_path):
     s = _preflight_session(tmp_path, which=lambda n: "/opt/bin/claude")
     assert s.claude_bin == "/opt/bin/claude" and s.claude_bin_error is None
-    assert s._start_command("sid").split(" && ")[1].startswith("/opt/bin/claude ")
+    assert s._start_command("sid").split(" && ")[1].startswith(
+        "DISABLE_AUTOUPDATER=1 /opt/bin/claude "
+    )
 
 
 def test_preflight_fails_loudly_when_claude_is_not_found(tmp_path, monkeypatch, caplog):

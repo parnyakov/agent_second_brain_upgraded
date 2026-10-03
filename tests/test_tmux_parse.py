@@ -2021,6 +2021,40 @@ def test_agents_wait_only_true_when_turn_closed_and_box_free() -> None:
     assert is_main_turn_active(pane) is True
 
 
+def test_agents_wait_only_true_with_cli_update_toast_above_box() -> None:
+    # Live frame 2026-10-03 (CLI 2.1.288): after an in-place auto-update the
+    # CLI draws "✔ Update installed · Restart to apply" between the wait line
+    # and the box. Fix 37 never fired on either bot while it was there.
+    pane = _agents_wait_fixture("update_toast")
+    assert "Update installed" in pane
+    assert is_agents_wait_only(pane) is True
+    assert is_main_turn_active(pane) is True
+
+
+def test_agents_wait_only_toast_never_hides_a_live_spinner() -> None:
+    # The toast is skipped only as its own text: a live main spinner sharing
+    # the screen still keeps the pane busy.
+    pane = (
+        "✻ Waiting for 1 background agent to finish\n"
+        "✢ Pondering… (12s · ↓ 554 tokens)\n"
+        "            ✔ Update installed · Restart to apply\n"
+        "──────────\n❯\n──────────\n" + _FOOTER_LINE
+    )
+    assert is_agents_wait_only(pane) is False
+
+
+def test_agents_wait_only_false_when_toast_follows_other_text() -> None:
+    # Toast removed, the last real row is a transcript line, not the wait
+    # line — still not the "only waiting on agents" state.
+    pane = (
+        "✻ Waiting for 1 background agent to finish\n"
+        "● still writing the answer\n"
+        "            ✔ Update installed · Restart to apply\n"
+        "──────────\n❯\n──────────\n" + _FOOTER_LINE
+    )
+    assert is_agents_wait_only(pane) is False
+
+
 @pytest.mark.parametrize("name", ["live_turn", "notification_turn"])
 def test_agents_wait_only_false_while_main_turn_runs(name: str) -> None:
     # Spinner "(0s · thinking)" + "esc to interrupt": a real turn is live,

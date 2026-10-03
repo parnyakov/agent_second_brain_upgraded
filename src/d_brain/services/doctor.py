@@ -258,6 +258,18 @@ def check_marker_compliance(
     return CheckResult("marker_compliance", True, detail)
 
 
+def check_turn_metrics(runtime_dir: Path, *, now: float | None = None) -> CheckResult:
+    """Info, never a failure: the one-day stuck-turn summary; ⚠️ when a
+    message was parked while the hook said the turn was closed, or waited
+    in the queue longer than the target behind a closed turn."""
+    from d_brain.services import turn_metrics
+
+    d = turn_metrics.summary(runtime_dir, now=now)
+    mark = "⚠️ " if turn_metrics.needs_attention(d) else ""
+    detail = mark + "\n" + turn_metrics.format_summary(d)
+    return CheckResult("застревания", True, detail)
+
+
 def run_cli(
     session: Any,
     *,
@@ -300,6 +312,7 @@ def main() -> None:  # pragma: no cover
         lambda: check_marker_compliance(
             session, settings.runtime_dir, repo_dir=settings.project_root
         ),
+        lambda: check_turn_metrics(settings.runtime_dir),
     ]
     raise SystemExit(
         run_cli(

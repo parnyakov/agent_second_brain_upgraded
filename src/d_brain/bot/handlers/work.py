@@ -47,6 +47,7 @@ from d_brain.services import (
     long_run,
     outbox,
     runtime,
+    turn_metrics,
 )
 from d_brain.services.claude_session import MAINT_PREFIX
 from d_brain.services.cron_store import CronJob, CronStore
@@ -508,6 +509,16 @@ def _outbox_lines(settings: Settings, *, now: float) -> list[str]:
     return lines
 
 
+def _turn_metrics_lines(settings: Settings, *, now: float) -> list[str]:
+    """One-day stuck-turn metric (design 2026-10-03, step 5)."""
+    try:
+        d = turn_metrics.summary(settings.runtime_dir, now=now)
+    except Exception:  # noqa: BLE001 — a metric must not break /work
+        logger.warning("/work: could not read turn metrics", exc_info=True)
+        return []
+    return turn_metrics.format_summary(d).splitlines()
+
+
 def build_work_report(settings: Settings, *, now: float | None = None) -> str:
     """The whole report as Telegram HTML. Synchronous and blocking on
     purpose — the caller runs it in a thread; see ``cmd_work``."""
@@ -518,6 +529,7 @@ def build_work_report(settings: Settings, *, now: float | None = None) -> str:
         _cron_lines(settings, now=moment),
         _inbox_lines(settings, now=moment),
         _chat_queue_lines(settings, now=moment),
+        _turn_metrics_lines(settings, now=moment),
         _delivery_lines(settings, now=moment),
     ]
     body = "\n\n".join("\n".join(block) for block in blocks if block)

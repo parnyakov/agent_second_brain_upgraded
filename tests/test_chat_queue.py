@@ -122,7 +122,7 @@ def test_a_second_message_during_work_is_parked_and_acknowledged(monkeypatch, qu
     asyncio.run(scenario())
 
     assert "в очереди: 1" in bot.texts()
-    assert "Принял" in bot.texts()
+    assert "Сообщение принято" in bot.texts()
     # Only the FIRST message reached the session; the second waited.
     assert mgr.sent == [(7, "первое")]
     waiting = queue.waiting(10)

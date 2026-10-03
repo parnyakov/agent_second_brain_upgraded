@@ -1,0 +1,50 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+● Agent(Background research task)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● <<<R:t2>>>Агент запущен, итог пришлю отдельным сообщением.<<<E:t2>>>
+
+❯ second message from the owner
+
+● <<<R:t3>>>
+  Принято, задача у агента.
+  <<<E:t3>>>
+
+✻ Waiting for 1 background agent to finish
+                                                                                                                                                                 ✔ Update installed · Restart to apply
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · 4 memories · ← 6 agents · ↓ to manage
+
+  ● main
+  ◯ general-purpose  Background research task                                                                                                                                21m 24s · ↓ 124.4k tokens
+  ◯ general-purpose  Second background task                                                                                                                                     1m 8s · ↓ 66.4k tokens

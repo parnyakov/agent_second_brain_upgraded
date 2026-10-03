@@ -843,6 +843,19 @@ _TURN_SUMMARY_RE = re.compile(
 # A run of box-drawing characters — the TUI's horizontal rule between the
 # transcript and the footer.
 _BOX_RULE_RE = re.compile(r"^\s*─+\s*$")
+# Claude Code's own status toasts, drawn right-aligned on a line of their
+# own between the transcript and the input box. Measured live 2026-10-03
+# (CLI 2.1.288) after an in-place auto-update: "✔ Update installed · Restart
+# to apply" sits UNDER "✻ Waiting for 1 background agent to finish" and stays
+# there until the CLI process restarts (501 hits in ~100 MB of pane.log), so
+# is_agents_wait_only never saw the wait line as the last row and fix 37 did
+# not fire once on either bot. Deliberately NARROW — exact CLI wordings only,
+# removed as a fragment rather than dropping the whole line — so a toast can
+# never hide a spinner or a real activity row that shares its line.
+_CLI_TOAST_RE = re.compile(
+    r"[✔✓]\s*Update installed\s*·\s*Restart to apply"
+    r"|^\s*[✗✘]\s*Auto-update failed\b.*$"
+)
 
 
 def _static_hint_outside_footer(chrome: str) -> bool:
@@ -1017,6 +1030,8 @@ def is_agents_wait_only(text: str) -> bool:
     "free for input", not "busy". Deliberately NOT folded into
     :func:`is_main_turn_active`: salvage after send must keep treating the
     wait as live (test_ask_does_not_salvage_while_waiting_for_background_agent).
+    CLI status toasts (``_CLI_TOAST_RE``, e.g. "Update installed · Restart to
+    apply") between the wait line and the box are skipped (2026-10-03).
     """
     chrome = _below_last_turn_summary(_chrome(text))
     if _static_hint_outside_footer(chrome) or _MAIN_SPINNER_RE.search(chrome):
@@ -1028,7 +1043,11 @@ def is_agents_wait_only(text: str) -> bool:
     )
     if box is None:
         return False
-    above = [ln for ln in lines[:box] if ln.strip() and not _BOX_RULE_RE.match(ln)]
+    above = [
+        ln
+        for ln in (_CLI_TOAST_RE.sub("", raw) for raw in lines[:box])
+        if ln.strip() and not _BOX_RULE_RE.match(ln)
+    ]
     return bool(above) and bool(_WAITING_FOR_AGENTS_RE.search(above[-1]))
 
 

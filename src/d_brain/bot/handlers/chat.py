@@ -235,7 +235,7 @@ def queued_ack(position: int) -> str:
     codebase was reworded away from exactly this phrasing (rule B3,
     2026-08-22) precisely because nothing re-sent the answer later.
     """
-    return f"✅ Принял — отвечу следом (в очереди: {position})."
+    return f"✅ Сообщение принято — отвечу следом (в очереди: {position})."
 
 
 def queue_full_message(limit: int) -> str:

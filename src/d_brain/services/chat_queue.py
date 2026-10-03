@@ -98,6 +98,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from d_brain.services import turn_metrics
 from d_brain.services.outbox import write_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,8 @@ class ChatQueue:
         # chat_id → (when its live runner took the lane, the queued job it is
         # running or None for an inline turn). One entry per chat.
         self._running: dict[int, tuple[float, str | None]] = {}
+        # job id → hook turn state when it was parked (turn metrics).
+        self._queued_turn_state: dict[str, str] = {}
 
     # ── clock and files ──────────────────────────────────────────────
 
@@ -337,6 +340,11 @@ class ChatQueue:
             message_id=int(message_id) if isinstance(message_id, int) else None,
         )
         write_json_atomic(self._path(job.id), _job_payload(job))
+        state = turn_metrics.read_turn_state_raw(self.dir.parent)
+        self._queued_turn_state[job.id] = state
+        turn_metrics.append_event(
+            self.dir.parent, "queued", job_id=job.id, turn_state=state
+        )
         return job, 1 + sum(1 for other in ahead if other.id < job.id)
 
     def waiting(self, chat_id: int | None = None) -> list[Job]:
@@ -575,6 +583,13 @@ async def _run_one(bot: Any, queue: ChatQueue, runner: Any, job: Job) -> None:
         queue.retire(job, reason=f"waited longer than {queue.max_age:.0f}s")
         await _tell(bot, job, RETIRED_NOTICE.format(reason="слишком долго ждало"))
         return
+    turn_metrics.append_event(
+        queue.dir.parent,
+        "dispatched",
+        job_id=job.id,
+        delay_s=round(max(0.0, queue.now() - job.queued_at), 3),
+        turn_state_at_queue=queue._queued_turn_state.pop(job.id, "unknown"),
+    )
     if await runner(bot, job):
         queue.done(job)
 
