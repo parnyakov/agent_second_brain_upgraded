@@ -6,21 +6,23 @@ surrounding shell shim still handles graph rebuild, memory decay, git and
 Telegram delivery.
 
     uv run python -m d_brain.pipeline daily   # prints the HTML report
+    uv run python -m d_brain.pipeline daily 2026-10-25   # re-run a missed day
 
 Exit code 0 on success (report), 1 otherwise.
 """
 
 import logging
 import sys
+from datetime import date
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def run(cmd: str, proc: Any) -> tuple[str, bool]:
+def run(cmd: str, proc: Any, day: date | None = None) -> tuple[str, bool]:
     """Run a pipeline command against a processor. Returns (text, ok)."""
     if cmd == "daily":
-        res = proc.process_daily()
+        res = proc.process_daily() if day is None else proc.process_daily(day)
     else:
         return f"unknown command: {cmd}", False
     if res.get("report"):
@@ -40,8 +42,9 @@ def main() -> None:  # pragma: no cover
     from d_brain.services.runtime import get_processor
 
     cmd = sys.argv[1] if len(sys.argv) > 1 else "daily"
+    day = date.fromisoformat(sys.argv[2]) if len(sys.argv) > 2 else None
     proc = get_processor(get_settings())
-    text, ok = run(cmd, proc)
+    text, ok = run(cmd, proc, day)
     print(text)
     sys.exit(0 if ok else 1)
 

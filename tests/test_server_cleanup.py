@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Safety gates for the nightly tmux cleanup."""
 
 import gzip
@@ -96,3 +97,64 @@ def test_journal_retention_uses_seven_days():
     assert run.call_args.args[:5] == (
         "sudo", "-n", "journalctl", "--rotate", "--vacuum-time=7d"
     )
+
+
+
+def proc(pid, ppid, comm, start, cmd="", rss=100 * 1048576):
+    return dict(pid=pid, ppid=ppid, comm=comm, start=start, rss=rss, state="S", cmd=cmd or comm)
+
+
+def test_browsers_close_nightly_except_fresh_agent_work():
+    now = 100 * 86400
+    table = {
+        10: proc(10, 5, "claude", 1, "/usr/bin/claude --session-id x"),
+        20: proc(20, 10, "chrome", now - 7200, "chrome --user-data-dir=/tmp/old"),
+        21: proc(21, 20, "chrome", now - 7200, "chrome --type=renderer"),
+        22: proc(22, 20, "chrome_crashpad", now - 7200),
+        30: proc(30, 10, "chrome", now - 600, "chrome --user-data-dir=/tmp/live"),
+        31: proc(31, 30, "chrome", now - 600),
+        40: proc(40, 1, "headless_shell", now - 300),
+        50: proc(50, 1, "Xvfb", now - 4 * 86400, "Xvfb :99"),
+        51: proc(51, 1, "Xvfb", now - 86400, "Xvfb :98"),
+        52: proc(52, 1, "oosplash", now - 5 * 86400, "oosplash --headless"),
+        53: proc(53, 1, "node", now - 5 * 86400, "node /x/playwright/cli.js run-driver"),
+        60: proc(60, 1, "postgres", now - 9 * 86400, "postgres -D /tmp/db"),
+        61: proc(61, 1, "uv", now - 9 * 86400, "uv run python -m d_brain"),
+        62: proc(62, 1, "node", now - 9 * 86400, "node server.js"),
+    }
+    with patch.object(cleanup, "process_table", return_value=table):
+        targets, skipped, noted = cleanup.find_stale_processes(now)
+    roots = {t["pids"][0]: t for t in targets}
+    assert set(roots) == {20, 40, 50, 52, 53}
+    assert sorted(roots[20]["pids"]) == [20, 21, 22]
+    assert roots[20]["rss"] == 300 * 1048576
+    assert roots[20]["kind"] == "browser" and roots[50]["kind"] == "Xvfb"
+    assert sorted(skipped.values()) == ["live agent task", "recent helper"]
+    assert [n.split()[0] for n in noted] == ["postgres", "node"]
+
+
+def test_stop_process_tree_terminates_then_kills_survivors():
+    target = dict(pids=[20, 21], starts={20: 5.0, 21: 5.0})
+    table = {20: proc(20, 1, "chrome", 5.0), 21: proc(21, 20, "chrome", 5.0)}
+    sent = []
+    with (patch.object(cleanup, "process_table", return_value=table),
+          patch.object(cleanup, "KILL_GRACE", 0),
+          patch.object(cleanup.os, "kill", side_effect=lambda pid, sig: sent.append((pid, sig)))):
+        cleanup.stop_process_tree(target)
+    term, kill = cleanup.signal.SIGTERM, cleanup.signal.SIGKILL
+    assert sent == [(20, term), (21, term), (20, kill), (21, kill)]
+
+
+def test_report_lists_closed_browsers_and_memory():
+    report = dict(closed=["coach"], browsers=2, browser_bytes=600 * 1048576,
+                  helpers=["Xvfb 50"], helper_bytes=1048576, noted=["postgres 60, 2 МиБ"],
+                  pip_files=0, pip_bytes=0, scratchpads=0, scratchpad_bytes=0, job_tmp=0,
+                  job_tmp_bytes=0, logs_archived=0, logs_original_bytes=0,
+                  logs_archive_bytes=0, uv_result="", journal_result="ok", errors=[],
+                  memory_before=1024 * 1048576, memory_after=1700 * 1048576,
+                  swap_before=0, swap_after=0, disk_used_percent=50.0, disk_after=0,
+                  sessions_left=3, protected_or_active=3, disk_breakdown={})
+    text = cleanup.report_text(report)
+    assert "Браузеры закрыты: 2 шт., около 600 МиБ." in text
+    assert "Xvfb 50" in text and "postgres 60" in text
+    assert "Доступная RAM: 1024 МиБ → 1700 МиБ." in text

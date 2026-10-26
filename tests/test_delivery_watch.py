@@ -32,6 +32,7 @@ SCRIPT = REPO / "scripts" / "delivery-watch.sh"
 
 _SYSTEMCTL_STUB = """#!/bin/bash
 # `systemctl --user show -p <Property> --value <unit>`
+echo "$*" >> "${STUB_CALLS:-/dev/null}"
 prop=""; unit=""
 for a in "$@"; do
     case "$a" in
@@ -50,12 +51,24 @@ esac
 exit 0
 """
 
-_PGREP_STUB = "#!/bin/bash\necho \"${STUB_BOT_COUNT:-1}\"\nexit 0\n"
+# Real procps pgrep -c prints "0" AND exits 1 on no match; the stub must too,
+# or the "0\n0" bug of 2026-10-26 stays invisible.
+_PGREP_STUB = (
+    "#!/bin/bash\nn=\"${STUB_BOT_COUNT:-1}\"\necho \"$n\"\n"
+    "[ \"$n\" = 0 ] && exit 1\nexit 0\n"
+)
 
 # `curl` stands in for both notify channels' only side effect, so nothing
 # leaves the machine. STUB_CURL_OK=0 is the case that matters most: dead
 # letters pile up precisely when Telegram sends are failing, and the script
 # must not then mark the fault as reported.
+# `sudo -n <cmd…>` → records the argv and runs <cmd…> (the stub systemctl).
+_SUDO_STUB = """#!/bin/bash
+[ "$1" = "-n" ] && shift
+echo "sudo $*" >> "${STUB_CALLS:-/dev/null}"
+exec "$@"
+"""
+
 _CURL_STUB = """#!/bin/bash
 if [ "${STUB_CURL_OK:-1}" = "1" ]; then exit 0; fi
 exit 7
@@ -70,7 +83,8 @@ def watch(tmp_path):
     (bindir / "systemctl").write_text(_SYSTEMCTL_STUB)
     (bindir / "pgrep").write_text(_PGREP_STUB)
     (bindir / "curl").write_text(_CURL_STUB)
-    for name in ("systemctl", "pgrep", "curl"):
+    (bindir / "sudo").write_text(_SUDO_STUB)
+    for name in ("systemctl", "pgrep", "curl", "sudo"):
         os.chmod(bindir / name, 0o755)
 
     runtime = tmp_path / "runtime"
@@ -231,6 +245,51 @@ def test_a_dead_unit_is_still_reported(watch):
     assert code == 1
     assert "не активен" in err
 
+
+
+def test_no_running_bot_does_not_break_the_count_check(watch):
+    """pgrep -c with no match printed "0" and exited 1, ``|| echo 0`` added a
+    second "0" and bash failed with "integer expression expected" every run."""
+    code, err = watch(STUB_BOT_STATE="failed", STUB_BOT_COUNT="0")
+    assert "integer expression expected" not in err
+    assert "не активен" in err
+
+
+# ── self-heal: a `failed` bot is restarted, rate-limited (2026-10-26) ──
+
+
+_SYS = {
+    "DBRAIN_SYSTEMD_SCOPE": "system",
+    "DBRAIN_BOT_UNIT": "dbrain-bot@x.service",
+    "DBRAIN_WATCHDOG_UNIT": "dbrain-watchdog@x.service",
+}
+
+
+def test_failed_bot_is_reset_and_restarted_via_the_sudoers_argv(watch, tmp_path):
+    calls = tmp_path / "calls"
+    code, err = watch(STUB_BOT_STATE="failed", STUB_CALLS=str(calls), **_SYS)
+    assert code == 1
+    assert "перезапущен автоматически" in err
+    lines = calls.read_text().splitlines()
+    # Byte for byte the shapes 3 and 1 of deploy/systemd/sudoers-dbrain.
+    assert "sudo systemctl reset-failed dbrain-bot@x.service dbrain-watchdog@x.service" in lines  # noqa: E501
+    assert "sudo systemctl restart --no-block dbrain-bot@x.service" in lines
+
+
+def test_self_heal_is_rate_limited(watch, tmp_path):
+    calls = tmp_path / "calls"
+    watch(STUB_BOT_STATE="failed", STUB_CALLS=str(calls), **_SYS)
+    calls.write_text("")
+    code, err = watch(STUB_BOT_STATE="failed", STUB_CALLS=str(calls), **_SYS)
+    assert "restart" not in calls.read_text()
+    assert "не активен" in err
+
+
+def test_inactive_or_active_bot_is_never_restarted(watch, tmp_path):
+    calls = tmp_path / "calls"
+    for state in ("active", "inactive"):
+        watch(STUB_BOT_STATE=state, STUB_CALLS=str(calls), **_SYS)
+    assert "restart" not in calls.read_text()
 
 # ── F6: the proven loss, which must ALWAYS get through ───────────────
 

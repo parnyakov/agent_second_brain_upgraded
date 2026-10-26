@@ -53,7 +53,9 @@ fi
 export TZ="${TZ:-UTC}"
 
 # Date and chat_id
-TODAY=$(date +%Y-%m-%d)
+# DBRAIN_PROCESS_DATE=YYYY-MM-DD re-runs a missed day (e.g. the 2026-10-25
+# run that died on an unquoted .env line); unset → today, as before.
+TODAY="${DBRAIN_PROCESS_DATE:-$(date +%Y-%m-%d)}"
 CHAT_ID="${ALLOWED_USER_IDS//[\[\] ]/}"  # strip brackets/spaces from [123, 456]
 CHAT_ID="${CHAT_ID%%,*}"  # first id only — the admin gets the report
 
@@ -197,7 +199,7 @@ echo "ORIENT: daily=$DAILY_SIZE bytes, handoff=OK, graph=OK"
 # processing through the shared session and prints the HTML report.
 echo "=== Daily processing (interactive session) ==="
 set +e
-REPORT=$(cd "$PROJECT_DIR" && uv run python -m d_brain.pipeline daily 2>&1)
+REPORT=$(cd "$PROJECT_DIR" && uv run python -m d_brain.pipeline daily "$TODAY" 2>&1)
 PIPELINE_EXIT=$?
 set -e
 

@@ -115,6 +115,40 @@ unit_active() {
 unit_active "$BOT_UNIT" || faults+=("$BOT_UNIT не активен")
 unit_active "$WATCHDOG_UNIT" || faults+=("$WATCHDOG_UNIT не активен")
 
+# Self-heal a bot unit that systemd gave up on (incident 2026-10-26: a bot unit
+# sat `failed` for 10 hours after StartLimitBurst while this script only
+# alerted). ONLY `failed` — inactive may be a deliberate stop, and
+# activating/deactivating is judged above. At most once per SELFHEAL_EVERY
+# seconds (stamp in the runtime dir), so a bot that crashes on start is
+# retried every ~10 minutes, not hammered every 5. In system scope the two
+# argvs are shapes 3 and 1 of deploy/systemd/sudoers-dbrain, byte for byte;
+# reset-failed also clears the StartLimit counter. The fault line below goes
+# out through the same notify path as every other fault, to this instance's
+# owner only.
+SELFHEAL_EVERY="${DBRAIN_SELFHEAL_EVERY:-540}"
+SELFHEAL_STAMP="$RUNTIME_DIR/delivery-watch.selfheal"
+if [ "${DBRAIN_SELFHEAL:-1}" = "1" ] \
+   && [ "$(systemctl "$SCOPE_FLAG" show -p ActiveState --value "$BOT_UNIT" 2>/dev/null)" = "failed" ]; then
+    last=$(stat -c %Y "$SELFHEAL_STAMP" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - last )) -ge "$SELFHEAL_EVERY" ]; then
+        touch "$SELFHEAL_STAMP" 2>/dev/null || true
+        if [ "$SYSTEMD_SCOPE" = "user" ]; then
+            systemctl --user reset-failed "$BOT_UNIT" "$WATCHDOG_UNIT" 2>/dev/null
+            systemctl --user restart --no-block "$BOT_UNIT"
+        else
+            sudo -n systemctl reset-failed "$BOT_UNIT" "$WATCHDOG_UNIT" 2>/dev/null
+            sudo -n systemctl restart --no-block "$BOT_UNIT"
+        fi
+        rc=$?
+        echo "delivery-watch: self-heal $BOT_UNIT was failed → reset-failed + restart (rc=$rc)" >&2
+        if [ "$rc" -eq 0 ]; then
+            faults+=("бот упал (failed), перезапущен автоматически")
+        else
+            faults+=("бот упал (failed), автоперезапуск не удался")
+        fi
+    fi
+fi
+
 STATUS="$RUNTIME_DIR/STATUS.md"
 if [ -f "$STATUS" ]; then
     age=$(( $(date +%s) - $(stat -c %Y "$STATUS" 2>/dev/null || date +%s) ))
@@ -184,7 +218,10 @@ fi
 # second instance runs under another account, each install would see the
 # other's healthy bot and report a phantom "orphan process" (F5) forever.
 # Single-instance result is unchanged: the only matching process is our own.
-n_bots=$(pgrep -u "$(id -un)" -cxf '.*/python[0-9.]* -m d_brain' 2>/dev/null || echo 0)
+# pgrep -c prints "0" itself and exits 1 on no match; `|| echo 0` would then
+# append a second "0" and break the integer test below ("0\n0").
+n_bots=$(pgrep -u "$(id -un)" -cxf '.*/python[0-9.]* -m d_brain' 2>/dev/null)
+n_bots=${n_bots:-0}
 if [ "${n_bots:-0}" -gt 1 ]; then
     faults+=("$n_bots процессов бота одновременно (осиротевший процесс)")
 fi

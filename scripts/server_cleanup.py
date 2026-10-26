@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ruff: noqa: E501
-"""Conservative daily cleanup of abandoned interactive sessions and caches."""
+"""Conservative daily cleanup of abandoned sessions, browsers, helpers and caches."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -24,6 +25,9 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 WEEK = 7 * 86400
+ORPHAN_HELPER_AGE = 3 * 86400  # abandoned Playwright/Xvfb/headless LibreOffice helpers
+LIVE_TASK = 3600  # a browser this young under a running agent belongs to live work
+KILL_GRACE = 10
 ARCHIVE_DAILY_LIMIT = 1024 * 1024 * 1024
 STATE = Path.home() / ".local/state/server-cleanup"
 CONFIG = Path.home() / ".config/server-cleanup"
@@ -45,6 +49,10 @@ TZ = _report_zone()
 
 
 CORE_PREFIXES = ("dbrain_",)
+# Headless/automation browsers are closed every night; an agent process
+# (Claude/Codex CLI, node-based) among the ancestors marks live work.
+AGENT_COMMS = {"claude", "codex", "node"}
+BROWSER_COMM = re.compile(r"^(chrome|chromium|chromium-browse|google-chrome|headless_shell|chrome_crashpad)")
 IDLE_CODEX = "Ask Codex to do anything"
 
 
@@ -155,6 +163,139 @@ def reason_to_skip(s: dict, protected: dict[str, int], now: float) -> str | None
     if not idle_prompt(s["name"]):
         return "idle state not verified"
     return None
+
+
+def process_table() -> dict[int, dict]:
+    """Snapshot of this user's processes: parent, start time, RSS and command."""
+    boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                if line.startswith("btime "))
+    ticks = os.sysconf("SC_CLK_TCK")
+    table: dict[int, dict] = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if (proc / "status").stat().st_uid != os.getuid():
+                continue
+            raw = (proc / "stat").read_text()
+            fields = raw[raw.rindex(")") + 2:].split()
+            rss = next((int(line.split()[1]) * 1024 for line in (proc / "status").read_text().splitlines()
+                        if line.startswith("VmRSS:")), 0)
+            table[int(proc.name)] = dict(
+                pid=int(proc.name), ppid=int(fields[1]), comm=raw[raw.index("(") + 1:raw.rindex(")")],
+                start=boot + int(fields[19]) / ticks, rss=rss, state=fields[0],
+                cmd=(proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore").strip(),
+            )
+        except (OSError, PermissionError, ValueError, IndexError):
+            continue
+    return table
+
+
+def descendants(table: dict[int, dict], root: int) -> list[int]:
+    children: dict[int, list[int]] = {}
+    for pid, p in table.items():
+        children.setdefault(p["ppid"], []).append(pid)
+    result, stack = [], [root]
+    while stack:
+        pid = stack.pop()
+        result.append(pid)
+        stack.extend(children.get(pid, []))
+    return result
+
+
+def is_browser(p: dict) -> bool:
+    return bool(BROWSER_COMM.match(p["comm"]))
+
+
+def under_agent(table: dict[int, dict], pid: int) -> bool:
+    """True when a Claude/Codex process is among the ancestors."""
+    seen = set()
+    pid = table[pid]["ppid"]
+    while pid in table and pid not in seen:
+        seen.add(pid)
+        p = table[pid]
+        if p["comm"] in AGENT_COMMS and re.search(r"\b(claude|codex)\b", p["cmd"]):
+            return True
+        pid = p["ppid"]
+    return False
+
+
+def helper_kind(p: dict) -> str | None:
+    """Orphan automation helpers that are safe to stop when abandoned."""
+    cmd = p["cmd"]
+    if p["comm"] == "node" and "playwright" in cmd and "run-driver" in cmd:
+        return "Playwright"
+    if p["comm"] == "Xvfb":
+        return "Xvfb"
+    if p["comm"] in {"oosplash", "soffice.bin"} and "--headless" in cmd:
+        return "LibreOffice"
+    return None
+
+
+def process_label(p: dict) -> str:
+    profile = re.search(r"--user-data-dir=(\S+)", p["cmd"])
+    where = profile.group(1) if profile else p["cmd"].split(" ")[0]
+    home = str(Path.home())
+    return f"{p['comm']} {p['pid']} ({where.replace(home, '~')[-70:]})"
+
+
+def find_stale_processes(now: float) -> tuple[list[dict], dict[str, str], list[str]]:
+    """Browser trees (nightly) and orphan helpers older than ORPHAN_HELPER_AGE."""
+    table = process_table()
+    own = os.getpid()
+    targets, skipped, noted = [], {}, []
+    for pid, p in table.items():
+        parent = table.get(p["ppid"])
+        if pid == own or p["state"] == "Z":
+            continue
+        if is_browser(p) and not (parent and is_browser(parent)):
+            if now - p["start"] < LIVE_TASK and under_agent(table, pid):
+                skipped[process_label(p)] = "live agent task"
+                continue
+            kind = "browser"
+        elif p["ppid"] == 1 and (kind := helper_kind(p)):
+            if now - p["start"] < ORPHAN_HELPER_AGE:
+                skipped[process_label(p)] = "recent helper"
+                continue
+        else:
+            if (p["ppid"] == 1 and now - p["start"] >= ORPHAN_HELPER_AGE
+                    and p["comm"] not in {"systemd", "tmux: server", "uv", "(sd-pam)"}):
+                noted.append(f"{p['comm']} {pid}, {p['rss'] // 1048576} МиБ")
+            continue
+        tree = [x for x in descendants(table, pid) if x != own]
+        targets.append(dict(kind=kind, label=process_label(p), pids=tree,
+                            starts={x: table[x]["start"] for x in tree},
+                            rss=sum(table[x]["rss"] for x in tree)))
+    return targets, skipped, noted
+
+
+def same_process(pid: int, start: float) -> bool:
+    """Guard against PID reuse between the scan and a signal."""
+    current = process_table().get(pid)
+    return bool(current) and abs(current["start"] - start) < 1
+
+
+def stop_process_tree(target: dict) -> None:
+    alive = [pid for pid in target["pids"] if same_process(pid, target["starts"][pid])]
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + KILL_GRACE
+    while time.time() < deadline:
+        table = process_table()
+        alive = [pid for pid in alive if pid in table and table[pid]["state"] != "Z"
+                 and abs(table[pid]["start"] - target["starts"][pid]) < 1]
+        if not alive:
+            return
+        time.sleep(0.5)
+    for pid in alive:
+        if same_process(pid, target["starts"][pid]):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def mem_available() -> int:
@@ -449,6 +590,8 @@ def report_text(report: dict) -> str:
     closed = ", ".join(report["closed"]) or "нет"
     lines = ["🧹 <b>Ежедневная уборка сервера</b>",
              f"Сессии закрыты: {html.escape(closed)}.",
+             f"Браузеры закрыты: {report['browsers']} шт., около {mib(report['browser_bytes'])}.",
+             f"Брошенные помощники закрыты: {html.escape(', '.join(report['helpers']) or 'нет')} (около {mib(report['helper_bytes'])}).",
              f"Кэш pip старше 7 дней: {report['pip_files']} файлов, {mib(report['pip_bytes'])}.",
              f"Старые временные папки Claude: {report['scratchpads']} шт., {mib(report['scratchpad_bytes'])}.",
              f"Временные файлы завершённых заданий: {report['job_tmp']} шт., {mib(report['job_tmp_bytes'])}.",
@@ -468,6 +611,9 @@ def report_text(report: dict) -> str:
     lines.append("Крупнейшие категории: " + "; ".join(
         f"{html.escape(name)} {size / 1073741824:.1f} ГиБ" for name, size in top
     ) + ".")
+    if report.get("noted"):
+        lines.append("Не трогал, старые процессы без родителя: "
+                     + html.escape("; ".join(report["noted"])[:400]) + ".")
     if report["errors"]:
         lines.append("Ошибки: " + html.escape("; ".join(report["errors"])[:800]))
     return "\n".join(lines)
@@ -500,6 +646,8 @@ def run_cleanup(dry_run: bool) -> dict:
     before = tmux_sessions()
     protected = protected_sessions()
     report = dict(at=datetime.now(TZ).isoformat(), dry_run=dry_run, closed=[], skipped={},
+                  browsers=0, browser_bytes=0, browser_list=[], helpers=[], helper_bytes=0,
+                  process_skipped={}, noted=[],
                   pip_files=0, pip_bytes=0, scratchpads=0, scratchpad_bytes=0,
                   job_tmp=0, job_tmp_bytes=0,
                   logs_archived=0, logs_original_bytes=0, logs_archive_bytes=0,
@@ -524,6 +672,20 @@ def run_cleanup(dry_run: bool) -> dict:
             report["closed"].append(name)
         else:
             report["errors"].append(f"tmux {name}: {result.stderr.strip()[:100]}")
+    try:
+        targets, report["process_skipped"], report["noted"] = find_stale_processes(now)
+        for target in targets:
+            if not dry_run:
+                stop_process_tree(target)
+            if target["kind"] == "browser":
+                report["browsers"] += 1
+                report["browser_bytes"] += target["rss"]
+                report["browser_list"].append(target["label"])
+            else:
+                report["helpers"].append(f"{target['kind']} {target['pids'][0]}")
+                report["helper_bytes"] += target["rss"]
+    except OSError as exc:
+        report["errors"].append(f"processes: {exc.strerror or type(exc).__name__}")
     report["pip_files"], report["pip_bytes"] = prune_old_pip_cache(now, dry_run)
     try:
         report["scratchpads"], report["scratchpad_bytes"] = prune_claude_scratchpads(now, dry_run)

@@ -7,7 +7,8 @@ class FakeProc:
     def __init__(self, daily=None):
         self._daily = daily or {}
 
-    def process_daily(self):
+    def process_daily(self, day=None):
+        self.day = day
         return self._daily
 
 
@@ -36,3 +37,12 @@ def test_run_unknown_command():
     text, ok = run("frobnicate", FakeProc())
     assert not ok
     assert "unknown" in text.lower()
+
+
+def test_run_daily_for_a_missed_day_passes_the_date():
+    from datetime import date
+
+    proc = FakeProc(daily={"report": "<b>ok</b>"})
+    _, ok = run("daily", proc, date(2026, 10, 25))
+    assert ok
+    assert proc.day == date(2026, 10, 25)
