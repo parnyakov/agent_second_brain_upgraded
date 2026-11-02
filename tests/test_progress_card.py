@@ -727,6 +727,20 @@ def test_stopping_a_card_task_that_never_ran_does_not_leak_cancellation(transcri
     asyncio.run(scenario())  # не должно бросить
 
 
+def test_final_answer_record_never_becomes_a_status():
+    """Reply ledger: no marker cuts the answer off any more; the record that
+    ENDS the turn (stop_reason end_turn) is the answer itself and stays out
+    of the card. Narration before a tool call still shows."""
+    narration = assistant(
+        text_block("Сейчас посмотрю файл"), tool_block("Read", file_path="/a.py")
+    )
+    narration["message"]["stop_reason"] = "tool_use"
+    final = assistant(text_block("Итоговый ответ"))
+    final["message"]["stop_reason"] = "end_turn"
+    assert progress.statuses_from_record(narration)[0] == "Сейчас посмотрю файл"
+    assert progress.statuses_from_record(final) == []
+
+
 def test_handler_removes_the_card_before_the_reply(monkeypatch, transcript):
     """Карточка снимается ДО ответа, и ответ приходит отдельным сообщением."""
     from d_brain.bot.handlers import chat
@@ -748,3 +762,20 @@ def test_handler_removes_the_card_before_the_reply(monkeypatch, transcript):
     assert bot.deleted, "карточка должна быть удалена"
     # Ответ — последнее сообщение, и он не склеен с карточкой.
     assert bot.sent[-1][1] == "готово"
+
+
+def test_handler_sends_nothing_and_does_not_retry_a_silent_turn(monkeypatch):
+    """Silent: the turn finished with nothing to say. No message, no
+    "Claude не ответил дважды", no second turn."""
+    from d_brain.bot.handlers import chat
+    from d_brain.services.chat_session import Silent
+
+    mgr = FakeManager(transcript=None, reply=Silent())
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+    res = asyncio.run(
+        chat._process_and_reply(bot, chat_id=7, user_id=1, prompt="привет")
+    )
+    assert res is None
+    assert bot.sent == []
+    assert len(mgr.sent) == 1

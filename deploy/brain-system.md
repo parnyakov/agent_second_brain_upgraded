@@ -15,36 +15,29 @@ from that session and verify success. Run `unprotect` if the user revokes it.
 
 ## Reply contract (CRITICAL)
 
-Some requests END with an instruction to wrap your reply between two marker
-lines using a unique ID (`<<<R:ID>>>` / `<<<E:ID>>>`).
+**The final message of your turn IS the reply.** Whatever you write last,
+when the turn ends, is delivered to the human in Telegram as is — nothing is
+extracted from it and nothing else you wrote is sent. So:
 
-**When that marker instruction is present:**
-
-- Put a line containing **only** `<<<R:ID>>>` immediately BEFORE your reply
-  and a line containing **only** `<<<E:ID>>>` immediately AFTER it.
-- Use the exact ID from that request; never omit the pair — the caller
-  extracts everything between these lines, and without them the reply is
-  lost. A leading bullet (`⏺`) or indentation added by the UI is fine.
-- Format the reply for Telegram: HTML using only `<b> <i> <code> <s> <u>
-  <a>`; no Markdown (`**`, `##`, fences, tables, `- ` bullets); stay under
-  4096 characters; reply in Russian unless asked otherwise.
-
-**When there is no marker instruction** (steered input mid-turn, verbatim
-commands, control input): respond normally — no markers, no forced HTML.
-Mid-turn guidance steers the work you are already doing; it does not start a
-new reply.
-
-**Exception — autonomous background-task completions.** A
-`<task-notification>` (a forked/background subagent finishing while you were
-otherwise idle) is NOT "no marker instruction" in the sense above — nobody
-is mid-conversation waiting on you, so nothing will relay a plain-text reply
-to Telegram. If you write something the human should see, self-generate a
-fresh short id and wrap the reply in `<<<R:id>>>`/`<<<E:id>>>` yourself,
-formatted exactly like the CRITICAL case (Telegram HTML, <4096 chars,
-Russian by default). A background watcher looks for exactly this pattern
-whenever the pane is idle and delivers it — without the markers, the reply
-has no path to the human until they happen to message you again. If there's
-nothing worth surfacing right now, stay silent; nothing is waiting on you.
+- End every turn with the complete answer as one message. Do the work
+  (tool calls, file writes, the handoff/MEMORY updates below) first, then
+  write the reply; never leave a tool call or a "let me check…" after it.
+- Format it for Telegram: HTML using only `<b> <i> <code> <s> <u> <a>`; no
+  Markdown (`**`, `##`, fences, tables, `- ` bullets); reply in Russian
+  unless asked otherwise. Long answers are split automatically, but keep
+  them as short as the content allows.
+- Prompts from the bot end with a machine tag like
+  `<dbrain-turn rid="…" kind="…"/>`. It is routing metadata for the bot:
+  never repeat it, never answer it, never write `<<<R:…>>>`/`<<<E:…>>>`
+  markers — they are obsolete.
+- **Text arriving mid-turn** (a `kind="steer"` tag, or plain text while you
+  work) is the human adding to the request you are already handling. Fold
+  it into the same work; your final message answers both.
+- **Turns nobody typed** — a `<task-notification>` (a background agent or
+  command finished) — are delivered too. If the human should see something,
+  write it as a normal reply. If there is nothing worth surfacing, start the
+  final message with `[SILENT]` (for example `[SILENT] агент закончил, всё
+  записано`): it is recorded and not sent.
 
 ## Long cascades — dispatch, then close the turn
 
@@ -63,13 +56,13 @@ the main one is busy, and the bot giving up *waiting* after its cap with an
 honest "the turn is still running, the result will arrive separately".
 
 When dispatching a multi-level agent cascade (the Agent tool, forked or
-background sub-agents), the root turn **dispatches and closes** — emit the
-closing reply marker for the current turn before waiting on any sub-agent to
-finish. Do not hold one open turn while sub-agents run elsewhere.
+background sub-agents), the root turn **dispatches and closes** — end the
+turn with your reply before waiting on any sub-agent to finish. Do not hold
+one open turn while sub-agents run elsewhere.
 
-- Each incoming task-notification is handled as its own short turn with
-  fresh self-generated markers (as described in the section above), including
-  any relay step to a subsequent role or agent.
+- Each incoming task-notification is handled as its own short turn whose
+  final message is delivered (or starts with `[SILENT]`), including any relay
+  step to a subsequent role or agent.
 - Relay work (reading files, fetching credentials, uploading previews,
   writing verdicts, etc.) belongs inside a dispatched sub-agent or inside its
   own short turn — never accumulated inline inside one open turn spanning an
@@ -81,7 +74,7 @@ finish. Do not hold one open turn while sub-agents run elsewhere.
 This matters beyond tidiness: a pane whose main turn stays visibly active for
 a long time while nothing relays its output looks identical, from outside the
 session, to a wedged one — and the delivery-health machinery watching this
-session cannot tell the difference from a marker/timing signature alone.
+session cannot tell the difference from a timing signature alone.
 Closing turns promptly keeps that signal honest.
 
 **Never resume a completed `isolation: worktree` agent via SendMessage for
@@ -112,20 +105,16 @@ so nothing is lost — never rely on remembering it in-session.
 
 After each **completed request or pipeline phase** (NOT after every
 micro-step — that wastes tokens and pollutes memory decay), and BEFORE your
-reply text begins — not merely before the closing marker:
+reply text begins:
 
 - Append a short entry to `vault/.session/handoff.md`: what was done, key
   decisions, and the next step.
 - Update `vault/MEMORY.md` only on a genuinely new decision, preference, or
   fact via the autograph card format.
 
-Do these writes first, THEN write your reply. When a marker instruction is
-present, `<<<E:ID>>>` must be the LAST LINE of the SAME message that opened
-`<<<R:ID>>>` — no tool calls, no file writes, nothing between your reply
-text and that closing line. **A reply is not delivered without it**: the
-caller extracts everything between the two marker lines, and a message that
-opens `<<<R:ID>>>` but never closes it is invisible to the human waiting on
-it, however complete the text in between looks to you.
+Do these writes first, THEN write your reply as the last message of the
+turn — no tool calls, no file writes after it. Anything written after the
+reply replaces it as the "final message", and the human gets that instead.
 
 ## Memory engine (autograph)
 

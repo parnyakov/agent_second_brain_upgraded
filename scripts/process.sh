@@ -199,7 +199,10 @@ echo "ORIENT: daily=$DAILY_SIZE bytes, handoff=OK, graph=OK"
 # processing through the shared session and prints the HTML report.
 echo "=== Daily processing (interactive session) ==="
 set +e
-REPORT=$(cd "$PROJECT_DIR" && uv run python -m d_brain.pipeline daily "$TODAY" 2>&1)
+# stderr (Python INFO logging, uv noise) goes to the log, never into the
+# Telegram report: `2>&1` here once put "INFO:d_brain.services.turn_state:
+# turn-source=hooks" at the top of the user's evening message (2026-10-30).
+REPORT=$(cd "$PROJECT_DIR" && uv run python -m d_brain.pipeline daily "$TODAY")
 PIPELINE_EXIT=$?
 set -e
 

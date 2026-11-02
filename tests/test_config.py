@@ -290,3 +290,12 @@ def test_pane_geometry_rejects_a_degenerate_size(tmp_path):
         _base_settings(tmp_path, pane_width=10)
     with pytest.raises(ValidationError):
         _base_settings(tmp_path, pane_height=2)
+
+
+def test_empty_reply_notice_is_off_by_default_and_set_per_instance(monkeypatch):
+    """A turn that ended without text is silent unless the instance's env
+    asks for the technical notice (DBRAIN_EMPTY_REPLY_NOTICE=1)."""
+    monkeypatch.delenv("DBRAIN_EMPTY_REPLY_NOTICE", raising=False)
+    assert _settings().empty_reply_notice is False
+    monkeypatch.setenv("DBRAIN_EMPTY_REPLY_NOTICE", "1")
+    assert _settings().empty_reply_notice is True

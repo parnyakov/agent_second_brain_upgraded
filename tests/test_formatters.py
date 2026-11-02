@@ -53,3 +53,13 @@ class TestTruncateHtml:
         out = truncate_html(text, 4096)
         assert len(out) <= 4096
         assert out.endswith("</b>")
+
+
+def test_process_report_with_empty_text_is_never_an_empty_message():
+    """/process edits its status message with this text; Telegram rejects
+    an empty one, so a silent processing turn gets the plain done line."""
+    from d_brain.bot.formatters import format_process_report
+
+    assert format_process_report({"report": "", "processed_entries": 1}) == (
+        "✅ <b>Обработка завершена</b>"
+    )

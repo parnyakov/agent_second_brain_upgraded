@@ -10,15 +10,31 @@ def test_persona_has_sentinel_header():
     assert text.startswith("# d-brain session contract")
 
 
-def test_marker_instruction_is_conditional():
-    """v3.0: markers are required ONLY when the request carries the marker
-    instruction (wrap=True turns). Verbatim/steered input gets a normal
-    reply — no unconditional 'every request' wording allowed."""
+LEGACY = PERSONA.with_name("brain-system-markers.md")
+
+
+def test_reply_contract_is_the_final_message():
+    """Reply ledger (2026-10-29): the final message of the turn is the reply;
+    the machine tag is never echoed; [SILENT] silences a background turn."""
     text = PERSONA.read_text()
+    assert "The final message of your turn IS the reply" in text
+    assert "<dbrain-turn" in text and "never repeat it" in text
+    assert "[SILENT]" in text
+    assert "<<<R:ID>>>" not in text  # the marker contract lives in LEGACY only
+
+
+def test_legacy_marker_instruction_is_conditional():
+    """The marker-path persona (used while the ledger is off): markers are
+    required ONLY when the request carries the marker instruction (wrap=True
+    turns). Verbatim/steered input gets a normal reply — no unconditional
+    'every request' wording allowed."""
+    text = LEGACY.read_text()
+    assert text.startswith("# d-brain session contract")
     assert "Every request ends with an instruction" not in text
     low = text.lower()
     assert "when" in low and "marker" in low
     assert "no marker instruction" in low or "without a marker instruction" in low
+    assert "<<<R:ID>>>" in text and "<<<E:ID>>>" in text
 
 
 def test_persona_names_autograph_memory():

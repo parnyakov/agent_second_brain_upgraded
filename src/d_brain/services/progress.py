@@ -262,6 +262,17 @@ def statuses_from_record(rec: Any, *, tagged: bool = False) -> list:
     out: list[tuple[str, bool]] = []
     try:
         content = _record_blocks(rec)
+        message = rec.get("message") if isinstance(rec, dict) else None
+        if (
+            content is not None
+            and isinstance(message, dict)
+            and message.get("stop_reason") == "end_turn"
+        ):
+            # Запись, которой модель ЗАКАНЧИВАЕТ ход, — это и есть ответ
+            # (журнал ходов, 2026-10-29: ответ = последнее сообщение хода,
+            # маркера, по которому его отсекали раньше, больше нет). Он уйдёт
+            # отдельным сообщением; в карточке ему делать нечего.
+            content = None
         if content is None:
             pass
         elif isinstance(content, str):

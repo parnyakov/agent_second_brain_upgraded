@@ -26,6 +26,7 @@ from d_brain.services import chat_queue, progress
 from d_brain.services.chat_session import (
     Busy,
     ChatSessionManager,
+    Silent,
     busy_fallback_message,
 )
 from d_brain.services.claude_session import DEFAULT_TIMEOUT
@@ -123,6 +124,12 @@ async def _dispatch_text(
 
     manager = _get_manager()
     turn_active = manager.is_turn_active()
+    if not turn_active and _cli_turn_steerable(manager):
+        # Reply ledger: the CLI turn itself is open although nothing holds
+        # the ask-lock (a task-notification turn, or a turn whose ask() gave
+        # up waiting). The text joins it; the turn's final message answers it
+        # and the reply pump delivers that.
+        turn_active = True
     if (
         not turn_active
         and text.strip().lower() in _STOP_WORDS
@@ -167,6 +174,20 @@ async def _dispatch_text(
     # (blind review F6), so that voice, media and album messages pass through
     # it too.
     await _process_and_reply(bot, chat_id, user_id, text, message_id=message_id)
+
+
+def _cli_turn_steerable(manager: Any) -> bool:
+    """Reply-ledger steer gate (hook state, not the lock). False on the
+    marker path, on Codex and on any probe failure."""
+    try:
+        # `is True`, not truthiness: a duck-typed manager (tests, tools)
+        # without the attribute must read as the marker path.
+        if getattr(manager, "reply_ledger", False) is not True:
+            return False
+        return manager.is_steerable_turn() is True
+    except Exception:  # noqa: BLE001
+        logger.warning("steerability probe failed", exc_info=True)
+        return False
 
 
 async def _main_is_busy(manager: Any) -> bool:
@@ -525,6 +546,12 @@ async def _run_turn(
                 fallback=response.fallback, busy_seconds=response.busy_seconds
             )
 
+        # ``Silent``: the turn finished with nothing to say (bare [SILENT]
+        # or no text). Logged by the manager and the reply ledger; no
+        # message, and no retry of a turn that did complete.
+        if isinstance(response, Silent):
+            return None
+
         if response:
             await send_response(bot, chat_id, response, reply_to=reply_to)
         else:
@@ -543,6 +570,8 @@ async def _run_turn(
                 return _Later(
                     fallback=response.fallback, busy_seconds=response.busy_seconds
                 )
+            if isinstance(response, Silent):
+                return None
             if response:
                 await send_response(bot, chat_id, response, reply_to=reply_to)
             else:

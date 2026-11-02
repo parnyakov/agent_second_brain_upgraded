@@ -1486,3 +1486,37 @@ def test_the_long_run_notice_only_claims_the_channel_is_intact_when_it_is(tmp_pa
     clock2["now"] = 2061.0
     wd2.check_once()
     assert "исправен" not in _start_hits(alerts2)[0]
+
+
+# ── blocking CLI choice dialog (2026-10-26/27) ─────────────────────────
+
+
+def test_choice_dialog_is_dismissed_not_recovered(tmp_path):
+    sess = FakeSession(state=PaneState.CHOICE_DIALOG)
+    calls = []
+
+    def dismiss():
+        calls.append(1)
+        sess.state = PaneState.READY
+        return True
+
+    sess.dismiss_choice_dialog = dismiss
+    clock = {"now": 1000.0}
+    wd = make_wd(tmp_path, sess, clock=clock)
+    assert wd.check_once() == "dialog_dismissed"
+    clock["now"] += 400.0
+    assert wd.check_once() == "healthy"
+    assert calls == [1]
+    assert sess.recovered == 0
+
+
+def test_choice_dialog_with_busy_pane_falls_back_to_hang_clock(tmp_path):
+    # Lock held by a live ask(): the watchdog leaves the dialog to it and
+    # keeps today's hang accounting (force_recover is refused under the lock).
+    sess = FakeSession(state=PaneState.CHOICE_DIALOG, recover_ok=False)
+    sess.dismiss_choice_dialog = lambda: False
+    clock = {"now": 1000.0}
+    wd = make_wd(tmp_path, sess, clock=clock)
+    assert wd.check_once() == "healthy"
+    clock["now"] += 301.0
+    assert wd.check_once() == "recover_deferred"

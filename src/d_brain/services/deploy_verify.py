@@ -75,6 +75,14 @@ DELIVERY_CRITICAL_PATHS = (
     "deploy/systemd/dbrain-bot@.service",
     "deploy/dbrain-watchdog.service",
     "deploy/brain-system.md",
+    # The reply ledger (2026-10-29): the hook that writes it, the module that
+    # reads and claims it, the pump that delivers unbound turns, and the
+    # marker-path persona used while the ledger is off.
+    "scripts/turn_hook.py",
+    "src/d_brain/services/turn_ledger.py",
+    "src/d_brain/services/turn_state.py",
+    "src/d_brain/services/reply_pump.py",
+    "deploy/brain-system-markers.md",
 )
 
 CANARY_TIMEOUT = 120.0

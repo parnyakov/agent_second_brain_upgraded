@@ -8,6 +8,7 @@ handlers don't need to change.
 """
 
 import logging
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,19 @@ _STATUS_MESSAGES = {
     "error": "❌ <b>Ошибка сессии.</b> Попробуйте позже.",
     "reset": "⏹ <b>Прервано командой /reset.</b> Запустите ещё раз.",
 }
+
+
+# DBRAIN_DAILY_REPORT=off: the processing itself runs as usual, but nothing
+# of it may reach the chat. process.sh already drops the synchronous reply;
+# a turn the CLI opens later (a background agent's <task-notification>) is
+# delivered by the reply pump unless it opens with [SILENT].
+_QUIET_SUFFIX = """
+
+ОТЧЁТ ВЫКЛЮЧЕН (DBRAIN_DAILY_REPORT=off): обработку выполни полностью, но
+пользователю ничего не отправляй. Ответ на это сообщение и КАЖДОЕ твоё
+итоговое сообщение по этой обработке, включая сообщение после завершения
+фоновых агентов, начинай строкой [SILENT], дальше одна строка итога.
+Не обещай «отчёт пришлю отдельным сообщением»."""
 
 
 class ClaudeProcessor:
@@ -107,4 +121,6 @@ CRITICAL OUTPUT FORMAT:
 - Start directly with 📊 <b>Обработка за {day}</b>
 - Allowed tags: <b>, <i>, <code>, <s>, <u>
 - If entries already processed, return status report in same HTML format"""
+        if os.environ.get("DBRAIN_DAILY_REPORT", "on") == "off":
+            prompt += _QUIET_SUFFIX
         return self._ask(prompt, wrap=True)

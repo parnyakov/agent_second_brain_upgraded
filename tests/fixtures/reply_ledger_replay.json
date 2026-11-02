@@ -1,0 +1,1059 @@
+{
+ "cases": [
+  {
+   "name": "incident_2026-10-29_old_rid_echo_steers_lost",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-29T06:45:11.927000+03:00",
+   "notes": "Turn 1 (bound 3375e36d) ended with the PREVIOUS turn's pair <<<R/E:9d28adc0>>> (already handled), so neither ask() nor the orphan poller could deliver it; ask() kept the lock (bot showed 'thinking'). Messages from Telegram were classified as steers (lock held) and typed into an idle CLI: each started its own CLI turn with no ask() bound to it (turns 2,3,4; turn 3 also absorbed a third steer mid-turn). Turn 4's reply was self-wrapped with a fresh rid a7c2e91f but the poller does not run while ask() holds the lock and it was never delivered later. Turn 5 is a message typed directly in the tmux pane by the owner (not via Telegram); its reply carried <<<R/E:3375e36d>>>, which finally released the waiting ask at +556 s.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "9d28adc0",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 10.678,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:9d28adc0>>>\n<reply text, 1235 chars>\n<<<E:9d28adc0>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 128.31,
+     "kind": "user_prompt",
+     "rid": "3375e36d",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 155.483,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:9d28adc0>>>\n<reply text, 919 chars>\n<<<E:9d28adc0>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 312.378,
+     "kind": "steer",
+     "rid": null,
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 322.293,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<reply text, 498 chars>",
+     "background_tasks": 0
+    },
+    {
+     "t": 332.477,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 357.176,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 374.297,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 3,
+     "final_text": "<reply text, 808 chars>",
+     "background_tasks": 0
+    },
+    {
+     "t": 520.456,
+     "kind": "steer",
+     "rid": null,
+     "turn": 4,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 527.149,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 4,
+     "final_text": "<<<R:a7c2e91f>>>\n<reply text, 680 chars>\n<<<E:a7c2e91f>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 642.689,
+     "kind": "user_prompt",
+     "rid": null,
+     "turn": 5,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 684.296,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 5,
+     "final_text": "<<<R:3375e36d>>>\n<reply text, 1816 chars>\n<<<E:3375e36d>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 762.546,
+     "kind": "user_prompt",
+     "rid": "b4adeaf2",
+     "turn": 6,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 783.781,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 6,
+     "final_text": "<<<R:b4adeaf2>>>\n<reply text, 1682 chars>\n<<<E:b4adeaf2>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "9d28adc0": "delivered",
+    "3375e36d": "delivered",
+    "turn 2": "lost",
+    "turn 3": "lost",
+    "turn 4": "lost",
+    "turn 5": "delivered",
+    "b4adeaf2": "delivered"
+   }
+  },
+  {
+   "name": "2026-10-24_ask_never_registered_task_notification_and_steers_lost",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-24T15:03:52.601000+03:00",
+   "notes": "ask a78f263e was typed at ~15:14:36 MSK but its prompt never registered in the CLI (no user record, no queue-operation): the CLI hooks would report nothing for it. While that ask held the lock, a task-notification turn produced a self-wrapped reply w2n6f4 (never delivered: poller skips while ask() holds the lock), then four Telegram messages were steered: the first started a new unbound CLI turn, three more were absorbed mid-turn; the turn's reply had no markers. The ask timed out at 15:36:12 (+~22 min).",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 10.098,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:z3k7m1>>>\n<reply text, 643 chars>\n<<<E:z3k7m1>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 435.009,
+     "kind": "user_prompt",
+     "rid": "46ac1c41",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 457.983,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:46ac1c41>>>\n<reply text, 231 chars>\n<<<E:46ac1c41>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 738.145,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 745.845,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:w2n6f4>>>\n<reply text, 378 chars>\n<<<E:w2n6f4>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 746.898,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 759.218,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 773.543,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 788.021,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 802.779,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 3,
+     "final_text": "<reply text, 917 chars>",
+     "background_tasks": 1
+    },
+    {
+     "t": 1619.846,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 4,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1640.835,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 4,
+     "final_text": "<<<R:v6b2n8>>>\n<reply text, 1483 chars>\n<<<E:v6b2n8>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "turn 0": "late_orphan",
+    "46ac1c41": "delivered",
+    "turn 2": "lost",
+    "turn 3": "lost",
+    "turn 4": "late_orphan",
+    "a78f263e": "lost"
+   }
+  },
+  {
+   "name": "2026-10-15_ask_never_registered_steers_and_notifications_lost",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-15T09:15:30.002000+03:00",
+   "notes": "Same shape as 2026-10-24 over 25 minutes: the bound prompt 39e7d033 never reached the CLI; meanwhile 8 Telegram messages were steered into an idle CLI, forming 7 unbound CLI turns (no markers -> lost), and 6 self-wrapped task-notification replies were produced (5 lost while the ask held the lock, 1 delivered later by the poller). Steers typed in the last seconds of a turn were queued by the CLI and run as their own turn (modelled at dequeue time).",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "64b3be7f",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 17.009,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:64b3be7f>>>\n<reply text, 516 chars>\n<<<E:64b3be7f>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 69.518,
+     "kind": "user_prompt",
+     "rid": "f60fa80a",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 80.938,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:f60fa80a>>>\n<reply text, 331 chars>\n<<<E:f60fa80a>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 299.627,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 310.13,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:pv5t6r8j>>>\n<reply text, 648 chars>\n<<<E:pv5t6r8j>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 545.699,
+     "kind": "steer",
+     "rid": null,
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 565.139,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 3,
+     "final_text": "<reply text, 611 chars>",
+     "background_tasks": 1
+    },
+    {
+     "t": 606.893,
+     "kind": "steer",
+     "rid": null,
+     "turn": 4,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 614.26,
+     "kind": "steer",
+     "rid": null,
+     "turn": 4,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 626.364,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 4,
+     "final_text": "<reply text, 502 chars>",
+     "background_tasks": 2
+    },
+    {
+     "t": 626.412,
+     "kind": "steer",
+     "rid": null,
+     "turn": 5,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 629.897,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 5,
+     "final_text": "<reply text, 297 chars>",
+     "background_tasks": 2
+    },
+    {
+     "t": 711.903,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 6,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 727.532,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 6,
+     "final_text": "<<<R:tr2v5n8x>>>\n<reply text, 713 chars>\n<<<E:tr2v5n8x>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 901.094,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 7,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 912.268,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 7,
+     "final_text": "<<<R:vn4k7p2s>>>\n<reply text, 596 chars>\n<<<E:vn4k7p2s>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 997.468,
+     "kind": "steer",
+     "rid": null,
+     "turn": 8,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1008.079,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 8,
+     "final_text": "<reply text, 302 chars>",
+     "background_tasks": 1
+    },
+    {
+     "t": 1094.785,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 9,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1103.117,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 9,
+     "final_text": "<<<R:vn6q3m9t>>>\n<reply text, 352 chars>\n<<<E:vn6q3m9t>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 1236.365,
+     "kind": "steer",
+     "rid": null,
+     "turn": 10,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1246.808,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 10,
+     "final_text": "<reply text, 356 chars>",
+     "background_tasks": 1
+    },
+    {
+     "t": 1450.272,
+     "kind": "steer",
+     "rid": null,
+     "turn": 11,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1462.2,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 11,
+     "final_text": "<reply text, 309 chars>",
+     "background_tasks": 2
+    },
+    {
+     "t": 1541.077,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 12,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1548.815,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 12,
+     "final_text": "<<<R:tf8w2k5n>>>\n<reply text, 250 chars>\n<<<E:tf8w2k5n>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 1637.576,
+     "kind": "steer",
+     "rid": null,
+     "turn": 13,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1647.58,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 13,
+     "final_text": "<reply text, 787 chars>",
+     "background_tasks": 1
+    },
+    {
+     "t": 1671.244,
+     "kind": "user_prompt",
+     "rid": "199077bf",
+     "turn": 14,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1683.256,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 14,
+     "final_text": "<<<R:199077bf>>>\n<reply text, 414 chars>\n<<<E:199077bf>>>",
+     "background_tasks": 2
+    },
+    {
+     "t": 1716.038,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 15,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 1723.894,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 15,
+     "final_text": "<<<R:vn8d4x6w>>>\n<reply text, 291 chars>\n<<<E:vn8d4x6w>>>",
+     "background_tasks": 1
+    }
+   ],
+   "old_path_outcome": {
+    "64b3be7f": "delivered",
+    "f60fa80a": "delivered",
+    "turn 2": "lost",
+    "turn 3": "lost",
+    "turn 4": "lost",
+    "turn 5": "lost",
+    "turn 6": "lost",
+    "turn 7": "lost",
+    "turn 8": "lost",
+    "turn 9": "lost",
+    "turn 10": "lost",
+    "turn 11": "lost",
+    "turn 12": "lost",
+    "turn 13": "lost",
+    "199077bf": "delivered",
+    "turn 15": "late_orphan",
+    "39e7d033": "lost"
+   }
+  },
+  {
+   "name": "2026-10-21_old_rid_echo_previous_turn",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-21T12:51:08.894000+03:00",
+   "notes": "Bound d8322a28 answered with the previous turn's pair <<<R/E:0c6ed705>>> (context ~67k tokens, i.e. not a long-context effect). The rid was already handled, so the reply was never delivered; ask timed out after the 300 s no-activity ceiling.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "0c6ed705",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 7.783,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:0c6ed705>>>\n<reply text, 375 chars>\n<<<E:0c6ed705>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 27.691,
+     "kind": "user_prompt",
+     "rid": "d8322a28",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 53.923,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:0c6ed705>>>\n<reply text, 322 chars>\n<<<E:0c6ed705>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 497.721,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 506.551,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:a7d21f4e>>>\n<reply text, 470 chars>\n<<<E:a7d21f4e>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "0c6ed705": "delivered",
+    "d8322a28": "lost",
+    "turn 2": "late_orphan"
+   }
+  },
+  {
+   "name": "2026-10-17_old_rid_echo_previous_turn",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-17T06:47:09.157000+03:00",
+   "notes": "Two minutes after a /clear (context ~60k). Bound bb9c0123 answered with the previous turn's pair <<<R/E:64d5bebb>>>; lost.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "64d5bebb",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 9.502,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:64d5bebb>>>\n<reply text, 238 chars>\n<<<E:64d5bebb>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 140.776,
+     "kind": "user_prompt",
+     "rid": "bb9c0123",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 157.633,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:64d5bebb>>>\n<reply text, 326 chars>\n<<<E:64d5bebb>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 703.918,
+     "kind": "user_prompt",
+     "rid": "702f6c93",
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 706.535,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:702f6c93>>>\n<reply text, 326 chars>\n<<<E:702f6c93>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "64d5bebb": "delivered",
+    "bb9c0123": "lost",
+    "702f6c93": "delivered"
+   }
+  },
+  {
+   "name": "2026-10-15_old_rid_echo_previous_turn",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-15T07:29:30.334000+03:00",
+   "notes": "Bound 7ffb41ae answered with the previous turn's pair <<<R/E:ef4cca58>>> (~220k context); lost.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "ef4cca58",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 48.158,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:ef4cca58>>>\n<reply text, 1475 chars>\n<<<E:ef4cca58>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 452.874,
+     "kind": "user_prompt",
+     "rid": "7ffb41ae",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 496.035,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:ef4cca58>>>\n<reply text, 1517 chars>\n<<<E:ef4cca58>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "ef4cca58": "delivered",
+    "7ffb41ae": "lost"
+   }
+  },
+  {
+   "name": "2026-09-26_fresh_self_generated_rid_not_delivered",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-09-26T21:42:46.523000+03:00",
+   "notes": "Bound bbe12b11 answered with a self-generated rid 1d4c7a52 (as if it were a background completion). ask() ignored it and timed out; the orphan poller never delivered 1d4c7a52 either. The following task-notification reply 2f8e6a1c was delivered by the poller.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "bbe12b11",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 23.667,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:1d4c7a52>>>\n<reply text, 582 chars>\n<<<E:1d4c7a52>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 298.488,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 311.923,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:2f8e6a1c>>>\n<reply text, 2293 chars>\n<<<E:2f8e6a1c>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "bbe12b11": "lost",
+    "turn 1": "late_orphan"
+   }
+  },
+  {
+   "name": "2026-09-24_compaction_mid_turn_fresh_rid_late_orphan",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-09-24T21:04:41.609000+03:00",
+   "notes": "Auto-compaction at ~966k context happened inside the bound turn; after the compaction summary the model no longer had the rid and wrapped its reply with a fresh rid m9k24a. ask() timed out; the orphan poller delivered it later. The compaction-summary user record is not modelled as a separate event (it continues the same CLI turn).",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "5e770dd7",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 248.234,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:m9k24a>>>\n<reply text, 1149 chars>\n<<<E:m9k24a>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "5e770dd7": "late_orphan"
+   }
+  },
+  {
+   "name": "2026-10-01_no_markers_at_all",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-01T22:00:54.440000+03:00",
+   "notes": "Bound bd27b77d: a 3-second turn whose final text (212 chars) carried no markers at all (context ~535k). Not salvageable (no open marker), no orphan; lost. Preceded by a self-wrapped task-notification reply f2d8a6e1 that the poller delivered.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 9.871,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:f2d8a6e1>>>\n<reply text, 1776 chars>\n<<<E:f2d8a6e1>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 193.734,
+     "kind": "user_prompt",
+     "rid": "bd27b77d",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 196.911,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<reply text, 212 chars>",
+     "background_tasks": 0
+    },
+    {
+     "t": 567.572,
+     "kind": "user_prompt",
+     "rid": "630eca61",
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 603.045,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:630eca61>>>\n<reply text, 922 chars>\n<<<E:630eca61>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "turn 0": "late_orphan",
+    "bd27b77d": "lost",
+    "630eca61": "delivered"
+   }
+  },
+  {
+   "name": "2026-10-22_prompt_stuck_in_input_box_merged",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-22T11:34:39.636000+03:00",
+   "notes": "Prompt 8861ee88 sat unsubmitted in the CLI input box for 5 min (Enter lost); ask timed out. The next ask 337178c1 was appended to the same input and submitted as ONE 4959-char user prompt containing both marker instructions (two user_prompt events at the same t). The model answered once under 337178c1, so the user got a reply to the merged text via the normal path, after a timeout notice for 8861ee88. Steers typed during the stuck period are not separately visible in the transcript.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "8861ee88",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "337178c1",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 29.794,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:337178c1>>>\n<reply text, 1465 chars>\n<<<E:337178c1>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 33.659,
+     "kind": "user_prompt",
+     "rid": "93d985d4",
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 43.693,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:93d985d4>>>\n<reply text, 591 chars>\n<<<E:93d985d4>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 47.244,
+     "kind": "user_prompt",
+     "rid": "ea9c7edd",
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 56.217,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:ea9c7edd>>>\n<reply text, 354 chars>\n<<<E:ea9c7edd>>>",
+     "background_tasks": 0
+    }
+   ],
+   "old_path_outcome": {
+    "8861ee88": "delivered",
+    "337178c1": "delivered",
+    "93d985d4": "delivered",
+    "ea9c7edd": "delivered"
+   }
+  },
+  {
+   "name": "2026-10-05_steer_after_turn_end_becomes_unbound_turn",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-05T23:38:13.648000+03:00",
+   "notes": "Steer typed 2 s before bound turn 072d1e29 ended. The CLI queued it and ran it as its OWN turn after the bound turn closed (queue-operation enqueue -> dequeue), so no ask() was bound to it; the reply had no markers; lost.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "072d1e29",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 10.207,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:072d1e29>>>\n<reply text, 494 chars>\n<<<E:072d1e29>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 10.245,
+     "kind": "steer",
+     "rid": null,
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 18.288,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<reply text, 397 chars>",
+     "background_tasks": 1
+    },
+    {
+     "t": 47.817,
+     "kind": "user_prompt",
+     "rid": "d56cac8d",
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 55.519,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:d56cac8d>>>\n<reply text, 169 chars>\n<<<E:d56cac8d>>>",
+     "background_tasks": 1
+    }
+   ],
+   "old_path_outcome": {
+    "072d1e29": "delivered",
+    "turn 1": "lost",
+    "d56cac8d": "delivered"
+   }
+  },
+  {
+   "name": "2026-10-13_self_wrapped_notification_preempted_by_next_ask",
+   "source": "reconstructed from production bot.log, watchdog.log and CLI transcripts (ids and text redacted)",
+   "case_start": "2026-10-13T07:31:02.190000+03:00",
+   "notes": "A task-notification turn ended with a correct self-wrapped pair f3c7d2a1; the next bound ask 6258b25b was typed 2 s later. The orphan poller does not run while ask() holds the lock and f3c7d2a1 was never delivered afterwards. Across the window, 39 of 52 self-wrapped notification replies followed by a bound ask within 30 s were lost, vs 1 of 96 when nothing followed for 10+ min.",
+   "events": [
+    {
+     "t": 0.0,
+     "kind": "user_prompt",
+     "rid": "e1a66f12",
+     "turn": 0,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 12.986,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 0,
+     "final_text": "<<<R:e1a66f12>>>\n<reply text, 659 chars>\n<<<E:e1a66f12>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 91.408,
+     "kind": "task_notification",
+     "rid": null,
+     "turn": 1,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 104.707,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 1,
+     "final_text": "<<<R:f3c7d2a1>>>\n<reply text, 1565 chars>\n<<<E:f3c7d2a1>>>",
+     "background_tasks": 0
+    },
+    {
+     "t": 105.99,
+     "kind": "user_prompt",
+     "rid": "6258b25b",
+     "turn": 2,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 131.233,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 2,
+     "final_text": "<<<R:6258b25b>>>\n<reply text, 527 chars>\n<<<E:6258b25b>>>",
+     "background_tasks": 1
+    },
+    {
+     "t": 171.457,
+     "kind": "user_prompt",
+     "rid": "9bf8758f",
+     "turn": 3,
+     "final_text": null,
+     "background_tasks": 0
+    },
+    {
+     "t": 180.071,
+     "kind": "turn_end",
+     "rid": null,
+     "turn": 3,
+     "final_text": "<<<R:9bf8758f>>>\n<reply text, 1386 chars>\n<<<E:9bf8758f>>>",
+     "background_tasks": 1
+    }
+   ],
+   "old_path_outcome": {
+    "e1a66f12": "delivered",
+    "turn 1": "lost",
+    "6258b25b": "delivered",
+    "9bf8758f": "delivered"
+   }
+  }
+ ]
+}

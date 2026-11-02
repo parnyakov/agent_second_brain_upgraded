@@ -218,6 +218,12 @@ def check_marker_compliance(
     gate the audit asked for — a rising drop rate is the owner's call (see
     R3), not a reason to red-alert the whole daily doctor over it.
     """
+    if getattr(session, "reply_ledger", False) is True:
+        # The reply ledger has no markers to comply with; its delivery rate
+        # is scripts/reply_metrics.py.
+        return CheckResult(
+            "marker_compliance", True, "не применимо: включён журнал ходов"
+        )
     state_file = runtime_dir / "last_marker_compliance_check"
     now = clock_fn()
     try:

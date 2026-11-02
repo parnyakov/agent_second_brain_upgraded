@@ -46,3 +46,11 @@ def test_run_daily_for_a_missed_day_passes_the_date():
     _, ok = run("daily", proc, date(2026, 10, 25))
     assert ok
     assert proc.day == date(2026, 10, 25)
+
+
+def test_run_daily_silent_turn_is_ok_with_no_output():
+    """A processing turn that ended with nothing to say ([SILENT] or no
+    text): success, and nothing for process.sh to send."""
+    proc = FakeProc(daily={"report": "", "processed_entries": 1})
+    text, ok = run("daily", proc)
+    assert ok and text == ""

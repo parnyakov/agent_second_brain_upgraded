@@ -2071,3 +2071,78 @@ def test_agents_wait_only_false_in_rewind_menu() -> None:
 def test_agents_wait_only_false_without_wait_line() -> None:
     pane = "● done\n✻ Brewed for 3s · done 10:15 PM\n" + _FOOTER_LINE
     assert is_agents_wait_only(pane) is False
+
+
+# ── CHOICE_DIALOG: blocking CLI choice menus (2026-10-26/27) ───────────
+
+from d_brain.services.tmux_parse import choice_dialog_key  # noqa: E402
+
+# Shape measured in a production pane.log, Claude Code 2.1.311, 2026-10-27 16:56.
+COMPACT_OFFER_CAPTURE = """\
+● <<<R:a279ded9>>>
+Перенесла ✅ В четверг, 29 октября, в 12:00 напомню позвонить по пылесосу.
+<<<E:a279ded9>>>
+✻ Worked for 7s · done 4:56 PM
+────────────────────────────────────────────────────────────────
+ We recommend compacting earlier
+
+ Each message re-sends the whole conversation, so long conversations use up
+ your plan's usage limits faster. With your current settings, Claude Code
+ autocompacts (replaces older messages with a summary) at 1m tokens.
+
+ Want to autocompact at 400k tokens instead? Your model doesn't change.
+
+ ❯ Keep auto (1m tokens)
+   Autocompact at ‹ 400k › tokens
+
+ ↑/↓ choose · ←/→ change size · enter confirm · esc not now
+"""
+
+
+def test_compact_offer_is_choice_dialog_not_ready():
+    # Before the fix its "❯ Keep auto" matched the idle prompt → READY, and
+    # the next message was typed into the dialog and lost.
+    assert classify_state(COMPACT_OFFER_CAPTURE) == PaneState.CHOICE_DIALOG
+
+
+def test_compact_offer_with_footer_still_choice_dialog():
+    cap = COMPACT_OFFER_CAPTURE + "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    assert classify_state(cap) == PaneState.CHOICE_DIALOG
+
+
+def test_compact_offer_closes_with_keep():
+    assert choice_dialog_key(COMPACT_OFFER_CAPTURE) == "Enter"
+
+
+def test_choice_dialog_other_selection_uses_escape():
+    cap = COMPACT_OFFER_CAPTURE.replace(
+        " ❯ Keep auto (1m tokens)\n   Autocompact",
+        "   Keep auto (1m tokens)\n ❯ Autocompact",
+    )
+    assert classify_state(cap) == PaneState.CHOICE_DIALOG
+    assert choice_dialog_key(cap) == "Escape"
+
+
+def test_generic_choice_menu_detected():
+    cap = (
+        "────────────────\n"
+        " Something new is available\n"
+        " ❯ Not now\n"
+        "   Turn it on\n"
+        " ↑/↓ to choose · enter to select · esc to cancel\n"
+    )
+    assert classify_state(cap) == PaneState.CHOICE_DIALOG
+    assert choice_dialog_key(cap) == "Escape"
+
+
+def test_dialog_text_inside_reply_is_not_a_dialog():
+    cap = (
+        "● <<<R:abc123>>>\n"
+        "The CLI shows: ↑/↓ choose · enter confirm · esc not now\n"
+        "<<<E:abc123>>>\n" + READY_CAPTURE
+    )
+    assert classify_state(cap) == PaneState.READY
+
+
+def test_trust_prompt_not_taken_for_choice_dialog():
+    assert classify_state(TRUST_CAPTURE) == PaneState.TRUST_PROMPT

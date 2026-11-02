@@ -27,6 +27,10 @@ def run(cmd: str, proc: Any, day: date | None = None) -> tuple[str, bool]:
         return f"unknown command: {cmd}", False
     if res.get("report"):
         return res["report"], True
+    if "report" in res and "error" not in res:
+        # The turn finished with nothing to say ([SILENT] or no text): a
+        # success with no output, so process.sh sends nothing.
+        return "", True
     return res.get("error", "pipeline error"), False
 
 

@@ -35,10 +35,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from d_brain.services import long_run, turn_state
+from d_brain.services import long_run, turn_ledger, turn_state
 from d_brain.services.tmux_parse import (
     PaneState,
     _chrome,
+    choice_dialog_key,
     classify_state,
     extract_open_reply,
     extract_reply,
@@ -66,6 +67,7 @@ from d_brain.services.transcript import (
     latest_reply,
     transcript_dir,
     transcript_path,
+    turn_end,
 )
 
 logger = logging.getLogger(__name__)
@@ -237,6 +239,8 @@ _PANE_HEIGHT = "50"
 # is removed rather than kept as unverified folklore; if a future CLI/tmux
 # combination reproduces it, re-add a note with the repro. Deep captures
 # beyond this default are for the salvage/orphan paths only, if ever needed.
+# Keys sent at most to close one blocking CLI choice dialog (CHOICE_DIALOG).
+_DIALOG_DISMISS_TRIES = 3
 _CAPTURE_SCROLLBACK = "-200"
 # Parked sessions (see ClaudeSession._park_foreign_session) kept per brain;
 # older ones are killed so they cannot pile up across repeated engine switches.
@@ -254,6 +258,19 @@ _MAX_CLEAR_ROUNDS = 8
 # sent). Two, not more: a box that still holds the prompt after three Enters
 # is not a lost keystroke.
 _ENTER_RETRIES = 2
+# Reply ledger (2026-10-29 incident, rid 21687a6e): after a 2-hour idle the
+# CLI drew the pasted prompt more than a second late, so _confirm_submitted's
+# single look saw an empty box, called the prompt sent, and the first Enter
+# had been lost — the prompt sat unsent for 13 minutes while Telegram showed
+# "работаю". In ledger mode the UserPromptSubmit hook is the proof of a
+# submit, so until it arrives ask() keeps looking at the box every
+# _SUBMIT_RECHECK seconds and presses Enter while OUR tag is still in it,
+# at most _SUBMIT_MAX_ENTERS times; if the tag is still there after that the
+# prompt is taken back out of the box and the person is told plainly.
+_SUBMIT_RECHECK = 3.0
+_SUBMIT_MAX_ENTERS = 5
+# AskResult.detail of that last case; chat_session maps it to its message.
+NOT_SUBMITTED_DETAIL = "prompt never left the input box"
 # What an unsent paste leaves in the input box once the CLI collapses it.
 _PASTED_TEXT = "[Pasted text"
 # Transcript records that carry the session's display name (verified live on
@@ -273,6 +290,22 @@ _TITLE_FIELDS = {
 STANDBY_SUFFIX = "_reset"
 # How long preflight gives `claude auth status` / `codex login status`.
 _PREFLIGHT_TIMEOUT = 30.0
+# Reply ledger (2026-10-29): how long the transcript must show our turn as
+# ended (system/turn_duration) with NO Stop in the ledger before ask() takes
+# the final message from the transcript instead (the Stop hook crashed or ran
+# out of its timeout). The hook normally lands within a second of the end.
+DEFAULT_LEDGER_STOP_GRACE = 10.0
+# Said instead of an empty reply when the instance asks for it
+# (Settings.empty_reply_notice); otherwise an empty turn is silent.
+LEDGER_EMPTY_REPLY = turn_ledger.EMPTY_REPLY
+# Said when the unsolicited-reply pump already delivered this very turn
+# (ask() lost the claim): never a second copy, never a retry.
+LEDGER_ALREADY_SENT = "↩️ Ответ на это сообщение уже отправлен отдельно."
+# The persona of the marker path, byte-for-byte the brain-system.md that was
+# live before the reply ledger. Used INSTEAD of brain-system.md while the
+# ledger is off for an instance, so marker-path instances are told exactly
+# what they were told before. Delete together with the marker path.
+LEGACY_PERSONA = "brain-system-markers.md"
 
 
 def _main_turn_blocks_input(cap: str) -> bool:
@@ -398,6 +431,13 @@ class AskResult:
     # chat_session's user-facing message) mention how long the pane has
     # been busy without re-deriving it themselves.
     busy_seconds: float | None = None
+    # True iff the final message opened with the [SILENT] sentinel, or (with
+    # empty_reply_notice off) the turn ended without any text. The reply
+    # ledger strips the sentinel from ``reply`` (a chat answer must not show
+    # it), so callers that suppress silent output (the cron runner, the chat
+    # path's ``Silent``) must look here: before this flag every silent cron
+    # reply under DBRAIN_REPLY_LEDGER=1 reached the chat (2026-10-30).
+    silent: bool = False
 
     @property
     def ok(self) -> bool:
@@ -437,8 +477,23 @@ class ClaudeSession:
         view_switch_timeout: float = _VIEW_SWITCH_TIMEOUT,
         pane_width: int | str | None = None,
         pane_height: int | str | None = None,
+        reply_ledger: bool = False,
+        ledger_stop_grace: float = DEFAULT_LEDGER_STOP_GRACE,
+        empty_reply_notice: bool = False,
     ) -> None:
         self.session_name = session_name
+        # Reply ledger switch (Settings.reply_ledger, per instance). Off ⇒
+        # the marker contract and every path below it are byte-for-byte as
+        # before; on ⇒ a reply is the Stop hook's final message of the turn
+        # that carries this ask's tag (see services/turn_ledger.py).
+        self.reply_ledger = bool(reply_ledger)
+        self._ledger_stop_grace = ledger_stop_grace
+        # Settings.empty_reply_notice: a turn that ended without text answers
+        # LEDGER_EMPTY_REPLY (on) or nothing at all, like [SILENT] (off).
+        self.empty_reply_notice = bool(empty_reply_notice)
+        # rid -> CLI prompt_id of a finished ledger ask, read back by ask()
+        # for its outcome line (keyed by rid: asks never share one).
+        self._ask_turns: dict[str, str] = {}
         self.work_dir = Path(work_dir)
         self.runtime_dir = Path(runtime_dir)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -688,6 +743,51 @@ class ClaudeSession:
     def _send_enter(self) -> None:
         self._tmux("send-keys", "-t", self._target, "Enter")
 
+    # ── blocking CLI choice dialogs (CHOICE_DIALOG) ──────────────────
+
+    def _dismiss_choice_dialog(self, cap: str | None = None, log_id: str = "") -> bool:
+        """Close a blocking CLI choice dialog on the pane, if one is there.
+
+        Caller holds the pane lock. Picks "Keep …" when it is the highlighted
+        option, otherwise Esc (see tmux_parse.choice_dialog_key) — never a
+        choice that changes behaviour. At most ``_DIALOG_DISMISS_TRIES`` keys;
+        True iff a dialog was on screen and is gone now."""
+        if cap is None:
+            cap = self._capture()
+        if classify_state(cap) != PaneState.CHOICE_DIALOG:
+            return False
+        for attempt in range(_DIALOG_DISMISS_TRIES):
+            key = choice_dialog_key(cap)
+            logger.warning(
+                "session %s: CLI choice dialog on screen%s — closing it with %s "
+                "(%d/%d)",
+                self.session_name,
+                f" during {log_id}" if log_id else "",
+                key,
+                attempt + 1,
+                _DIALOG_DISMISS_TRIES,
+            )
+            self._tmux("send-keys", "-t", self._target, key)
+            self._sleep(self._poll_interval)
+            cap = self._capture()
+            if classify_state(cap) != PaneState.CHOICE_DIALOG:
+                return True
+        logger.error(
+            "session %s: CLI choice dialog still on screen after %d keys",
+            self.session_name,
+            _DIALOG_DISMISS_TRIES,
+        )
+        return False
+
+    def dismiss_choice_dialog(self) -> bool:
+        """Watchdog entry point: close a blocking choice dialog if the pane
+        is free. Non-blocking on the pane lock — a live ask() handles the
+        dialog itself (and re-submits its prompt if the dialog ate it)."""
+        with self._locked(blocking=False) as got:
+            if not got:
+                return False
+            return self._dismiss_choice_dialog()
+
     # ── session creation (shared by _ensure_locked and boot_standby) ──
 
     def _exists(self, name: str) -> bool:
@@ -808,6 +908,14 @@ class ClaudeSession:
                 last_state = state
                 self._sleep(self._poll_interval)
                 continue
+            # A blocking choice dialog at start-up: close it (debounced to
+            # the transition, like TRUST), never wait it out.
+            if state == PaneState.CHOICE_DIALOG:
+                if last_state != PaneState.CHOICE_DIALOG:
+                    self._tmux("send-keys", "-t", target, choice_dialog_key(cap))
+                last_state = state
+                self._sleep(self._poll_interval)
+                continue
             if state == PaneState.READY:
                 self._tmux("set-option", "-t", target, "-u", "remain-on-exit")
                 return True, state, ""
@@ -885,10 +993,11 @@ class ClaudeSession:
         ]
         if self.mcp_config:
             parts += ["--mcp-config", shlex.quote(str(self.mcp_config))]
-        if self.system_prompt_file:
+        persona = self._effective_system_prompt()
+        if persona:
             parts += [
                 "--append-system-prompt",
-                f'"$(cat {shlex.quote(str(self.system_prompt_file))})"',
+                f'"$(cat {shlex.quote(str(persona))})"',
             ]
         if self.model:
             parts += ["--model", shlex.quote(self.model)]
@@ -913,6 +1022,47 @@ class ClaudeSession:
             + env
             + " ".join(parts)
         )
+
+    def _effective_system_prompt(self) -> Path | None:
+        """The persona file the CLI starts with: the marker-path persona
+        (``LEGACY_PERSONA``, next to brain-system.md) while the reply ledger
+        is OFF and that file exists, otherwise the configured one."""
+        base = self.system_prompt_file
+        if base is None or self.reply_ledger:
+            return base
+        legacy = base.with_name(LEGACY_PERSONA)
+        try:
+            return legacy if legacy.is_file() else base
+        except OSError:
+            return base
+
+    def _persona_outdated(self) -> bool:
+        """True when the live, idle CLI was started with a persona other
+        than the one a fresh start would get now. The running persona is
+        read from the CLI's own argv (turn-state's ``cli_pid``); the pid
+        counts as ours only if its argv names this runtime dir (the hook
+        settings path). Anything unknown — no state, a busy turn, background
+        agents, no /proc — reads as "not outdated": never restart on a
+        guess."""
+        persona = self._effective_system_prompt()
+        st = turn_state.read(self.runtime_dir)
+        if persona is None or st is None or not st.cli_pid:
+            return False
+        if st.state == "open" or st.background_tasks:
+            return False
+        try:
+            argv = Path(f"/proc/{st.cli_pid}/cmdline").read_bytes().split(b"\0")
+            current = persona.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        flag = b"--append-system-prompt"
+        if flag not in argv[:-1]:
+            return False
+        if not any(str(self.runtime_dir).encode() in a for a in argv):
+            return False
+        running = argv[argv.index(flag) + 1].decode("utf-8", "replace")
+        # "$(cat file)" drops the file's trailing newlines.
+        return running != current.rstrip("\n")
 
     # ── R1: pinned session id / transcript path ─────────────────────────
 
@@ -988,6 +1138,8 @@ class ClaudeSession:
             status, not recovery.
           - ``"ready"`` — ``body`` is the last complete reply.
         """
+        if self.reply_ledger:
+            return self._ledger_last_reply()
         path = self.current_transcript_path()
         if path is None:
             return "unavailable", None
@@ -1133,10 +1285,25 @@ class ClaudeSession:
                 back = self._return_to_main(view)
                 if back is not None:
                     cap, view = back, None
-            if view is None:
+            if view is None and self._persona_outdated():
+                # The persona is fixed at CLI start (--append-system-prompt),
+                # so a session that outlived a persona change keeps obeying
+                # the old contract. 2026-11-01: the cron brain, up since
+                # 25.10, still wrote <<<R/E>>> markers and the old [SILENT]
+                # rules under the reply ledger, and a background agent's
+                # report was swallowed as a sentinel reply.
+                logger.warning(
+                    "session %s runs an outdated persona — restarting it",
+                    self.session_name,
+                )
+                self._tmux("kill-session", "-t", self._target)
+                turn_state.close(
+                    self.runtime_dir, event="restart", reason="persona_changed"
+                )
+            elif view is None:
                 self._ensure_pipe()
                 return cap
-            if not self._park_foreign_session(view):
+            elif not self._park_foreign_session(view):
                 # Neither rename nor kill worked and the stuck pane is still
                 # there: creating a session under the same name would fail
                 # anyway, and reusing it is the very bug this guards against.
@@ -1733,6 +1900,11 @@ class ClaudeSession:
         again. Delivery now depends only on the rid never having been sent,
         not on poll timing.
         """
+        if self.reply_ledger:
+            # The reply ledger delivers unbound turns through the bot's
+            # reply pump (services/reply_pump.py); scraping the pane here
+            # as well would double-deliver them.
+            return []
         if self.is_turn_active():
             return []
         cap = self._capture()
@@ -2059,7 +2231,20 @@ class ClaudeSession:
         Used to inject guidance into an in-flight turn (the lock is held by
         that turn's ask()). The interactive TUI feeds mid-turn input to the
         model (steer/queue semantics) — VERIFY-LIVE per CLI version.
+
+        With the reply ledger on, the text carries a ``steer`` tag: joined
+        into an open CLI turn it is answered by that turn's final message; if
+        the turn closed in between, it opens a turn of its own, which the
+        reply pump delivers (verified live 2.1.312: a mid-turn submit shares
+        the running turn's prompt_id).
         """
+        if self.reply_ledger:
+            rid = self._rid_factory()
+            text = turn_ledger.tagged(text, rid, "steer")
+            self._send_text(text)
+            self._send_enter()
+            self._confirm_submitted(turn_ledger.turn_tag(rid, "steer"))
+            return
         self._send_text(text)
         self._send_enter()
 
@@ -2069,6 +2254,15 @@ class ClaudeSession:
         C-c is deliberately NOT used here: on an idle prompt a C-c starts the
         double-C-c exit sequence; Escape only ever cancels the response.
         """
+        if self.reply_ledger:
+            # An Escape fires no Stop hook; record the end ourselves so the
+            # waiting ask() and the metric see an interrupted turn, not a
+            # silent one. Read BEFORE close() below rewrites the state.
+            st = turn_state.read(self.runtime_dir)
+            if st is not None and st.state == "open" and st.prompt_id:
+                turn_ledger.append_bot_event(
+                    self.runtime_dir, "interrupt", prompt_id=st.prompt_id
+                )
         self._tmux("send-keys", "-t", self._target, "Escape")
         turn_state.close(self.runtime_dir, event="bot_interrupt", reason="interrupt")
 
@@ -2147,6 +2341,8 @@ class ClaudeSession:
         answer. A held lock WITHOUT an inflight record is startup/recovery/
         control — also not steerable.
         """
+        if self.reply_ledger:
+            return self._ledger_steerable()
         if not self.is_turn_active():
             return False
         try:
@@ -2154,6 +2350,31 @@ class ClaudeSession:
         except (FileNotFoundError, IndexError):
             return False
         return not first.startswith(MAINT_PREFIX)
+
+    def _ledger_steerable(self) -> bool:
+        """Reply-ledger steer gate: the CLI turn itself is open (hook state,
+        not the ask-lock) and it is not a maintenance turn.
+
+        * ask-lock held with a ``maint-`` inflight (pipeline, or an ask still
+          readying the pane) → no, as before;
+        * hook state valid → open and untagged-or-chat ⇒ steer, closed ⇒ no:
+          the message becomes a new bound request instead;
+        * hook state missing/untrusted → the old lock-based answer.
+        """
+        locked = self.is_turn_active()
+        inflight_first = ""
+        if locked:
+            try:
+                inflight_first = self._inflight.read_text().splitlines()[0]
+            except (OSError, IndexError):
+                return False
+            if inflight_first.startswith(MAINT_PREFIX):
+                return False
+        st = turn_state.read(self.runtime_dir)
+        if turn_state.valid(st, session_id=self._read_session_id(), now=time.time()):
+            assert st is not None
+            return st.state == "open" and "maint" not in st.kinds
+        return locked
 
     def send_control(self, text: str) -> None:
         """Type a client-side Claude Code command verbatim, fire-and-forget.
@@ -2343,6 +2564,366 @@ class ClaudeSession:
             )
             return None
 
+    # ── reply ledger (2026-10-29) ────────────────────────────────────
+
+    def _hook_pulse(self) -> float:
+        """Last hook event time (tool hooks pulse it) — a liveness signal
+        that needs no pane parsing."""
+        st = turn_state.read(self.runtime_dir)
+        return st.last_event_ts if st is not None else 0.0
+
+    def _ledger_last_reply(self) -> tuple[str, str | None]:
+        """``/resend`` from the ledger: the newest turn's final message."""
+        book = turn_ledger.TurnBook()
+        book.extend(turn_ledger.read_all(self.runtime_dir))
+        turns = book.ordered()
+        if not turns:
+            return "empty", None
+        if not turns[-1].closed:
+            st = turn_state.read(self.runtime_dir)
+            if st is not None and st.state == "open":
+                return "in_progress", None
+        for turn in reversed(turns):
+            text = turn_ledger.clean_reply(turn_ledger.stop_text(turn))
+            if text and not turn_ledger.is_silent(text):
+                return "ready", text
+        return "empty", None
+
+    def _ledger_finish(
+        self,
+        turn_pid: str,
+        text: str | None,
+        rid: str,
+        log_id: str,
+        *,
+        send_wall: float,
+        source: str,
+    ) -> AskResult:
+        """Claim the turn for this ask() and hand its final message back."""
+        self._ask_turns[rid] = turn_pid
+        reply = turn_ledger.clean_reply(text)
+        sentinel = turn_ledger.is_silent(reply)
+        if sentinel:
+            reply = turn_ledger.strip_sentinel(reply)
+        silent = sentinel
+        state = "delivered"
+        if not reply:
+            if self.empty_reply_notice:
+                # The instance wants a visible signal for a quiet turn.
+                reply = LEDGER_EMPTY_REPLY
+            else:
+                # "Nothing to report", exactly like a bare [SILENT]: recorded
+                # in the claims log, never sent (2026-11-02).
+                silent = True
+                state = "sentinel" if sentinel else "empty"
+        self._inflight.unlink(missing_ok=True)
+        claims = turn_ledger.Claims(self.runtime_dir)
+        try:
+            won = claims.claim(
+                turn_pid,
+                by="ask",
+                state=state,
+                rid=rid,
+                bound=True,
+                source=source,
+                latency=round(time.time() - send_wall, 3),
+                chars=len(reply),
+                sentinel=sentinel,
+            )
+        except OSError as exc:
+            # The claim is bookkeeping; this ask() is the reply's only
+            # channel, so a filesystem hiccup must not swallow it.
+            logger.error("could not claim turn %s for %s: %s", turn_pid, log_id, exc)
+            won = True
+        if not won:
+            logger.warning(
+                "turn %s for %s was already delivered by the reply pump",
+                turn_pid,
+                log_id,
+            )
+            return AskResult(
+                "ok", reply=LEDGER_ALREADY_SENT, detail="already delivered"
+            )
+        logger.info(
+            "ledger reply for %s: turn=%s source=%s len=%d%s",
+            log_id,
+            turn_pid,
+            source,
+            len(reply),
+            (" (sentinel)" if sentinel else "")
+            + (" (empty, not sent)" if state == "empty" else ""),
+        )
+        return AskResult("ok", reply=reply, silent=silent)
+
+    def _ledger_outcome(
+        self, rid: str, turn: "turn_ledger.Turn | None", res: AskResult
+    ) -> AskResult:
+        """Remember which CLI turn a non-ok ask() belonged to; ask() writes
+        the outcome line for the delivery metric."""
+        if turn is not None:
+            self._ask_turns[rid] = turn.prompt_id
+        return res
+
+    @staticmethod
+    def _untagged_submit_since(
+        book: "turn_ledger.TurnBook", since_wall: float, log_id: str
+    ) -> "turn_ledger.Turn | None":
+        """A person's turn with NO tag that began after our paste: our own
+        prompt whose tag was mangled on the way in (seen live: the owner
+        was typing in the attached pane while the bot pasted, a keystroke
+        landed inside the tag, and the hook saw no rid). Without this the
+        ask() waited for a rid that could never appear, holding the pane
+        lock while every new message queued behind it. Only
+        ``origin == "user"`` submits count; tagged turns (steer, cron,
+        maint) and task notifications never do."""
+        for turn in reversed(book.ordered()):
+            if turn.first_ts < since_wall:
+                break
+            if turn.origin == "user" and not turn.tags:
+                logger.warning(
+                    "%s: taking untagged turn %s as ours (tag mangled in the "
+                    "input box)",
+                    log_id,
+                    turn.prompt_id,
+                )
+                return turn
+        return None
+
+    def _ask_via_ledger(
+        self,
+        prompt: str,
+        rid: str,
+        log_id: str,
+        *,
+        timeout: float,
+        deadline: float,
+        turn_started: float,
+        pre_cap: str,
+    ) -> AskResult:
+        """The reply-ledger half of ask(): send the tagged prompt, wait for
+        the Stop of the CLI turn that carries our rid, return its final
+        message. The pane is read for STATE only (rate limit, logged out,
+        dialogs, stall); the reply never comes from it.
+
+        Exits:
+          * Stop for our turn → claim + ok (final message, sentinel stripped);
+          * StopFailure → rate_limited / error;
+          * interrupted (Escape fires no Stop; interrupt() logs it) → error;
+          * the transcript closed our turn but no Stop arrived within
+            ``ledger_stop_grace`` (hook crashed or timed out) → ok from the
+            transcript;
+          * no liveness for stall_timeout → interrupt + error (as before);
+          * deadline → timeout with inflight kept: the Stop that comes later
+            is delivered by the reply pump instead of being lost.
+        """
+        kind = "maint" if log_id.startswith(MAINT_PREFIX) else "ask"
+        tag = turn_ledger.turn_tag(rid, kind)
+        reader = turn_ledger.LedgerReader.at_end(self.runtime_dir)
+        book = turn_ledger.TurnBook()
+        send_wall = time.time()
+        payload = f"{prompt}\n\n{tag}"
+        self._send_text(payload)
+        self._send_enter()
+        self._confirm_submitted(tag)
+
+        send_time = self._clock()
+        last_active = send_time
+        last_chrome_change_ts = send_time
+        last_cap = pre_cap
+        last_log_size = self._pane_log_size()
+        last_pulse = self._hook_pulse()
+        rate_limited_streak = 0
+        dialog_resent = False
+        turn: turn_ledger.Turn | None = None
+        transcript_end_seen: float | None = None
+        next_transcript_check = send_time + self._ledger_stop_grace
+        next_submit_check = send_time + _SUBMIT_RECHECK
+        submit_enters = 0
+        while self._clock() < deadline:
+            if self._abort_requested(turn_started):
+                return self._ledger_outcome(rid, turn, self._aborted(log_id))
+            book.extend(reader.read_new())
+            if turn is None:
+                turn = book.by_rid(rid) or self._untagged_submit_since(
+                    book, send_wall, log_id
+                )
+            if turn is None and self._clock() >= next_submit_check:
+                # No UserPromptSubmit for our rid yet: is the prompt still
+                # sitting in the box? (See _SUBMIT_RECHECK.)
+                next_submit_check = self._clock() + _SUBMIT_RECHECK
+                box = input_box_text(self._capture())
+                if box is not None and (tag in box or _PASTED_TEXT in box):
+                    if submit_enters >= _SUBMIT_MAX_ENTERS:
+                        logger.error(
+                            "prompt for %s still unsent in the input box after "
+                            "%d extra Enters — taking it back out",
+                            log_id,
+                            submit_enters,
+                        )
+                        self._clear_input_draft()
+                        self._inflight.unlink(missing_ok=True)
+                        return self._ledger_outcome(
+                            rid, None, AskResult("error", detail=NOT_SUBMITTED_DETAIL)
+                        )
+                    submit_enters += 1
+                    logger.warning(
+                        "no submit for %s yet and the prompt is still in the "
+                        "input box — pressing Enter (%d/%d)",
+                        log_id,
+                        submit_enters,
+                        _SUBMIT_MAX_ENTERS,
+                    )
+                    self._send_enter()
+                    last_active = self._clock()
+            if turn is not None:
+                if turn.stop is not None:
+                    return self._ledger_finish(
+                        turn.prompt_id,
+                        turn_ledger.stop_text(turn),
+                        rid,
+                        log_id,
+                        send_wall=send_wall,
+                        source="hook",
+                    )
+                if turn.failure is not None:
+                    self._inflight.unlink(missing_ok=True)
+                    err = str(turn.failure.get("error") or "")
+                    status = "rate_limited" if "rate" in err.lower() else "error"
+                    logger.error("turn for %s failed in the CLI: %s", log_id, err)
+                    return self._ledger_outcome(
+                        rid, turn, AskResult(status, detail=f"turn failed: {err}"[:300])
+                    )
+                if turn.interrupted_ts is not None:
+                    self._inflight.unlink(missing_ok=True)
+                    return self._ledger_outcome(
+                        rid, turn, AskResult("error", detail="turn interrupted")
+                    )
+
+            # A Stop the hook never wrote (crashed, timed out, older CLI):
+            # the transcript says when the turn ended. Checked sparingly —
+            # it is a file scan, and the hook normally answers first.
+            if self._clock() >= next_transcript_check:
+                next_transcript_check = self._clock() + max(
+                    2.0, self._poll_interval * 5
+                )
+                path = self.current_transcript_path()
+                end = (
+                    turn_end(path, tag=tag, prompt_id=turn.prompt_id if turn else None)
+                    if path is not None
+                    else None
+                )
+                if end is not None and end.ended:
+                    if transcript_end_seen is None:
+                        transcript_end_seen = self._clock()
+                    elif self._clock() - transcript_end_seen >= self._ledger_stop_grace:
+                        logger.error(
+                            "no Stop hook for %s although the transcript closed "
+                            "turn %s — delivering from the transcript",
+                            log_id,
+                            end.prompt_id,
+                        )
+                        return self._ledger_finish(
+                            end.prompt_id,
+                            end.text,
+                            rid,
+                            log_id,
+                            send_wall=send_wall,
+                            source="transcript",
+                        )
+
+            cap = self._capture()
+            state = classify_state(cap)
+            if state == PaneState.RATE_LIMITED:
+                rate_limited_streak += 1
+                if rate_limited_streak >= _RATE_LIMIT_CONFIRM_POLLS:
+                    logger.warning(
+                        "rate-limited (in-loop-streak) for %s after %d polls",
+                        log_id,
+                        rate_limited_streak,
+                    )
+                    self._inflight.unlink(missing_ok=True)
+                    return self._ledger_outcome(rid, turn, AskResult("rate_limited"))
+            else:
+                rate_limited_streak = 0
+            if state == PaneState.LOGGED_OUT:
+                self._inflight.unlink(missing_ok=True)
+                return self._ledger_outcome(rid, turn, AskResult("logged_out"))
+            if has_survey_prompt(cap):
+                self._tmux("send-keys", "-t", self._target, "0")
+                last_active = self._clock()
+                self._sleep(self._poll_interval)
+                continue
+            if state == PaneState.CHOICE_DIALOG:
+                self._dismiss_choice_dialog(cap, log_id)
+                if not dialog_resent and turn is None:
+                    dialog_resent = True
+                    box = input_box_text(self._capture()) or ""
+                    if tag in box or _PASTED_TEXT in box:
+                        logger.warning(
+                            "prompt for %s still in the input box after a CLI "
+                            "dialog — pressing Enter",
+                            log_id,
+                        )
+                        self._send_enter()
+                    else:
+                        logger.warning(
+                            "prompt for %s was swallowed by a CLI dialog — "
+                            "submitting it again",
+                            log_id,
+                        )
+                        self._send_text(payload)
+                        self._send_enter()
+                    self._confirm_submitted(tag)
+                last_active = self._clock()
+                self._sleep(self._poll_interval)
+                continue
+
+            # Stall model as in the marker path, plus the hook pulse (the
+            # tool hooks fire on every tool call) as a pane-free signal.
+            log_size = self._pane_log_size()
+            pulse = self._hook_pulse()
+            if _chrome(cap) != _chrome(last_cap) or log_size > last_log_size:
+                last_chrome_change_ts = self._clock()
+            trust_static = (self._clock() - last_chrome_change_ts) < STATIC_TRUST_WINDOW
+            if (
+                is_working_progressing(cap, last_cap, trust_static=trust_static)
+                or log_size > last_log_size
+                or pulse > last_pulse
+            ):
+                last_active = self._clock()
+            last_log_size = log_size
+            last_pulse = pulse
+            last_cap = cap
+            if self._clock() - last_active > self._stall_timeout:
+                self.interrupt()
+                logger.warning(
+                    "no liveness signal for %ss on %s — interrupted and released "
+                    "the lock",
+                    self._stall_timeout,
+                    log_id,
+                )
+                self._inflight.unlink(missing_ok=True)
+                return self._ledger_outcome(
+                    rid,
+                    turn,
+                    AskResult("error", detail="session stalled (no active turn)"),
+                )
+            self._sleep(self._poll_interval)
+
+        if turn is None:
+            logger.error(
+                "no UserPromptSubmit hook ever reported %s (rid %s) — the hooks "
+                "may not be firing; see %s",
+                log_id,
+                rid,
+                self.runtime_dir / "turn-hook.err",
+            )
+        # inflight kept: the turn may still be running, and its Stop is
+        # delivered by the reply pump when it comes.
+        return self._ledger_outcome(
+            rid, turn, AskResult("timeout", detail=f"no reply in {timeout}s")
+        )
+
     # ── ask ──────────────────────────────────────────────────────────
 
     def ask(
@@ -2367,8 +2948,42 @@ class ClaudeSession:
         wrap=False types the prompt verbatim; completion is the pane sitting
         idle for two consecutive polls and the reply is the chrome-stripped
         pane text (best effort, may include the input echo).
+
+        With ``reply_ledger`` on, wrap=True appends the machine tag instead
+        and the reply is the final message of the tagged CLI turn (see
+        ``_ask_via_ledger``).
         """
         rid = self._rid_factory()
+        res = self._ask(prompt, rid, timeout=timeout, request_id=request_id, wrap=wrap)
+        turn_pid = self._ask_turns.pop(rid, None)
+        if wrap:
+            # One outcome line per ask on BOTH paths, early exits included
+            # (pre-send rate limit, busy, session start failure), so
+            # scripts/reply_metrics.py measures the marker path and the
+            # ledger with the same ruler (the hook binds either rid to its
+            # CLI turn).
+            try:
+                turn_ledger.Claims(self.runtime_dir).record(
+                    state="ask_outcome",
+                    rid=rid,
+                    prompt_id=turn_pid,
+                    status=res.status,
+                    detail=res.detail,
+                    salvaged=res.salvaged,
+                )
+            except Exception:  # noqa: BLE001 — telemetry never costs a reply
+                logger.debug("could not record ask outcome", exc_info=True)
+        return res
+
+    def _ask(
+        self,
+        prompt: str,
+        rid: str,
+        *,
+        timeout: float,
+        request_id: str | None,
+        wrap: bool,
+    ) -> AskResult:
         log_id = request_id or rid
         with self._locked() as got:
             if not got:  # only happens with non-blocking; blocking=True here
@@ -2409,6 +3024,12 @@ class ClaudeSession:
             # the same lock; reuse that frame rather than taking a second one.
             pre_cap = reused_cap if reused_cap is not None else self._capture()
             pre = classify_state(pre_cap)
+            if pre == PaneState.CHOICE_DIALOG:
+                # Typed into the dialog, the prompt would be lost (seen live,
+                # 2026-10-26/27): close it first, then look again.
+                self._dismiss_choice_dialog(pre_cap, log_id)
+                pre_cap = self._capture()
+                pre = classify_state(pre_cap)
             if pre == PaneState.RATE_LIMITED and self._confirmed_rate_limited(
                 pre_cap, log_id
             ):
@@ -2643,6 +3264,17 @@ class ClaudeSession:
             # (steerable from here on) right before typing anything into it.
             self._inflight.write_text(f"{log_id}\n{self._clock()}\n")
 
+            if self.reply_ledger and wrap:
+                return self._ask_via_ledger(
+                    prompt,
+                    rid,
+                    log_id,
+                    timeout=timeout,
+                    deadline=deadline,
+                    turn_started=turn_started,
+                    pre_cap=pre_cap,
+                )
+
             # THE reply source for this turn, anchored
             # BEFORE the prompt is typed so nothing the model writes in answer
             # to it can land ahead of the anchor — the rid is fresh, so
@@ -2688,6 +3320,8 @@ class ClaudeSession:
             ever_saw_r_marker = False
             idle_streak = 0
             rate_limited_streak = 0
+            # One re-submit at most per turn after a CLI dialog ate the prompt.
+            dialog_resent = False
             # ── salvage/ceiling tracking state ──────────
             # send_time: fixed anchor for "how long have we waited" logging
             # below — unlike last_active/last_main_turn_active, this never
@@ -2879,6 +3513,42 @@ class ClaudeSession:
                 if has_survey_prompt(cap):
                     self._tmux("send-keys", "-t", self._target, "0")
                     last_active = self._clock()
+                    self._sleep(self._poll_interval)
+                    continue
+
+                # A blocking choice dialog (CHOICE_DIALOG) that opened between
+                # the pre-send check and the paste swallows the prompt: the
+                # turn never starts and the transcript gets NOTHING (seen live,
+                # 2026-10-27 16:56). Close it; if the conversation never saw
+                # our prompt, submit it again — once, same rid, so a reply
+                # can never be produced twice.
+                if state == PaneState.CHOICE_DIALOG:
+                    self._dismiss_choice_dialog(cap, log_id)
+                    if (
+                        wrap
+                        and not dialog_resent
+                        and reply_tail is not None
+                        and not reply_tail.saw_records
+                    ):
+                        dialog_resent = True
+                        box = input_box_text(self._capture()) or ""
+                        if f"<<<E:{rid}>>>" in box or _PASTED_TEXT in box:
+                            logger.warning(
+                                "prompt for %s still in the input box after a "
+                                "CLI dialog — pressing Enter",
+                                log_id,
+                            )
+                            self._send_enter()
+                            self._confirm_submitted(f"<<<E:{rid}>>>")
+                        else:
+                            logger.warning(
+                                "prompt for %s was swallowed by a CLI dialog — "
+                                "submitting it again",
+                                log_id,
+                            )
+                            self._send_prompt(prompt, rid, wrap=wrap)
+                    last_active = self._clock()
+                    last_main_turn_active = last_active
                     self._sleep(self._poll_interval)
                     continue
 

@@ -24,6 +24,7 @@ from d_brain.services import ask_health, long_run
 from d_brain.services.claude_session import (
     DEFAULT_LONG_RUN_STALE_AFTER,
     DEFAULT_TIMEOUT,
+    NOT_SUBMITTED_DETAIL,
     AskResult,
 )
 from d_brain.services.runtime import get_ask_lock, get_duty_session, get_session
@@ -69,6 +70,13 @@ _STATUS_MESSAGES = {
     "reset": "⏹ Этот ход прерван командой /reset — если ответ ещё нужен, "
     "повтори сообщение.",
 }
+# 2026-10-29 (rid 21687a6e): the prompt was pasted but never left the input
+# box despite repeated Enters; ask() took it back out. Nothing is running for
+# it, so asking to resend is the truth.
+_NOT_SUBMITTED_MESSAGE = (
+    "⚠️ Сообщение не ушло в сессию: оно застряло в поле ввода, и Enter не "
+    "сработал. Я убрал его оттуда. Отправь, пожалуйста, ещё раз."
+)
 # R2c (Fable audit, F2 class): the ceiling's honest message for "no reply
 # markers ever appeared at all" — distinguished from the generic "timeout"
 # message by a substring of AskResult.detail set in claude_session.ask().
@@ -230,6 +238,19 @@ class Busy:
 
     busy_seconds: float | None = None
     fallback: str = ""
+
+
+@dataclass(frozen=True)
+class Silent:
+    """"The turn finished and has nothing to say" — send nothing.
+
+    Returned by ``send_message`` INSTEAD of a reply string when the main
+    turn ended ``ok`` with no text: a bare ``[SILENT]`` or no final message
+    at all (``AskResult.silent`` with an empty ``reply``). Not ``""``: an
+    empty string is the chat path's "nothing came back, retry" signal, and
+    a finished turn must not be run a second time. The turn is already
+    recorded in the reply ledger's claims log; the caller only logs it.
+    """
 
 
 def wrap_duty_prompt(text: str) -> str:
@@ -412,7 +433,7 @@ class ChatSessionManager:
         except Exception:  # noqa: BLE001 — never break a reply over telemetry
             logger.warning("ask-health record failed", exc_info=True)
 
-    async def send_message(self, user_id: int, prompt: str) -> str | Busy:
+    async def send_message(self, user_id: int, prompt: str) -> str | Busy | Silent:
         """Send a message to the session and return the reply text — or
         ``Busy``, meaning "the main brain is working, park this".
 
@@ -513,6 +534,14 @@ class ChatSessionManager:
             else:
                 status = res.status
             self._record_health(status)
+        elif res.ok and getattr(res, "silent", False) and not (res.reply or "").strip():
+            # Finished, nothing to say (bare [SILENT] or no text): a delivered
+            # turn for the health ledger, no message, no retry.
+            self._record_health(ask_health.SUCCESS_STATUS)
+            logger.info(
+                "main turn for user %d ended without text — nothing sent", user_id
+            )
+            return Silent()
         else:
             text = self._reply_text(user_id, res)
         # agent-infra: if this very turn had to park a pane
@@ -899,6 +928,8 @@ class ChatSessionManager:
             and _NO_MARKERS_DETAIL_MARKER in res.detail
         ):
             return _NO_MARKERS_MESSAGE
+        if res.status == "error" and res.detail == NOT_SUBMITTED_DETAIL:
+            return _NOT_SUBMITTED_MESSAGE
         if self._is_turn_limit(res):
             # Engine-dependent truth (F4). Claude: the turn is still running
             # and still in flight — "попробуй ещё раз" would queue a second
@@ -956,6 +987,13 @@ class ChatSessionManager:
 
     def is_turn_active(self) -> bool:
         return self._session.is_turn_active()
+
+    @property
+    def reply_ledger(self) -> bool:
+        """True iff the engine binds replies by the hook ledger (Claude with
+        Settings.reply_ledger on). The steer gate then follows the CLI turn,
+        not the ask-lock."""
+        return bool(getattr(self._session, "reply_ledger", False))
 
     def is_pane_turn_active(self) -> bool:
         """Step D: true iff the PANE shows the

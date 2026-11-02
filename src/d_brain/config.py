@@ -214,6 +214,33 @@ class Settings(BaseSettings):
     # Env names are DBRAIN_-prefixed (unlike the older fields) because they
     # are operator switches set in systemd's EnvironmentFile, and a bare
     # CHAT_ENGINE is far too generic a name to claim in a service env.
+    # Reply ledger (2026-10-29): bind a reply to its request by the CLI's own
+    # hook events (turn-ledger.jsonl) instead of model-echoed <<<R/E>>>
+    # markers, and deliver turns nobody asked for through the bot's reply
+    # pump. Per instance, OFF by default: an instance without the line keeps
+    # the marker path byte-for-byte. Claude engine only; Codex ignores it.
+    reply_ledger: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DBRAIN_REPLY_LEDGER", "reply_ledger"),
+        description=(
+            "Reply = the final message of the CLI turn (hook ledger). "
+            "Off = the legacy marker contract."
+        ),
+    )
+    # A turn that ended without any text (reply ledger). Per instance, OFF by
+    # default: such a turn is silent, like [SILENT]: logged, nothing sent.
+    # On: the owner gets "✅ Ход завершён без текстового ответа." as a
+    # visible signal that a turn went quiet (an operator's problem detector).
+    empty_reply_notice: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "DBRAIN_EMPTY_REPLY_NOTICE", "empty_reply_notice"
+        ),
+        description=(
+            "Send a technical notice for a turn that ended without text. "
+            "Off = send nothing, log only."
+        ),
+    )
     chat_engine: Literal["claude", "codex"] = Field(
         default="claude",
         validation_alias=AliasChoices("DBRAIN_CHAT_ENGINE", "chat_engine"),

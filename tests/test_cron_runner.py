@@ -120,6 +120,17 @@ async def test_due_job_runs_and_delivers(tmp_path):
     assert deliver.calls == [(111, "<b>done</b>")]
 
 
+async def test_ledger_silent_flag_suppresses_delivery(tmp_path):
+    """The reply ledger strips [SILENT] from reply and sets res.silent; the
+    runner must still treat the reply as silent (2026-10-30 leak)."""
+    store = _store(tmp_path)
+    _add_job(store, "j1")
+    deliver = Recorder()
+    session = FakeSession([AskResult("ok", reply="итог без новостей", silent=True)])
+    await _runner(store, session, deliver=deliver).tick()
+    assert deliver.calls == []
+
+
 async def test_future_and_disabled_jobs_skipped(tmp_path):
     store = _store(tmp_path)
     _add_job(store, "future", next_run=NOW + timedelta(hours=1))

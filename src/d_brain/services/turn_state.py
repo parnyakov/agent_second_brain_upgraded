@@ -39,6 +39,11 @@ class TurnState:
     cli_pid: int
     background_tasks: int = 0
     origin: str | None = None
+    # The CLI prompt_id of the open/last turn and the bot tag kinds seen in it
+    # ("ask" / "steer" / "maint" / "" for untagged input), written by the hook
+    # since the reply ledger (2026-10-29). Empty on older state files.
+    prompt_id: str = ""
+    kinds: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -50,7 +55,15 @@ class TurnState:
             "cli_pid": self.cli_pid,
             "background_tasks": self.background_tasks,
             "origin": self.origin,
+            "prompt_id": self.prompt_id,
+            "kinds": list(self.kinds),
         }
+
+
+def _kinds(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(k) for k in raw if k is not None)
 
 
 def read(runtime_dir: Path) -> TurnState | None:
@@ -69,6 +82,8 @@ def read(runtime_dir: Path) -> TurnState | None:
             cli_pid=int(raw.get("cli_pid") or 0),
             background_tasks=int(raw.get("background_tasks") or 0),
             origin=raw.get("origin"),
+            prompt_id=str(raw.get("prompt_id") or ""),
+            kinds=_kinds(raw.get("kinds")),
         )
     except (OSError, ValueError, TypeError, KeyError):
         return None

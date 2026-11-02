@@ -498,3 +498,109 @@ class ReplyTail:
                 )
             self._reply = extract_reply_from_text(self._joined, self._rid)
         return self._reply
+
+
+# ── reply ledger fallback (2026-10-29) ──────────────────────────────────
+# Verified live on Claude Code 2.1.312: every user record of a turn carries
+# the CLI ``promptId`` (the same id the hooks report as ``prompt_id``), and
+# the CLI writes a ``system`` record with ``subtype == "turn_duration"`` when
+# the turn ends. Used only when the Stop hook did not hand over the final
+# message itself (an older CLI without ``last_assistant_message``, or a hook
+# that crashed or ran out of its timeout).
+_TURN_END_SUBTYPES = ("turn_duration",)
+
+
+@dataclass(frozen=True)
+class TurnEnd:
+    prompt_id: str
+    ended: bool
+    text: str | None
+
+
+def _user_text(rec: dict) -> str:
+    message = rec.get("message") or {}
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(b.get("text") or "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def _tail_records(path: Path | str, tail_bytes: int) -> list[dict]:
+    try:
+        with Path(path).open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            chunk = f.read()
+    except OSError:
+        return []
+    lines = chunk.split(b"\n")
+    if size > tail_bytes and lines:
+        lines = lines[1:]  # the first line may be cut in half
+    out: list[dict] = []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def turn_end(
+    path: Path | str,
+    *,
+    tag: str | None = None,
+    prompt_id: str | None = None,
+    tail_bytes: int = 8 * 1024 * 1024,
+) -> TurnEnd | None:
+    """The turn that carries ``tag`` in a user prompt (or has ``prompt_id``):
+    whether the CLI has closed it, and its final assistant message.
+
+    ``None`` if that turn is not in the last ``tail_bytes`` of the file.
+    Never raises: the JSONL schema is not a published API."""
+    try:
+        records = _tail_records(path, tail_bytes)
+        pid = prompt_id or None
+        start = None
+        for i, rec in enumerate(records):
+            if rec.get("type") != "user" or rec.get("isSidechain"):
+                continue
+            rec_pid = rec.get("promptId")
+            if pid is not None and rec_pid == pid:
+                start = i
+                break
+            if pid is None and tag and tag in _user_text(rec):
+                pid = rec_pid or ""
+                start = i
+                break
+        if start is None or not pid:
+            return None
+        text: str | None = None
+        for rec in records[start + 1 :]:
+            if rec.get("isSidechain"):
+                continue
+            if rec.get("type") == "user":
+                other = rec.get("promptId")
+                if other and other != pid:
+                    break  # a later turn began; ours never wrote an end record
+                continue
+            if rec.get("type") == "system" and rec.get("subtype") in _TURN_END_SUBTYPES:
+                return TurnEnd(prompt_id=pid, ended=True, text=text)
+            body = _record_text(rec)
+            if body is not None:
+                text = body
+        return TurnEnd(prompt_id=pid, ended=False, text=text)
+    except Exception:  # noqa: BLE001 — a fallback must never raise
+        logger.debug("turn_end: transcript scan failed", exc_info=True)
+        return None

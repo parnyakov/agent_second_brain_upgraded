@@ -4684,3 +4684,193 @@ def test_ensure_session_reports_the_real_start_error_and_leaves_no_dead_pane_rea
     with pytest.raises(RuntimeError, match="claude: not found"):
         s.ensure_session()
     assert s.is_healthy() is False
+
+
+# ── blocking CLI choice dialog (2026-10-26/27) ─────────────────────────
+
+DIALOG = (
+    "────────────────────\n"
+    " We recommend compacting earlier\n"
+    " Want to autocompact at 400k tokens instead?\n"
+    " ❯ Keep auto (1m tokens)\n"
+    "   Autocompact at ‹ 400k › tokens\n"
+    " ↑/↓ choose · ←/→ change size · enter confirm · esc not now\n"
+)
+
+
+def _pastes(fake: FakeTmux) -> int:
+    return sum(1 for s in fake.sent_subcommands() if s == "paste-buffer")
+
+
+def test_ask_closes_dialog_before_typing(tmp_path, clock):
+    # The offer was on screen when the message arrived: close it with the
+    # "Keep" option first, then type the prompt once.
+    fake = FakeTmux(
+        [DIALOG, READY, READY, READY, THINKING, _complete("rid00001")], exists=True
+    )
+    s = make_session(tmp_path, fake, clock)
+    res = s.ask("привет")
+    assert res.status == "ok"
+    assert res.reply == "PONG"
+    assert _pastes(fake) == 1
+    escapes = [c for c in fake.sent_keys() if c[-1] == "Escape"]
+    assert not escapes
+
+
+def test_ask_resubmits_prompt_swallowed_by_dialog(tmp_path, clock):
+    # The dialog opened between the pre-send look and the paste: the prompt
+    # went into it, the transcript saw nothing. Close it and send again.
+    fake = FakeTmux(
+        [READY, READY, DIALOG, READY, READY, READY, THINKING, _complete("rid00001")],
+        exists=True,
+    )
+    s = make_session(tmp_path, fake, clock)
+    res = s.ask("привет")
+    assert res.status == "ok"
+    assert res.reply == "PONG"
+    assert _pastes(fake) == 2
+
+
+def test_ask_does_not_resubmit_when_turn_already_started(tmp_path, clock):
+    # The conversation already has records for this turn: a dialog now must
+    # only be closed, never cause a second copy of the prompt.
+    started = "● <<<R:rid00001>>>\nпишу ответ\n" + THINKING
+    fake = FakeTmux(
+        [READY, READY, started, DIALOG, READY, _complete("rid00001")],
+        exists=True,
+    )
+    s = make_session(tmp_path, fake, clock)
+    res = s.ask("привет")
+    assert res.status == "ok"
+    assert _pastes(fake) == 1
+
+
+def test_watchdog_dismiss_choice_dialog(tmp_path, clock):
+    fake = FakeTmux([DIALOG, READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    assert s.dismiss_choice_dialog() is True
+    assert fake.enter_count() == 1
+
+
+def test_watchdog_dismiss_noop_without_dialog(tmp_path, clock):
+    fake = FakeTmux([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    assert s.dismiss_choice_dialog() is False
+    assert fake.sent_keys() == []
+
+
+def test_startup_closes_choice_dialog(tmp_path, clock):
+    fake = FakeTmux([DIALOG, READY], exists=False)
+    s = make_session(tmp_path, fake, clock)
+    s.ensure_session()
+    assert fake.enter_count() >= 1
+    assert (tmp_path / ".dbrain" / "ready").exists()
+
+
+# ── persona changed while the CLI kept running (2026-11-02) ─────────────
+
+
+def _live_cli(tmp_path: Path, persona: str, *, state: str = "closed", bg: int = 0):
+    """A real process whose argv looks like the CLI's (persona + this
+    runtime dir's hook settings), recorded in turn-state like the hooks do."""
+    import sys
+
+    rt = tmp_path / ".dbrain"
+    rt.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            "--append-system-prompt",
+            persona,
+            "--settings",
+            str(rt / "turn-hooks.json"),
+        ]
+    )
+    (rt / "turn-state.json").write_text(
+        json.dumps(
+            {
+                "state": state,
+                "event": "Stop",
+                "ts": 1.0,
+                "session_id": "test-sid",
+                "cli_pid": proc.pid,
+                "background_tasks": bg,
+            }
+        )
+    )
+    return proc
+
+
+def _persona_session(tmp_path, fake, clock, text: str) -> ClaudeSession:
+    persona = tmp_path / "brain-system.md"
+    persona.write_text(text + "\n")
+    s = make_session(tmp_path, fake, clock)
+    s.system_prompt_file = persona
+    s.reply_ledger = True
+    return s
+
+
+@pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
+def test_session_with_outdated_persona_is_restarted(tmp_path, clock):
+    """The cron brain outlived the reply-ledger persona switch and kept the
+    marker contract for days; reusing it must start a fresh CLI instead."""
+    proc = _live_cli(tmp_path, "# old contract")
+    try:
+        fake = FakeTmux([READY], exists=True)
+        s = _persona_session(tmp_path, fake, clock, "# new contract")
+        s.ensure_session()
+    finally:
+        proc.kill()
+        proc.wait()
+    subs = fake.sent_subcommands()
+    assert "kill-session" in subs and "new-session" in subs
+    assert subs.index("kill-session") < subs.index("new-session")
+
+
+@pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
+def test_session_with_current_persona_is_reused(tmp_path, clock):
+    proc = _live_cli(tmp_path, "# new contract")
+    try:
+        fake = FakeTmux([READY], exists=True)
+        s = _persona_session(tmp_path, fake, clock, "# new contract")
+        s.ensure_session()
+    finally:
+        proc.kill()
+        proc.wait()
+    subs = fake.sent_subcommands()
+    assert "kill-session" not in subs and "new-session" not in subs
+
+
+@pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
+@pytest.mark.parametrize("state,bg", [("open", 0), ("closed", 1)])
+def test_busy_session_with_outdated_persona_is_left_alone(tmp_path, clock, state, bg):
+    """A turn or a background agent still running: never cut it."""
+    proc = _live_cli(tmp_path, "# old contract", state=state, bg=bg)
+    try:
+        fake = FakeTmux([READY], exists=True)
+        s = _persona_session(tmp_path, fake, clock, "# new contract")
+        s.ensure_session()
+    finally:
+        proc.kill()
+        proc.wait()
+    assert "kill-session" not in fake.sent_subcommands()
+
+
+def test_foreign_pid_in_turn_state_is_not_trusted(tmp_path, clock):
+    """cli_pid of a process that is not this session's CLI (here: pytest
+    itself, no persona in argv) — no restart on a guess."""
+    import os
+
+    rt = tmp_path / ".dbrain"
+    rt.mkdir(parents=True, exist_ok=True)
+    (rt / "turn-state.json").write_text(
+        json.dumps(
+            {"state": "closed", "event": "Stop", "ts": 1.0, "cli_pid": os.getpid()}
+        )
+    )
+    fake = FakeTmux([READY], exists=True)
+    s = _persona_session(tmp_path, fake, clock, "# new contract")
+    s.ensure_session()
+    assert "kill-session" not in fake.sent_subcommands()

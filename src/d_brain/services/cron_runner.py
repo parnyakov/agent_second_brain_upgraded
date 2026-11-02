@@ -186,7 +186,8 @@ class CronRunner:
 
         if res.ok:
             reply = (res.reply or "").strip()
-            silent = reply.startswith(SILENT_MARKER)
+            # res.silent: the reply ledger strips the sentinel from reply.
+            silent = getattr(res, "silent", False) or reply.startswith(SILENT_MARKER)
             delivery_error: str | None = None
             if reply and not silent:
                 chat = job.chat_id or self.default_chat_id

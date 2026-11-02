@@ -136,3 +136,19 @@ def test_daily_processing_is_tagged_as_maintenance(tmp_path):
     ClaudeProcessor(tmp_path, session=sess).process_daily(day)
     assert sess.request_ids
     assert all(r and r.startswith("maint-") for r in sess.request_ids)
+
+
+def test_daily_report_off_asks_for_silent_output(tmp_path, monkeypatch):
+    day = _daily(tmp_path)
+    sess = FakeSession(AskResult("ok", reply="x"))
+    monkeypatch.setenv("DBRAIN_DAILY_REPORT", "off")
+    ClaudeProcessor(tmp_path, session=sess).process_daily(day)
+    assert "[SILENT]" in sess.prompts[-1]
+
+
+def test_daily_report_on_by_default(tmp_path, monkeypatch):
+    day = _daily(tmp_path)
+    sess = FakeSession(AskResult("ok", reply="x"))
+    monkeypatch.delenv("DBRAIN_DAILY_REPORT", raising=False)
+    ClaudeProcessor(tmp_path, session=sess).process_daily(day)
+    assert "[SILENT]" not in sess.prompts[-1]

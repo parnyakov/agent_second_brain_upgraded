@@ -884,6 +884,18 @@ class Watchdog:
             self._write_status("logged_out")
             return "logged_out"
 
+        if state == PaneState.CHOICE_DIALOG:
+            # A blocking CLI choice dialog (e.g. the autocompact offer) is not
+            # a hang: close it instead of killing the session and its
+            # context. If a live ask() holds the pane it closes the dialog
+            # itself; until then the hang clock below runs as before, and
+            # force_recover is refused while that ask() holds the lock.
+            dismiss = getattr(self.session, "dismiss_choice_dialog", None)
+            if dismiss is not None and dismiss():
+                self._stuck_since = None
+                self._write_status("dialog_dismissed")
+                return "dialog_dismissed"
+
         if self._is_hung(state):
             return self._recover("hung", "♻️ Мозг завис — перезапустил.")
 

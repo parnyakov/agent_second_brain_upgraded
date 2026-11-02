@@ -173,6 +173,14 @@ def _build_session(
         # that sets neither env var is unchanged (see Settings.pane_width).
         pane_width=settings.pane_width,
         pane_height=settings.pane_height,
+        # Per-instance switch (Settings.reply_ledger); passed only when on, so
+        # an instance without it builds exactly the session it did before.
+        **({"reply_ledger": True} if getattr(settings, "reply_ledger", False) else {}),
+        **(
+            {"empty_reply_notice": True}
+            if getattr(settings, "empty_reply_notice", False)
+            else {}
+        ),
         # Passed only when set, so an unconfigured install builds the
         # session with exactly the arguments it did before ("claude" looked
         # up on PATH, the default tmux server) — see Settings.claude_bin /

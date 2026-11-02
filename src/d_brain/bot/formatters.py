@@ -175,7 +175,7 @@ def format_process_report(report: dict[str, Any]) -> str:
         error_msg = html.escape(str(report["error"]))
         return f"❌ <b>Ошибка:</b> {error_msg}"
 
-    if "report" in report:
+    if "report" in report and (report["report"] or "").strip():
         raw_report = report["report"]
 
         # Sanitize HTML, keeping allowed tags

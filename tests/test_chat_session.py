@@ -1486,3 +1486,33 @@ def test_reset_on_codex_runs_the_codex_preflight_not_claude_auth(
         asyncio.run(m.circuit_reset(1))
     assert calls == [["/usr/bin/codex", "login", "status"]]
     assert main._thread_file.read_text() == "thread-old\n"
+
+
+def test_send_message_returns_silent_for_an_empty_silent_turn(tmp_path):
+    """A turn that finished with nothing to say (bare [SILENT], or no text
+    with empty_reply_notice off) is Silent: not "" (the retry signal), and
+    a delivered turn for the health ledger."""
+    from d_brain.services import ask_health
+    from d_brain.services.chat_session import Silent
+
+    m = _manager(tmp_path, AskResult("ok", reply="", silent=True))
+    res = asyncio.run(m.send_message(1, "x"))
+    assert isinstance(res, Silent)
+    assert ask_health.read(tmp_path).last_status == "ok"
+
+
+def test_send_message_still_returns_text_of_a_sentinel_reply(tmp_path):
+    """"[SILENT] записал" answers a person: the text after the sentinel is
+    still the reply."""
+    m = _manager(tmp_path, AskResult("ok", reply="записал", silent=True))
+    assert asyncio.run(m.send_message(1, "x")) == "записал"
+
+
+def test_send_message_delivers_the_empty_notice_when_the_instance_wants_it(
+    tmp_path,
+):
+    """empty_reply_notice on: ask() hands back the notice as a normal reply."""
+    from d_brain.services.claude_session import LEDGER_EMPTY_REPLY
+
+    m = _manager(tmp_path, AskResult("ok", reply=LEDGER_EMPTY_REPLY))
+    assert asyncio.run(m.send_message(1, "x")) == LEDGER_EMPTY_REPLY

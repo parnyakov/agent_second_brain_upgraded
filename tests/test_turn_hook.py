@@ -159,3 +159,133 @@ def test_start_command_survives_hook_generation_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(turn_hooks, "write_hook_settings", boom)
     cmd = _session(tmp_path)._start_command("sid")
     assert "--settings" not in cmd and "DISABLE_AUTOUPDATER=1 " in cmd
+
+
+# ── reply ledger (2026-10-29) ───────────────────────────────────────────
+# Payload shapes below are the ones captured live from Claude Code 2.1.312
+# (throwaway session on a private tmux socket): UserPromptSubmit carries
+# prompt_id + prompt, Stop carries the same prompt_id, last_assistant_message
+# and background_tasks; a steer shares the running turn's prompt_id.
+
+
+def ledger(rt: Path) -> list[dict]:
+    p = rt / "turn-ledger.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+TAG = '<dbrain-turn rid="abc123" kind="ask"/>'
+
+
+def test_ledger_records_bound_submit_and_stop(tmp_path):
+    r = run_hook(tmp_path, ev("UserPromptSubmit", prompt=f"привет\n\n{TAG}",
+                              prompt_id="p1"))
+    assert r.returncode == 0 and r.stdout == ""
+    run_hook(tmp_path, ev("Stop", prompt_id="p1", last_assistant_message="Ответ",
+                          background_tasks=[{"id": "x"}]))
+    sub, stop = ledger(tmp_path)
+    assert sub["ev"] == "submit" and sub["prompt_id"] == "p1"
+    assert (sub["rid"], sub["kind"], sub["origin"]) == ("abc123", "ask", "user")
+    assert "prompt" not in sub  # the prompt text is never copied
+    assert stop["ev"] == "stop" and stop["prompt_id"] == "p1"
+    assert stop["text"] == "Ответ" and stop["background_tasks"] == 1
+    assert "transcript_path" not in stop
+
+
+def test_ledger_takes_the_last_tag_in_a_prompt(tmp_path):
+    old = '<dbrain-turn rid="old111" kind="ask"/>'
+    new = '<dbrain-turn rid="new222" kind="steer"/>'
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt=f"цитата {old}\nтекст\n\n{new}",
+                          prompt_id="p1"))
+    rec = ledger(tmp_path)[0]
+    assert (rec["rid"], rec["kind"]) == ("new222", "steer")
+
+
+def test_ledger_untagged_and_task_notification(tmp_path):
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt="набрал руками", prompt_id="p1"))
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt="<task-notification>\n<task-id>x",
+                          prompt_id="p2"))
+    a, b = ledger(tmp_path)
+    assert a["rid"] is None and a["origin"] == "user"
+    assert b["rid"] is None and b["origin"] == "task-notification"
+
+
+def test_ledger_binds_legacy_marker_prompt_for_the_metric(tmp_path):
+    prompt = ("вопрос\n\nWhen done, wrap your ENTIRE reply between a line containing "
+              "only <<<R:leg42>>> and a line containing only <<<E:leg42>>>.")
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt=prompt, prompt_id="p1"))
+    assert (ledger(tmp_path)[0]["rid"], ledger(tmp_path)[0]["kind"]) == ("leg42", "ask")
+
+
+def test_ledger_stop_without_message_points_at_transcript(tmp_path):
+    """An older CLI without last_assistant_message: the reader resolves the
+    text from the transcript later; the hook stays cheap."""
+    run_hook(tmp_path, ev("Stop", prompt_id="p1", transcript_path="/t/x.jsonl"))
+    rec = ledger(tmp_path)[0]
+    assert rec["text"] is None and rec["transcript_path"] == "/t/x.jsonl"
+
+
+def test_ledger_stop_failure_and_session_start(tmp_path):
+    run_hook(tmp_path, ev("StopFailure", prompt_id="p1", error="rate_limit"))
+    run_hook(tmp_path, ev("SessionStart", source="clear"))
+    f, s = ledger(tmp_path)
+    assert f["ev"] == "stop_failure" and f["error"] == "rate_limit"
+    assert s["ev"] == "session_start" and s["source"] == "clear"
+
+
+def test_ledger_ignores_subagent_and_tool_events(tmp_path):
+    run_hook(tmp_path, ev("Stop", agent_id="af4d", prompt_id="p1",
+                          last_assistant_message="subagent"))
+    run_hook(tmp_path, ev("PreToolUse", tool_name="Bash", prompt_id="p1"))
+    assert ledger(tmp_path) == []
+
+
+def test_ledger_rotates_at_the_size_cap(tmp_path):
+    big = tmp_path / "turn-ledger.jsonl"
+    big.write_text("x" * (8 * 1024 * 1024 + 10) + "\n")
+    run_hook(tmp_path, ev("Stop", prompt_id="p9", last_assistant_message="new"))
+    assert (tmp_path / "turn-ledger.jsonl.1").exists()
+    assert [r["prompt_id"] for r in ledger(tmp_path)] == ["p9"]
+
+
+def test_ledger_still_written_when_state_file_is_broken(tmp_path):
+    (tmp_path / "turn-state.json").mkdir()  # the state write must fail
+    r = run_hook(tmp_path, ev("Stop", prompt_id="p1", last_assistant_message="ok"))
+    assert r.returncode == 0 and r.stdout == ""
+    assert ledger(tmp_path)[0]["text"] == "ok"
+
+
+def test_compact_does_not_close_an_open_turn(tmp_path):
+    """Auto-compaction inside a running turn: the turn goes on."""
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt=TAG, prompt_id="p1"))
+    run_hook(tmp_path, {"hook_event_name": "SessionStart", "session_id": "s2",
+                        "source": "compact", "prompt_id": "p1"})
+    st = state(tmp_path)
+    assert st["state"] == "open" and st["session_id"] == "s2"
+    assert st["prompt_id"] == "p1"
+
+
+def test_state_tracks_prompt_id_and_tag_kinds_of_the_open_turn(tmp_path):
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt=TAG, prompt_id="p1"))
+    steer = '<dbrain-turn rid="s1" kind="steer"/>'
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt=f"ещё {steer}", prompt_id="p1"))
+    st = state(tmp_path)
+    assert st["prompt_id"] == "p1" and st["kinds"] == ["ask", "steer"]
+    run_hook(tmp_path, ev("Stop", prompt_id="p1", last_assistant_message="x"))
+    maint = '<dbrain-turn rid="m1" kind="maint"/>'
+    run_hook(tmp_path, ev("UserPromptSubmit", prompt=maint, prompt_id="p2"))
+    st = state(tmp_path)
+    assert st["prompt_id"] == "p2" and st["kinds"] == ["maint"]
+
+
+def test_hook_and_module_tag_regex_agree():
+    """scripts/turn_hook.py is stdlib-only and keeps its own copy."""
+    import importlib.util
+
+    from d_brain.services import turn_ledger
+
+    spec = importlib.util.spec_from_file_location("turn_hook_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.TAG_RE.pattern == turn_ledger.TAG_RE.pattern
+    tag = turn_ledger.turn_tag("r_1-x", "maint")
+    assert mod.parse_tag(f"a\n\n{tag}") == ("r_1-x", "maint")

@@ -48,6 +48,10 @@ class PaneState(str, Enum):
     READY = "ready"  # idle prompt / bypass-permissions footer
     RATE_LIMITED = "rate_limited"  # usage limit hit — do NOT kill, wait for reset
     LOGGED_OUT = "logged_out"  # auth lost — needs re-login
+    # A blocking CLI choice dialog drawn over the prompt box (e.g. the
+    # "We recommend compacting earlier" autocompact offer, 2026-10-26/27):
+    # it swallows typed prompts and is NOT a hang — dismiss it, never kill.
+    CHOICE_DIALOG = "choice_dialog"
     UNKNOWN = "unknown"
 
 
@@ -536,6 +540,26 @@ _LOGGED_OUT_RE = re.compile(
 _FOOTER_RE = re.compile(r"bypass permissions on")
 _IDLE_RE = re.compile(r"(?m)^\s*❯")
 _STARTING_RE = re.compile(r"Claude Code v\d", re.I)
+# Blocking choice dialogs (CHOICE_DIALOG). Measured live on Claude Code
+# 2.1.310/2.1.311 (a production pane.log, 2026-10-26 and 2026-10-27):
+#
+#   We recommend compacting earlier
+#   ...
+#   ❯ Keep auto (1m tokens)
+#     Autocompact at ‹ 400k › tokens
+#   ↑/↓ choose · ←/→ change size · enter confirm · esc not now
+#
+# Its "❯ Keep auto" selector matched _IDLE_RE, so the pane read as READY:
+# the bot typed the next message INTO the dialog (lost), the turn never
+# started, and the watchdog restarted the session after the ask timed out.
+# Anchored on the CLI's own key-hint line ("enter confirm · esc …"), matched
+# in chrome only. Trust / bypass modals have their own states and are
+# classified first; this never auto-answers those.
+_CHOICE_DIALOG_RE = re.compile(
+    r"(?im)^.*\benter\s+(?:to\s+)?(?:confirm|select)\b.*·\s*esc\b.*$"
+)
+# The selected option of a choice dialog: "❯ <label>".
+_DIALOG_SELECTED_RE = re.compile(r"(?m)^\s*❯\s*(\S.*?)\s*$")
 # Active-turn marker. The TUI shows "(esc to interrupt)" next to its spinner
 # for the whole turn, so its absence + an idle ❯ is the idle signal. The
 # bypass footer is ALWAYS on screen under --dangerously-skip-permissions and
@@ -1421,8 +1445,28 @@ def classify_state(text: str) -> PaneState:
         return PaneState.RATE_LIMITED
     if _LOGGED_OUT_RE.search(chrome):
         return PaneState.LOGGED_OUT
+    # Before READY: the dialog's "❯ Keep …" selector matches _IDLE_RE and the
+    # bypass footer may still be on screen under it.
+    if _CHOICE_DIALOG_RE.search(chrome):
+        return PaneState.CHOICE_DIALOG
     if _FOOTER_RE.search(text) or _IDLE_RE.search(chrome):
         return PaneState.READY
     if _STARTING_RE.search(text):
         return PaneState.STARTING
     return PaneState.UNKNOWN
+
+
+def choice_dialog_key(text: str) -> str:
+    """The key that closes a CHOICE_DIALOG without changing anything.
+
+    ``"Enter"`` when the highlighted option is a "Keep …" one (the compact
+    offer's "Keep auto (1m tokens)" — the same choice the owner's own config
+    holds, so it is also persisted and the offer does not come back);
+    ``"Escape"`` ("not now" / cancel) for any other selection."""
+    chrome = _chrome(text)
+    selected = None
+    for m in _DIALOG_SELECTED_RE.finditer(chrome):
+        selected = m.group(1)
+    if selected and selected.lower().startswith("keep"):
+        return "Enter"
+    return "Escape"

@@ -174,6 +174,32 @@ async def _watchdog_pinger() -> None:
         notify("WATCHDOG=1")
 
 
+def _start_reply_pump(bot: Bot, settings: Settings) -> asyncio.Task | None:
+    """The unsolicited-reply pump (services/reply_pump.py), only when this
+    instance runs the reply ledger on the Claude engine. Watches the MAIN
+    session's runtime dir only — cron and duty keep their own ledgers, and
+    nobody relays their unbound turns, exactly as before."""
+    if not getattr(settings, "reply_ledger", False) or settings.chat_engine != "claude":
+        return None
+    chat_id = settings.admin_chat_id
+    if chat_id is None:
+        logger.warning("reply ledger on but no owner chat id — reply pump not started")
+        return None
+    from d_brain.bot.formatters import send_response
+    from d_brain.services import reply_pump
+
+    async def deliver(text: str) -> None:
+        await send_response(bot, chat_id, text)
+
+    pump = reply_pump.ReplyPump(
+        settings.runtime_dir,
+        deliver,
+        empty_notice=bool(getattr(settings, "empty_reply_notice", False)),
+    )
+    logger.info("reply ledger: unsolicited-reply pump started for chat %s", chat_id)
+    return asyncio.create_task(reply_pump.run(pump))
+
+
 async def run_bot(settings: Settings) -> None:
     """Run the bot with polling."""
     bot = create_bot(settings)
@@ -245,6 +271,7 @@ async def run_bot(settings: Settings) -> None:
     # process had queued but not delivered (restart mid-send, crash, 429
     # backoff that outlived the process).
     outbox_task = asyncio.create_task(outbox.run(bot, box))
+    pump_task = _start_reply_pump(bot, settings)
     cron_task = (
         asyncio.create_task(run_cron(settings, bot)) if settings.cron_enabled else None
     )
@@ -347,6 +374,8 @@ async def run_bot(settings: Settings) -> None:
     finally:
         pinger.cancel()
         outbox_task.cancel()
+        if pump_task is not None:
+            pump_task.cancel()
         # Not cancelled before the grace, unlike cron: `should_start` above
         # already stopped it taking NEW jobs, and the one it may still be
         # running is tracked in `stopper`, so `wait_for_turns` gives it the
