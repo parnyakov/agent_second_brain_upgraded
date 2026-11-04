@@ -227,6 +227,20 @@ class Settings(BaseSettings):
             "Off = the legacy marker contract."
         ),
     )
+    # The cron session's turns nobody asked for (2026-11-02): a scheduled job
+    # that dispatched a background agent closes its turn; the agent's
+    # task-notification turn then answers in the cron session, where only
+    # the job's own ask() was listening. On: the bot runs the same reply pump
+    # over the cron runtime dir as over the main one. Per instance, OFF by
+    # default; needs reply_ledger and the Claude cron engine.
+    cron_reply_pump: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DBRAIN_CRON_REPLY_PUMP", "cron_reply_pump"),
+        description=(
+            "Deliver the cron session's unsolicited turns (background-agent "
+            "reports) through the reply pump. Off = they are not delivered."
+        ),
+    )
     # A turn that ended without any text (reply ledger). Per instance, OFF by
     # default: such a turn is silent, like [SILENT]: logged, nothing sent.
     # On: the owner gets "✅ Ход завершён без текстового ответа." as a

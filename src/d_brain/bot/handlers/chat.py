@@ -104,9 +104,23 @@ async def _dispatch_text(
     text: str,
     *,
     message_id: int | None = None,
+    context: str = "",
 ) -> None:
     """Route a text by behavior: control → fire-and-forget; tui → hint;
-    normal turn (incl. /skill-name) → session via the marker path."""
+    normal turn (incl. /skill-name) → session via the marker path.
+
+    ``context`` (e.g. the replied-to message, see ``reply_context``) rides
+    along into the session but never takes part in classifying ``text`` —
+    a "/stop" or a slash command sent as a reply is still what it is.
+    A slash command must also stay first in the prompt for the CLI to run
+    it, so there the context follows the command instead of leading it.
+    """
+    if not context:
+        prompt = text
+    elif text.startswith("/"):
+        prompt = f"{text}\n{context.rstrip()}"
+    else:
+        prompt = f"{context}{text}"
     kind = classify_command(text)
     if kind == "control":
         await _get_manager().send_control(text)
@@ -159,21 +173,23 @@ async def _dispatch_text(
             # queue; the "held by maintenance" check lives
             # at that single choke point so voice and media get it too (the
             # F6 lesson), not here.
-            await _process_and_reply(bot, chat_id, user_id, text, message_id=message_id)
+            await _process_and_reply(
+                bot, chat_id, user_id, prompt, message_id=message_id
+            )
             return
         # A STEERABLE chat turn is the one busy case the queue deliberately
         # does NOT take: steering hands the text to the turn that is running
         # right now, which is strictly better than making it wait for a turn
         # of its own. "One work at a time per chat" still holds — steering
         # adds input to the live work, it does not start a second one.
-        await manager.steer(text)
+        await manager.steer(prompt)
         await bot.send_message(chat_id, "↪️ Передал в текущую задачу.")
         return
     # mode == "ask". The busy gate used to live right here — it now lives
     # inside _run_turn, behind the single _process_and_reply choke point
     # (blind review F6), so that voice, media and album messages pass through
     # it too.
-    await _process_and_reply(bot, chat_id, user_id, text, message_id=message_id)
+    await _process_and_reply(bot, chat_id, user_id, prompt, message_id=message_id)
 
 
 def _cli_turn_steerable(manager: Any) -> bool:
@@ -742,6 +758,103 @@ def forward_note(origin: Any) -> str:
     return "[переслано]\n"
 
 
+# A Telegram "Reply" is the user pointing at a message. Without it a short
+# answer ("Да", "второй вариант") reaches the brain with no referent — the
+# session cannot tell WHICH question was answered, least of all when the
+# question came from another sender in the same chat (cron session, file
+# sender). So the replied message travels with the prompt as one compact
+# context line.
+REPLY_CONTEXT_LIMIT = 600
+
+_REPLY_MEDIA_LABELS = (
+    # (attribute on Message / ExternalReplyInfo, human label)
+    # animation first: Telegram also fills ``document`` for a GIF
+    ("animation", "GIF"),
+    ("photo", "фото"),
+    ("document", "документ"),
+    ("voice", "голосовое"),
+    ("video", "видео"),
+    ("video_note", "видеосообщение"),
+    ("audio", "аудио"),
+    ("sticker", "стикер"),
+    ("location", "геопозиция"),
+    ("contact", "контакт"),
+    ("poll", "опрос"),
+)
+
+
+def _reply_media_label(obj: Any) -> str:
+    for attr, label in _REPLY_MEDIA_LABELS:
+        if getattr(obj, attr, None):
+            return label
+    return ""
+
+
+def _truncate_start(text: str, limit: int = REPLY_CONTEXT_LIMIT) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _local_time(moment: Any) -> datetime | None:
+    # Same convention as the daily timestamps: server-local wall clock.
+    if moment is None:
+        return None
+    try:
+        return datetime.fromtimestamp(moment.timestamp())
+    except (AttributeError, OSError, OverflowError, ValueError):
+        return None
+
+
+def reply_context(message: Any) -> str:
+    """Context line for a message sent as a Telegram reply, or ''.
+
+    Covers an in-chat reply (``reply_to_message``), a quoted fragment of it
+    (``quote`` — preferred over the full text, it is what the user pointed
+    at) and a reply to a message from another chat (``external_reply``).
+    The replied text is cut at ``REPLY_CONTEXT_LIMIT`` keeping its start;
+    a message without text is named by its media type.
+    """
+    replied = getattr(message, "reply_to_message", None)
+    external = getattr(message, "external_reply", None)
+    if replied is None and external is None:
+        return ""
+
+    quote = getattr(message, "quote", None)
+    quoted = (getattr(quote, "text", None) or "") if quote is not None else ""
+
+    if replied is not None:
+        sender = getattr(replied, "from_user", None)
+        who = "от бота" if getattr(sender, "is_bot", False) else "от пользователя"
+        moment = getattr(replied, "date", None)
+        body = getattr(replied, "text", None) or getattr(replied, "caption", None)
+        media = _reply_media_label(replied)
+    else:
+        who = "из другого чата"
+        moment = getattr(getattr(external, "origin", None), "date", None)
+        body = None  # ExternalReplyInfo carries no text; only a quote does
+        media = _reply_media_label(external)
+
+    parts = [f"в ответ на сообщение {who}"]
+    when = _local_time(moment)
+    if when is not None:
+        sent = _local_time(getattr(message, "date", None))
+        same_day = sent is not None and sent.date() == when.date()
+        parts.append(when.strftime("%H:%M" if same_day else "%d.%m %H:%M"))
+    if media:
+        parts.append(f"({media})")
+    line = " ".join(parts)
+
+    text = quoted or body or ""
+    if text:
+        sep = ", цитата: " if quoted else ": "
+        line += f"{sep}«{_truncate_start(text)}»"
+    elif not media:
+        line += ": текст недоступен"
+    return f"[{line}]\n"
+
+
 def build_media_prompt(
     *,
     kind: str,
@@ -778,6 +891,7 @@ _album_tasks: dict[str, asyncio.Task] = {}
 
 def build_album_prompt(items: list[dict[str, Any]]) -> str:
     fwd = next((i["fwd"] for i in items if i["fwd"]), "")
+    reply = next((i.get("reply") for i in items if i.get("reply")), "")
     captions = [i["caption"] for i in items if i["caption"]]
     lines = []
     for item in items:
@@ -801,7 +915,7 @@ def build_album_prompt(items: list[dict[str, Any]]) -> str:
         "в память по правилам vault одной записью и кратко ответь."
     )
     return (
-        f"{fwd}Пользователь прислал альбом из {len(items)} файлов:\n"
+        f"{reply}{fwd}Пользователь прислал альбом из {len(items)} файлов:\n"
         f"{files}{caption_part}\n{guidance}\n"
         "Ответь ОДНОЙ записью в память и одним кратким ответом на весь альбом."
     )
@@ -1017,7 +1131,7 @@ async def handle_chat_voice(message: Message, bot: Bot) -> None:
             bot,
             message.chat.id,
             message.from_user.id,
-            f"[voice] {transcript}",
+            f"{reply_context(message)}[voice] {transcript}",
             message_id=message.message_id,
         )
 
@@ -1065,6 +1179,7 @@ async def handle_chat_text(message: Message, bot: Bot) -> None:
         message.from_user.id,
         text,
         message_id=message.message_id,
+        context=reply_context(message),
     )
 
 
@@ -1080,6 +1195,7 @@ async def handle_chat_media(message: Message, bot: Bot) -> None:
     timestamp = datetime.fromtimestamp(message.date.timestamp())
     caption = message.caption or ""
     fwd = forward_note(getattr(message, "forward_origin", None))
+    reply = reply_context(message)
 
     try:
         kind, file_id, ext, original_name = extract_media(message)
@@ -1149,6 +1265,7 @@ async def handle_chat_media(message: Message, bot: Bot) -> None:
                         "rel_path": rel_path,
                         "caption": caption,
                         "fwd": fwd,
+                        "reply": reply,
                         "message_id": message.message_id,
                         "model_rel_path": prep.model_rel_path,
                         "instruction": prep.instruction,
@@ -1165,7 +1282,7 @@ async def handle_chat_media(message: Message, bot: Bot) -> None:
                     await flush
                 return
 
-            prompt = build_media_prompt(
+            prompt = reply + build_media_prompt(
                 kind=kind,
                 rel_path=rel_path,
                 original_name=original_name,

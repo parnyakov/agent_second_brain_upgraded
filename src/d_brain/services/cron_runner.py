@@ -11,6 +11,11 @@ Semantics:
   alerts the admin. rate_limited is not the job's fault — skip, wait.
 * A reply starting with [SILENT] is not delivered (anti-spam for
   monitoring jobs).
+* The job's own turn is delivered here. A later turn of the cron session
+  that no job asked for (a background agent's task-notification) is
+  delivered by the cron reply pump when Settings.cron_reply_pump is on
+  (cron_pump_enabled); both claim turns in the same claims file, so a turn
+  goes out once.
 """
 
 import asyncio
@@ -28,6 +33,22 @@ from d_brain.services.tmux_parse import PaneState, classify_state, reset_epoch
 logger = logging.getLogger(__name__)
 
 SILENT_MARKER = "[SILENT]"
+# A job's own turn that the cron pump delivered because the job's ask() was
+# gone (the bot restarted mid-job): marked so it is not read as new news.
+CRON_LATE_PREFIX = "↩️ <i>Результат планового задания, пришёл с опозданием:</i>\n\n"
+# AskResult.detail when the turn was already taken by the reply pump.
+ALREADY_DELIVERED = "already delivered"
+
+
+def cron_pump_enabled(settings: Any) -> bool:
+    """Is the cron session's unsolicited-turn pump on for this instance?"""
+    return bool(
+        getattr(settings, "reply_ledger", False)
+        and getattr(settings, "cron_reply_pump", False)
+        and getattr(settings, "cron_enabled", False)
+        and getattr(settings, "cron_engine", "claude") == "claude"
+    )
+
 
 # (2026-09): the cron pane has no watchdog of its
 # own (see runtime.py — a separate tmux pane + runtime_dir from the main
@@ -46,7 +67,23 @@ LIMIT_ALERT_AFTER = 6 * 3600.0
 LIMIT_ALERT_REPEAT = 24 * 3600.0
 
 
-def wrap_job_prompt(job_id: str, prompt: str, *, scheduled_for: str | None) -> str:
+# Appended to the run rules only when the cron pump is on: the follow-up
+# turn of a background agent is then a real reply, under the same rules.
+BACKGROUND_RULE = (
+    " Если запускаешь фонового агента, его итог придёт отдельным ходом "
+    "(task-notification), и последнее сообщение того хода тоже уйдёт в "
+    "Telegram: те же правила — HTML, по-русски, а если сообщать нечего, "
+    f"начни его строкой {SILENT_MARKER}."
+)
+
+
+def wrap_job_prompt(
+    job_id: str,
+    prompt: str,
+    *,
+    scheduled_for: str | None,
+    background_relayed: bool = False,
+) -> str:
     """Per-run envelope for the cron brain. The marker instruction is NOT
     duplicated here — ask(wrap=True) appends it."""
     return (
@@ -57,6 +94,7 @@ def wrap_job_prompt(job_id: str, prompt: str, *, scheduled_for: str | None) -> s
         "(<b> <i> <code> <a>), без Markdown. Если доставлять нечего — начни "
         f"ответ строкой {SILENT_MARKER}. В этом запуске ЗАПРЕЩЕНО создавать, "
         "изменять или удалять cron-задания (никаких d_brain.cron add/remove)."
+        + (BACKGROUND_RULE if background_relayed else "")
     )
 
 
@@ -77,8 +115,12 @@ class CronRunner:
         max_consecutive_errors: int = 3,
         retry_seconds: float = 300.0,
         clock: Callable[[], datetime] | None = None,
+        background_relayed: bool = False,
     ) -> None:
         self.store = store
+        # cron_pump_enabled(): a background agent's report is delivered by
+        # the cron reply pump, and the job prompt says so.
+        self.background_relayed = background_relayed
         self.session = session
         self.deliver = deliver
         self.alert = alert
@@ -161,7 +203,10 @@ class CronRunner:
 
     async def run_job(self, job: CronJob) -> None:
         wrapped = wrap_job_prompt(
-            job.id, job.prompt, scheduled_for=job.state.next_run
+            job.id,
+            job.prompt,
+            scheduled_for=job.state.next_run,
+            background_relayed=self.background_relayed,
         )
         res = await asyncio.to_thread(
             self.session.ask,
@@ -188,6 +233,13 @@ class CronRunner:
             reply = (res.reply or "").strip()
             # res.silent: the reply ledger strips the sentinel from reply.
             silent = getattr(res, "silent", False) or reply.startswith(SILENT_MARKER)
+            if getattr(res, "detail", None) == ALREADY_DELIVERED:
+                # The cron pump took this turn first (the ask() was slower
+                # than its grace): it is already out, don't send it twice.
+                logger.warning(
+                    "cron job %s: reply already delivered by the pump", job.id
+                )
+                silent = True
             delivery_error: str | None = None
             if reply and not silent:
                 chat = job.chat_id or self.default_chat_id
@@ -471,5 +523,6 @@ async def run_cron(settings: Any, bot: Any) -> None:
         job_timeout=settings.cron_job_timeout,
         max_consecutive_errors=settings.cron_max_consecutive_errors,
         retry_seconds=settings.cron_retry_seconds,
+        background_relayed=cron_pump_enabled(settings),
     )
     await runner.run(settings.cron_tick_seconds)

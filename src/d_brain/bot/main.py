@@ -174,12 +174,42 @@ async def _watchdog_pinger() -> None:
         notify("WATCHDOG=1")
 
 
+def _reply_pumps(settings: Settings, deliver) -> list:
+    """One unsolicited-reply pump (services/reply_pump.py) per session whose
+    turns nobody else relays. Main: whenever this instance runs the reply
+    ledger on the Claude chat engine. Cron: additionally behind
+    Settings.cron_reply_pump (a background agent dispatched by a scheduled
+    job reports in the cron session after the job's turn closed). Duty keeps
+    its own ledger, unrelayed, as before."""
+    if not getattr(settings, "reply_ledger", False):
+        return []
+    from d_brain.services import reply_pump
+    from d_brain.services.cron_runner import CRON_LATE_PREFIX, cron_pump_enabled
+
+    empty = bool(getattr(settings, "empty_reply_notice", False))
+    pumps = []
+    if settings.chat_engine == "claude":
+        pumps.append(
+            reply_pump.ReplyPump(settings.runtime_dir, deliver, empty_notice=empty)
+        )
+    if cron_pump_enabled(settings):
+        settings.cron_dir.mkdir(parents=True, exist_ok=True)
+        pumps.append(
+            reply_pump.ReplyPump(
+                settings.cron_dir,
+                deliver,
+                empty_notice=empty,
+                name="cron",
+                late_prefix=CRON_LATE_PREFIX,
+            )
+        )
+    return pumps
+
+
 def _start_reply_pump(bot: Bot, settings: Settings) -> asyncio.Task | None:
-    """The unsolicited-reply pump (services/reply_pump.py), only when this
-    instance runs the reply ledger on the Claude engine. Watches the MAIN
-    session's runtime dir only — cron and duty keep their own ledgers, and
-    nobody relays their unbound turns, exactly as before."""
-    if not getattr(settings, "reply_ledger", False) or settings.chat_engine != "claude":
+    """Run the session pumps (see _reply_pumps) in one background task. Every
+    pump delivers to the owner chat, the same chat cron jobs report to."""
+    if not getattr(settings, "reply_ledger", False):
         return None
     chat_id = settings.admin_chat_id
     if chat_id is None:
@@ -191,13 +221,15 @@ def _start_reply_pump(bot: Bot, settings: Settings) -> asyncio.Task | None:
     async def deliver(text: str) -> None:
         await send_response(bot, chat_id, text)
 
-    pump = reply_pump.ReplyPump(
-        settings.runtime_dir,
-        deliver,
-        empty_notice=bool(getattr(settings, "empty_reply_notice", False)),
+    pumps = _reply_pumps(settings, deliver)
+    if not pumps:
+        return None
+    logger.info(
+        "reply ledger: unsolicited-reply pump started for chat %s (sessions: %s)",
+        chat_id,
+        ", ".join(p.name for p in pumps),
     )
-    logger.info("reply ledger: unsolicited-reply pump started for chat %s", chat_id)
-    return asyncio.create_task(reply_pump.run(pump))
+    return asyncio.create_task(reply_pump.run(*pumps))
 
 
 async def run_bot(settings: Settings) -> None:

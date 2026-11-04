@@ -1,0 +1,41 @@
+{
+  "_about": "Three cron-session cases lost before the cron reply pump existed. Shape and timing follow a real cron turn ledger and its claims (dt = seconds from the job's submit); prompt/session ids are synthetic and the texts are neutral stand-ins of the same form (a legacy <<<R:...>>> line, Telegram HTML, a [SILENT] job reply). In each case the job turn was claimed by the cron runner's ask() and the background agent's task-notification turn was claimed by nobody.",
+  "cases": [
+    {
+      "name": "pressfeed",
+      "records": [
+        {"dt": 0.0, "ev": "submit", "session": "s1", "prompt_id": "job-pf", "rid": "da51f053", "kind": "ask", "origin": "user"},
+        {"dt": 105.283, "ev": "stop", "session": "s1", "prompt_id": "job-pf", "text": "<<<R:da51f053>>>\n<b>Плановый отчёт готов.</b> Подборку запросов собирает фоновый агент.", "background_tasks": 1},
+        {"dt": 106.672, "ev": "session_start", "session": "s2", "prompt_id": "", "source": "clear"},
+        {"dt": 503.986, "ev": "submit", "session": "s2", "prompt_id": "bg-pf", "rid": null, "kind": null, "origin": "task-notification"},
+        {"dt": 516.289, "ev": "stop", "session": "s2", "prompt_id": "bg-pf", "text": "<<<R:pf3110a>>>\n<b>Подборку запросов сегодня сделать не удалось.</b> Сайт площадки недоступен с сервера, повторю завтра.", "background_tasks": 0}
+      ],
+      "ask_claims": [{"prompt_id": "job-pf", "rid": "da51f053", "dt": 106.205, "sentinel": false}],
+      "expected": "<b>Подборку запросов сегодня сделать не удалось.</b> Сайт площадки недоступен с сервера, повторю завтра."
+    },
+    {
+      "name": "ai-visibility",
+      "records": [
+        {"dt": 0.0, "ev": "submit", "session": "s1", "prompt_id": "job-aiw", "rid": "60635835", "kind": "ask", "origin": "user"},
+        {"dt": 19.311, "ev": "stop", "session": "s1", "prompt_id": "job-aiw", "text": "[SILENT]\n\nЯ запустил недельный прогон в фоне. Когда он закончится, отправлю итог.", "background_tasks": 1},
+        {"dt": 19.965, "ev": "session_start", "session": "s2", "prompt_id": "", "source": "clear"},
+        {"dt": 1049.704, "ev": "submit", "session": "s2", "prompt_id": "bg-aiw", "rid": null, "kind": null, "origin": "task-notification"},
+        {"dt": 1063.637, "ev": "stop", "session": "s2", "prompt_id": "bg-aiw", "text": "<<<R:aiw0111>>>\n<b>Сделал все 3 действия недели</b>, но в ответах нейросетей нас пока нет.", "background_tasks": 0}
+      ],
+      "ask_claims": [{"prompt_id": "job-aiw", "rid": "60635835", "dt": 19.612, "sentinel": true}],
+      "expected": "<b>Сделал все 3 действия недели</b>, но в ответах нейросетей нас пока нет."
+    },
+    {
+      "name": "ozon",
+      "records": [
+        {"dt": 0.0, "ev": "submit", "session": "s1", "prompt_id": "job-oz", "rid": "8014f7a3", "kind": "ask", "origin": "user"},
+        {"dt": 17.577, "ev": "stop", "session": "s1", "prompt_id": "job-oz", "text": "[SILENT] Отправил фоновому агенту обновление снимка. Итог разберу, когда он вернётся.", "background_tasks": 1},
+        {"dt": 18.905, "ev": "session_start", "session": "s2", "prompt_id": "", "source": "clear"},
+        {"dt": 276.161, "ev": "submit", "session": "s2", "prompt_id": "bg-oz", "rid": null, "kind": null, "origin": "task-notification"},
+        {"dt": 288.028, "ev": "stop", "session": "s2", "prompt_id": "bg-oz", "text": "Утренняя проверка прошла: <b>все 16 офферов совпадают с пультом</b>.", "background_tasks": 0}
+      ],
+      "ask_claims": [{"prompt_id": "job-oz", "rid": "8014f7a3", "dt": 18.496, "sentinel": true}],
+      "expected": "Утренняя проверка прошла: <b>все 16 офферов совпадают с пультом</b>."
+    }
+  ]
+}
