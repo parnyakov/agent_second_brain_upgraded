@@ -27,6 +27,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from d_brain.services.claude_session import PERMISSION_STATUS
 from d_brain.services.cron_store import CronJob, CronStore, compute_next_run
 from d_brain.services.tmux_parse import PaneState, classify_state, reset_epoch
 
@@ -220,6 +221,15 @@ class CronRunner:
             logger.warning("cron job %s skipped: subscription rate limit", job.id)
             self._note_rate_limited(now)
             self._record_failure(job, now, status="rate_limited", count=False)
+            return
+
+        if res.status == PERMISSION_STATUS:
+            # A permission dialog in the cron pane waits for the person
+            # (services/permission_gate.py asks the person). Not the job's fault and
+            # nothing to recover: force_recover would kill the agent that
+            # asked. Retried like a limit hit.
+            logger.warning("cron job %s waits: permission dialog on screen", job.id)
+            self._record_failure(job, now, status=res.status, count=False)
             return
 
         # Any other outcome (ok / error / logged_out / timeout) means the

@@ -38,6 +38,7 @@ from pathlib import Path
 from d_brain.services import long_run, turn_ledger, turn_state
 from d_brain.services.tmux_parse import (
     PaneState,
+    PermissionDialog,
     _chrome,
     choice_dialog_key,
     classify_state,
@@ -57,6 +58,7 @@ from d_brain.services.tmux_parse import (
     main_area_working,
     main_turn_finished,
     open_reply_rids,
+    read_permission_dialog,
     reply_rids,
     strip_chrome,
     strip_open_reply_body,
@@ -273,6 +275,27 @@ _SUBMIT_MAX_ENTERS = 5
 NOT_SUBMITTED_DETAIL = "prompt never left the input box"
 # What an unsent paste leaves in the input box once the CLI collapses it.
 _PASTED_TEXT = "[Pasted text"
+# Permission dialogs (tmux_parse.PaneState.PERMISSION_DIALOG, 2026-11-05):
+# ask() never types into one; it hands the prompt back with this status and
+# the chat path parks it until the person has answered (services/
+# permission_gate.py). Neutral for ask_health: nothing is broken.
+PERMISSION_STATUS = "permission"
+PERMISSION_DETAIL = "a permission dialog is waiting for the person"
+# A dialog on screen while OUR turn has not shown up yet: the prompt was
+# dropped by the dialog (verified live: a paste into it is discarded). The
+# grace covers a submit hook that is merely a moment late.
+_PERMISSION_SUBMIT_GRACE = 6.0
+# How long answer_permission() watches for the dialog to go after its key.
+_PERMISSION_ANSWER_WAIT = 6.0
+# Ledger path: no UserPromptSubmit this long after the paste, our prompt not
+# in the input box (or no box at all), no dialog and nothing working — the
+# prompt went somewhere the bot cannot see. Told plainly instead of waiting
+# out the 900-1500 s ceiling (2026-11-02..05). A turn that runs
+# without hooks still shows as working, and when it ends the transcript
+# fallback below delivers it well inside this minute.
+_SUBMIT_GIVE_UP = 60.0
+# AskResult.detail of that case; chat_session maps it to its message.
+NOT_SUBMITTED_HIDDEN_DETAIL = "prompt never reached the session"
 # Transcript records that carry the session's display name (verified live on
 # 2.1.278: `/rename foo` appends custom-title + agent-name records holding
 # "foo" to the pinned transcript; the CLI's own auto-title is ai-title).
@@ -663,7 +686,7 @@ class ClaudeSession:
     # ── tmux helpers ─────────────────────────────────────────────────
 
     def _tmux(
-        self, *args: str, input_text: str | None = None
+        self, *args: str, input_text: str | None = None, quiet: bool = False
     ) -> subprocess.CompletedProcess:
         proc = self._runner(
             tmux_argv(self.tmux_socket, *args),
@@ -672,7 +695,7 @@ class ClaudeSession:
             check=False,
             input=input_text,
         )
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not quiet:
             logger.warning(
                 "tmux %s failed (rc=%s): %s",
                 args[0],
@@ -702,6 +725,16 @@ class ClaudeSession:
 
     def _session_exists(self) -> bool:
         return self._tmux("has-session", "-t", self._target).returncode == 0
+
+    def exists(self) -> bool:
+        """Is this session's tmux session there right now? A quiet
+        has-session: for pollers (the permission gate) that look at every
+        session the instance may have, where an absent one — a duty session
+        that was never needed — is normal, not a failure worth a warning."""
+        return (
+            self._tmux("has-session", "-t", self._target, quiet=True).returncode
+            == 0
+        )
 
     def _enforce_geometry(self) -> bool:
         """Re-assert the pane size on an ALREADY RUNNING session.
@@ -740,8 +773,76 @@ class ClaudeSession:
         )
         return True
 
-    def _send_enter(self) -> None:
+    def _send_enter(self) -> bool:
+        """Press Enter — unless a permission dialog is on screen: there Enter
+        APPROVES the highlighted "Yes" (verified live, Claude Code 2.1.318).
+        Every path that types (ask, steer, control commands, nudge) presses
+        Enter through here, so none of them can answer the person's dialog.
+        False iff the Enter was withheld."""
+        if read_permission_dialog(self._capture()) is not None:
+            logger.error(
+                "session %s: permission dialog on screen — Enter withheld",
+                self.session_name,
+            )
+            return False
         self._tmux("send-keys", "-t", self._target, "Enter")
+        return True
+
+    # ── permission dialogs (PERMISSION_DIALOG) ────────────────────────
+
+    def permission_dialog(self) -> PermissionDialog | None:
+        """The permission dialog on the pane, if any. Read-only, no lock —
+        same as every other introspection (see capture_text)."""
+        return read_permission_dialog(self._capture())
+
+    def answer_permission(self, fingerprint: str, allow: bool) -> str:
+        """Answer the dialog with the person's choice: its own digit for the
+        plain "Yes" or for "No" (a digit picks and confirms at once, verified
+        live on 2.1.318) — never Enter, never "don't ask again".
+
+        Only if the very dialog the person was shown (``fingerprint``) is
+        still on screen. No pane lock: an ask() may hold it for its whole
+        turn, and nothing types while the dialog is up (see _send_enter).
+        Returns "done" (the dialog went or changed after the key), "gone"
+        (no dialog), "changed" (another one, nothing pressed) or "stuck"
+        (pressed, still on screen)."""
+        dialog = self.permission_dialog()
+        if dialog is None:
+            return "gone"
+        if dialog.fingerprint != fingerprint:
+            return "changed"
+        key = dialog.yes_key if allow else dialog.no_key
+        logger.warning(
+            "session %s: answering the permission dialog %s (key %s)",
+            self.session_name,
+            "YES" if allow else "NO",
+            key,
+        )
+        self._tmux("send-keys", "-t", self._target, key)
+        step = max(self._poll_interval, 0.5)
+        waited = 0.0
+        while waited < _PERMISSION_ANSWER_WAIT:
+            self._sleep(step)
+            waited += step
+            now = self.permission_dialog()
+            if now is None or now.fingerprint != fingerprint:
+                return "done"
+        logger.error(
+            "session %s: permission dialog still on screen after the key",
+            self.session_name,
+        )
+        return "stuck"
+
+    def _permission_wait(self, log_id: str) -> AskResult:
+        """ask()'s exit for a permission dialog: nothing was (or stays) typed,
+        the caller parks the prompt until the person answers."""
+        logger.warning(
+            "permission dialog on screen — not typing %s; it waits for the "
+            "person's answer",
+            log_id,
+        )
+        self._inflight.unlink(missing_ok=True)
+        return AskResult(PERMISSION_STATUS, detail=PERMISSION_DETAIL)
 
     # ── blocking CLI choice dialogs (CHOICE_DIALOG) ──────────────────
 
@@ -2739,6 +2840,7 @@ class ClaudeSession:
         next_transcript_check = send_time + self._ledger_stop_grace
         next_submit_check = send_time + _SUBMIT_RECHECK
         submit_enters = 0
+        hidden_checks = 0
         while self._clock() < deadline:
             if self._abort_requested(turn_started):
                 return self._ledger_outcome(rid, turn, self._aborted(log_id))
@@ -2751,8 +2853,33 @@ class ClaudeSession:
                 # No UserPromptSubmit for our rid yet: is the prompt still
                 # sitting in the box? (See _SUBMIT_RECHECK.)
                 next_submit_check = self._clock() + _SUBMIT_RECHECK
-                box = input_box_text(self._capture())
-                if box is not None and (tag in box or _PASTED_TEXT in box):
+                cap = self._capture()
+                box = input_box_text(cap)
+                in_box = box is not None and (tag in box or _PASTED_TEXT in box)
+                hidden = (
+                    not in_box
+                    and self._clock() - send_time >= _SUBMIT_GIVE_UP
+                    and read_permission_dialog(cap) is None
+                    and not is_working(cap)
+                )
+                hidden_checks = hidden_checks + 1 if hidden else 0
+                if hidden_checks >= 2:
+                    # Two looks in a row: not in the box, no dialog, nothing
+                    # working — the prompt did not reach the session.
+                    logger.error(
+                        "no submit for %s in %.0fs, the prompt is not in the "
+                        "input box and nothing runs — it did not reach the "
+                        "session",
+                        log_id,
+                        self._clock() - send_time,
+                    )
+                    self._inflight.unlink(missing_ok=True)
+                    return self._ledger_outcome(
+                        rid,
+                        None,
+                        AskResult("error", detail=NOT_SUBMITTED_HIDDEN_DETAIL),
+                    )
+                if in_box:
                     if submit_enters >= _SUBMIT_MAX_ENTERS:
                         logger.error(
                             "prompt for %s still unsent in the input box after "
@@ -2850,6 +2977,18 @@ class ClaudeSession:
                 return self._ledger_outcome(rid, turn, AskResult("logged_out"))
             if has_survey_prompt(cap):
                 self._tmux("send-keys", "-t", self._target, "0")
+                last_active = self._clock()
+                self._sleep(self._poll_interval)
+                continue
+            if state == PaneState.PERMISSION_DIALOG:
+                # Waiting on the person, not a stall: no Escape (it would
+                # refuse the command for the person). Our own turn, once submitted,
+                # goes on after the answer; a prompt the dialog dropped goes
+                # back to the queue and is sent again after it.
+                dropped = self._clock() - send_time >= _PERMISSION_SUBMIT_GRACE
+                if turn is None and dropped:
+                    res = self._permission_wait(log_id)
+                    return self._ledger_outcome(rid, None, res)
                 last_active = self._clock()
                 self._sleep(self._poll_interval)
                 continue
@@ -3030,6 +3169,8 @@ class ClaudeSession:
                 self._dismiss_choice_dialog(pre_cap, log_id)
                 pre_cap = self._capture()
                 pre = classify_state(pre_cap)
+            if pre == PaneState.PERMISSION_DIALOG:
+                return self._permission_wait(log_id)
             if pre == PaneState.RATE_LIMITED and self._confirmed_rate_limited(
                 pre_cap, log_id
             ):
@@ -3259,6 +3400,10 @@ class ClaudeSession:
                         busy_seconds=busy_seconds,
                     )
                 pre_cap = cap
+
+            # The busy-wait above can outlast a background agent's request.
+            if read_permission_dialog(pre_cap) is not None:
+                return self._permission_wait(log_id)
 
             # The pane is confirmed ours and free: take on our real identity
             # (steerable from here on) right before typing anything into it.
@@ -3522,6 +3667,21 @@ class ClaudeSession:
                 # 2026-10-27 16:56). Close it; if the conversation never saw
                 # our prompt, submit it again — once, same rid, so a reply
                 # can never be produced twice.
+                # A permission dialog: see the ledger path. "Not submitted"
+                # here is a transcript with no records for this turn yet.
+                if state == PaneState.PERMISSION_DIALOG:
+                    if (
+                        wrap
+                        and reply_tail is not None
+                        and not reply_tail.saw_records
+                        and self._clock() - send_time >= _PERMISSION_SUBMIT_GRACE
+                    ):
+                        return self._permission_wait(log_id)
+                    last_active = self._clock()
+                    last_main_turn_active = last_active
+                    self._sleep(self._poll_interval)
+                    continue
+
                 if state == PaneState.CHOICE_DIALOG:
                     self._dismiss_choice_dialog(cap, log_id)
                     if (

@@ -402,6 +402,21 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Permission dialogs (services/permission_gate.py, 2026-11-05): the CLI
+    # asks the owner to approve a background agent's command; the bot relays
+    # the question with «Да» / «Нет» and never answers it by itself.
+    permission_remind_after: float = Field(
+        default=1800.0,
+        validation_alias=AliasChoices(
+            "DBRAIN_PERMISSION_REMIND_AFTER", "permission_remind_after"
+        ),
+        description=(
+            "Seconds without an answer before ONE reminder about a pending "
+            "permission question. Nothing is ever approved or refused on a "
+            "timeout. 0 (or negative) disables the reminder."
+        ),
+    )
+
     # ── duty session ───────────────
     # The THIRD engine session, modelled on the cron one: same persona, same
     # vault, own session name and own runtime dir. It exists for exactly one

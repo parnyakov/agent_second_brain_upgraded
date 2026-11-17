@@ -136,6 +136,9 @@ _SERVICEABLE = {
     PaneState.READY,
     PaneState.RATE_LIMITED,
     PaneState.LOGGED_OUT,
+    # Waits for the person's answer (services/permission_gate.py): not a
+    # hang, and recovering would kill the agent that asked.
+    PaneState.PERMISSION_DIALOG,
 }
 
 
@@ -763,6 +766,16 @@ class Watchdog:
                 "уничтожило бы её контекст вместе с недоделанной работой. "
                 "Прервать вручную — /stop."
             )
+            return
+
+        # Not over a permission dialog: the Escape would refuse the command
+        # on the person's behalf. The cap fires once the dialog is answered.
+        try:
+            asking = self.session.current_state() == PaneState.PERMISSION_DIALOG
+        except Exception:  # noqa: BLE001 — duck-typed sessions in tests
+            asking = False
+        if asking:
+            logger.info("long-run: cap reached, but a permission dialog is open")
             return
 
         # Stage 1: one interrupt, one honest message.

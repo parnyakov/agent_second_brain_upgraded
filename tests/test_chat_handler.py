@@ -1157,3 +1157,157 @@ def test_an_idle_session_pays_no_extra_delay_with_the_real_is_main_busy(
     assert session.probes == 0  # not even probed: no marker to confirm
     assert elapsed < 1.0  # and certainly no 3s confirmation window
     assert bot.messages and "ответ" in bot.messages[0][1]
+
+
+# --- Catch-all: rich messages (Bot API 10.1 Message.rich_message) ---
+
+
+def _catchall_message(extra: dict, *, forwarded: bool = True):
+    """A real aiogram Message (validated from raw JSON like a live update)
+    whose answer() is captured instead of hitting the network."""
+    from datetime import datetime
+
+    from aiogram.types import Message
+
+    answers: list[str] = []
+
+    class CapturingMessage(Message):
+        async def answer(self, text, **kw):  # type: ignore[override]
+            answers.append(text)
+
+    raw = {
+        "message_id": 4242,
+        "date": datetime(2026, 11, 6, 20, 17, 13),
+        "chat": {"id": 10, "type": "private", "first_name": "M"},
+        "from": {"id": 7, "is_bot": False, "first_name": "M"},
+        **extra,
+    }
+    if forwarded:
+        raw["forward_origin"] = {
+            "type": "user",
+            "date": datetime(2026, 11, 6, 20, 0, 0),
+            "sender_user": {"id": 99, "is_bot": True, "first_name": "Stefania bot"},
+        }
+    return CapturingMessage.model_validate(raw), answers
+
+
+_RICH = {
+    "rich_message": {
+        "blocks": [
+            {"type": "heading", "size": 1, "text": "Итоги дня"},
+            {
+                "type": "paragraph",
+                "text": [
+                    "Привет, ",
+                    {"type": "bold", "text": "Анна"},
+                    "! Смотри ",
+                    {"type": "url", "text": "отчёт", "url": "https://secret.example/x"},
+                ],
+            },
+            {
+                "type": "photo",
+                "photo": [
+                    {"file_id": "AgADfileid", "file_unique_id": "uniq",
+                     "width": 1, "height": 1}
+                ],
+                "caption": {"text": "подпись к фото"},
+            },
+        ]
+    }
+}
+
+
+def _patch_catchall(monkeypatch, tmp_path):
+    from d_brain.bot.handlers import chat
+
+    dispatched: list[dict] = []
+
+    async def fake_dispatch(bot, chat_id, user_id, text, **kw):
+        dispatched.append({"chat_id": chat_id, "user_id": user_id, "text": text})
+
+    monkeypatch.setattr(chat, "_dispatch_text", fake_dispatch)
+    monkeypatch.setattr(chat, "get_settings", lambda: _Stub(vault_path=tmp_path))
+    monkeypatch.setattr(chat, "UNSUPPORTED_DUMP_DIR", tmp_path / "unsupported")
+    return chat, dispatched
+
+
+def test_rich_message_forward_goes_to_text_path_with_forward_note(
+    monkeypatch, tmp_path
+):
+    chat, dispatched = _patch_catchall(monkeypatch, tmp_path)
+    msg, answers = _catchall_message(_RICH)
+
+    asyncio.run(chat.handle_chat_other(msg, FakeBot(), _Stub(update_id=20726588)))
+
+    assert answers == []  # no "can't process" reply
+    assert len(dispatched) == 1
+    text = dispatched[0]["text"]
+    assert text.startswith("[переслано от: Stefania bot]\n")
+    assert "Итоги дня" in text
+    assert "Привет, Анна! Смотри отчёт" in text
+    assert "подпись к фото" in text
+    # ids and urls are not text
+    assert "AgADfileid" not in text and "secret.example" not in text
+    daily = (tmp_path / "daily/2026-11-06.md").read_text(encoding="utf-8")
+    assert "[forward]" in daily and "Итоги дня" in daily
+
+
+def test_unknown_extra_field_with_text_is_recovered(monkeypatch, tmp_path):
+    """A future Bot API field aiogram does not model yet lands in
+    model_extra — its nested text must still reach the session."""
+    chat, dispatched = _patch_catchall(monkeypatch, tmp_path)
+    msg, answers = _catchall_message(
+        {"fancy_future_text": {"content": [{"plain": "новый формат"}],
+                               "link_url": "https://x"}},
+        forwarded=False,
+    )
+
+    asyncio.run(chat.handle_chat_other(msg, FakeBot()))
+
+    assert answers == []
+    assert dispatched and dispatched[0]["text"] == "новый формат"
+
+
+def test_truly_non_text_message_keeps_old_reply(monkeypatch, tmp_path):
+    chat, dispatched = _patch_catchall(monkeypatch, tmp_path)
+    msg, answers = _catchall_message(
+        {"location": {"latitude": 52.37, "longitude": 4.89}}, forwarded=True
+    )
+
+    asyncio.run(chat.handle_chat_other(msg, FakeBot(), _Stub(update_id=1)))
+
+    assert dispatched == []
+    assert answers == [chat.UNSUPPORTED_REPLY]
+
+
+def test_catchall_dumps_raw_json_and_logs_keys_only(monkeypatch, tmp_path, caplog):
+    import json
+    import logging
+
+    chat, _ = _patch_catchall(monkeypatch, tmp_path)
+    msg, _ = _catchall_message(_RICH)
+
+    with caplog.at_level(logging.WARNING, logger=chat.logger.name):
+        asyncio.run(
+            chat.handle_chat_other(msg, FakeBot(), _Stub(update_id=20726590))
+        )
+
+    files = list((tmp_path / "unsupported").iterdir())
+    assert len(files) == 1 and files[0].name.endswith("_20726590.json")
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert data["rich_message"]["blocks"][0]["text"] == "Итоги дня"
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "rich_message" in logged and "content_type=" in logged
+    assert "Итоги" not in logged and "Анна" not in logged
+
+
+def test_catchall_dump_failure_never_breaks_handler(monkeypatch, tmp_path):
+    chat, dispatched = _patch_catchall(monkeypatch, tmp_path)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")  # a file where the dir should be → mkdir fails
+    monkeypatch.setattr(chat, "UNSUPPORTED_DUMP_DIR", blocker / "unsupported")
+    msg, answers = _catchall_message(_RICH)
+
+    asyncio.run(chat.handle_chat_other(msg, FakeBot()))
+
+    assert dispatched and answers == []

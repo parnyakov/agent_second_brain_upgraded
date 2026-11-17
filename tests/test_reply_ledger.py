@@ -74,6 +74,12 @@ class FakeCLI:
         self.hide_box_captures = 0  # the CLI draws the paste late
         self.lost_enters = 0  # Enters the CLI swallows while text is in the box
         self.mangle = None  # callable(text) -> text, applied on submit
+        # A modal drawn over the input box (a permission dialog, or anything
+        # else): capture shows it, a paste is dropped, Enter / a digit closes
+        # it — Enter and "1" approve, as on Claude Code 2.1.318.
+        self.overlay: str | None = None
+        self.overlay_on_paste: str | None = None  # opens as the paste lands
+        self.dialog_keys: list[str] = []
 
     # time & hooks
     def wall(self) -> float:
@@ -142,7 +148,14 @@ class FakeCLI:
         elif sub == "load-buffer":
             self._buf = kwargs.get("input") or ""
         elif sub == "paste-buffer":
-            self._box = self._buf
+            if self.overlay_on_paste is not None:
+                self.overlay, self.overlay_on_paste = self.overlay_on_paste, None
+            if self.overlay is None:
+                self._box = self._buf
+        elif sub == "send-keys" and self.overlay is not None:
+            self.dialog_keys.append(body[-1])
+            if body[-1] in ("Enter", "Escape", "1", "2", "3"):
+                self.overlay = None
         elif sub == "send-keys":
             if body[-1] == "Enter" and self._box is not None:
                 if self.lost_enters > 0:
@@ -159,6 +172,8 @@ class FakeCLI:
         elif sub == "capture-pane":
             self._flush()
             out = THINKING if self.open_pid else READY
+            if self.overlay is not None:
+                out = self.overlay
             if self.show_box and self._box is not None:
                 if self.hide_box_captures > 0:
                     self.hide_box_captures -= 1
@@ -1411,3 +1426,80 @@ def test_untagged_turn_before_the_paste_is_not_taken(tmp_path, clock):
     assert ClaudeSession._untagged_submit_since(book, 200.0, "x") is None
     book.add({"ev": "submit", "ts": 202.0, "prompt_id": "mine", "origin": "user"})
     assert ClaudeSession._untagged_submit_since(book, 200.0, "x").prompt_id == "mine"
+
+
+# ── permission dialogs (2026-11-02..05) ─────────────────────────
+# Chrome of a background agent's request, as on the instances.
+_FIXTURE = ROOT / "tests" / "fixtures" / "pane_permission_dangerous_rm.txt"
+PERMISSION = _FIXTURE.read_text(encoding="utf-8")
+
+
+def test_never_types_into_a_permission_dialog(tmp_path, clock):
+    """22:22 incident shape: the dialog was up when the message came. Before
+    the fix the paste went into it and the ask hung for 900 s; now nothing
+    is typed (Enter would approve) and the message goes back to wait."""
+    s, cli = make(tmp_path, clock, stall_timeout=900)
+    cli.overlay = PERMISSION
+    res = s.ask("голосовое", timeout=1500)
+    assert res.status == claude_session.PERMISSION_STATUS
+    assert cli.dialog_keys == [] and cli.prompts == []
+    assert cli.overlay == PERMISSION  # still waiting for the person
+    assert clock["now"] < 5
+
+
+def test_dialog_that_swallows_the_paste_hands_the_prompt_back(tmp_path, clock):
+    """The dialog drew as the paste landed: the paste is dropped and the
+    Enter after it is withheld (it would approve). The ask returns within
+    seconds instead of sitting out the stall ceiling."""
+    s, cli = make(tmp_path, clock, stall_timeout=900)
+    cli.overlay_on_paste = PERMISSION
+    res = s.ask("голосовое", timeout=1500)
+    assert res.status == claude_session.PERMISSION_STATUS
+    assert cli.dialog_keys == [] and cli.prompts == []
+    assert clock["now"] < 15
+    assert not (s.runtime_dir / "inflight").exists()
+
+
+def test_running_turn_waits_out_the_dialog_without_escape(tmp_path, clock):
+    """Our turn is in; a background agent then asks. The ask keeps waiting
+    (no stall Escape — it would refuse the command for the person) and gets
+    its reply once the dialog is answered."""
+    s, cli = make(tmp_path, clock, stall_timeout=60)
+
+    def cb(c, pid, prompt):
+        c.at(1, lambda: setattr(c, "overlay", PERMISSION))
+        c.at(400, lambda: setattr(c, "overlay", None))  # answered in Telegram
+        c.at(402, lambda: c.stop(pid, "Готово."))
+
+    cli.on_submit = cb
+    res = s.ask("сделай", timeout=1500)
+    assert res.ok and res.reply == "Готово."
+    assert cli.dialog_keys == []
+
+
+@pytest.mark.parametrize("closes_on_enter", [False, True])
+def test_prompt_that_never_reached_the_cli_is_reported_in_a_minute(
+    tmp_path, clock, closes_on_enter
+):
+    """After the 2026-11-05 incident: no submit, our prompt not in
+    the box, nothing running — say so after about a minute instead of
+    waiting 900-1500 s. Both shapes: an unknown window that stays over the
+    box, and one that ate the paste and closed on the Enter."""
+    s, cli = make(tmp_path, clock, stall_timeout=900)
+    cli.overlay_on_paste = " Something new\n  ❯ Not now\n"
+    if not closes_on_enter:
+        real = FakeCLI.__call__
+
+        def sticky(self, args, **kw):
+            keep = self.overlay
+            res = real(self, args, **kw)
+            if keep is not None and "send-keys" in args:
+                self.overlay = keep
+            return res
+
+        cli.__class__ = type("Sticky", (FakeCLI,), {"__call__": sticky})
+    res = s.ask("голосовое", timeout=1500)
+    assert res.status == "error"
+    assert res.detail == claude_session.NOT_SUBMITTED_HIDDEN_DETAIL
+    assert 60 <= clock["now"] < 90
+    assert cli.prompts == []

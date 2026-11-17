@@ -21,7 +21,9 @@ The rate-limit / logged-out signatures are not yet confirmed against a
 live session and may need adjustment per CLI version (see tests, open Q #2).
 """
 
+import hashlib
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 
@@ -52,6 +54,12 @@ class PaneState(str, Enum):
     # "We recommend compacting earlier" autocompact offer, 2026-10-26/27):
     # it swallows typed prompts and is NOT a hang — dismiss it, never kill.
     CHOICE_DIALOG = "choice_dialog"
+    # The CLI asks the person to approve a tool call ("Do you want to
+    # proceed? ❯ 1. Yes  2. No"), even under bypass permissions — e.g. a
+    # background agent's `rm` on a glob (2026-11-02..05). Never typed
+    # into: Enter there APPROVES. Only the person answers it (see
+    # services/permission_gate.py); never dismissed, never killed.
+    PERMISSION_DIALOG = "permission_dialog"
     UNKNOWN = "unknown"
 
 
@@ -560,6 +568,40 @@ _CHOICE_DIALOG_RE = re.compile(
 )
 # The selected option of a choice dialog: "❯ <label>".
 _DIALOG_SELECTED_RE = re.compile(r"(?m)^\s*❯\s*(\S.*?)\s*$")
+# Permission dialogs (PERMISSION_DIALOG). Measured in ~/.dbrain/pane.log and
+# the instances' pane logs (2026-09..11) and live on Claude Code 2.1.318
+# (isolated tmux server, a `Bash(rm:*)` ask rule):
+#
+#   ───────────────────────────────────────────────
+#    Bash command · from the general-purpose agent
+#    Remove png/c.png from the working directory
+#   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+#    rm -f png/c.png
+#   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+#    Permission rule Bash(rm:*) requires confirmation for this command.
+#    /permissions to update rules
+#
+#    Do you want to proceed?
+#    ❯ 1. Yes
+#      2. No
+#
+#    Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents
+#
+# Its "❯ 1. Yes" matched _IDLE_RE, so the pane read as READY and the bot
+# pasted the next message into it. Verified live on 2.1.318: the paste is
+# dropped, and the Enter after it APPROVES the highlighted "Yes"; a digit
+# key picks that option at once ("1" ran the command, "2" refused it).
+# Triple anchor, all in chrome and line-anchored: the question, a numbered
+# "Yes" option and the "Esc to cancel" hint. The model quoting the dialog
+# writes it inline (one line), which never matches.
+_PERMISSION_QUESTION_RE = re.compile(r"^\s*Do you want to .+\?\s*$")
+_PERMISSION_OPTION_RE = re.compile(r"^\s*(?:❯\s*)?(\d)\.\s+(\S.*?)\s*$")
+_PERMISSION_HINT_RE = re.compile(r"^\s*Esc to cancel\b")
+_DIALOG_TOP_RE = re.compile(r"^\s*─{3,}\s*$")
+_DIALOG_FRAME_RE = re.compile(r"^\s*╌{3,}\s*$")
+_DIALOG_HEADER_RE = re.compile(r"^\s*(\S.*?)(?:\s+·\s+from the (.+?) agent)?\s*$")
+# How far above the question the dialog's top rule may sit (a long command).
+_DIALOG_MAX_LINES = 45
 # Active-turn marker. The TUI shows "(esc to interrupt)" next to its spinner
 # for the whole turn, so its absence + an idle ❯ is the idle signal. The
 # bypass footer is ALWAYS on screen under --dangerously-skip-permissions and
@@ -1440,6 +1482,11 @@ def classify_state(text: str) -> PaneState:
         and not _FOOTER_RE.search(text)
     ):
         return PaneState.BYPASS_PROMPT
+    # A permission dialog outranks every chrome signature below: its body
+    # quotes the command, which can say anything ("logged out", a limit
+    # banner), and its "❯ 1. Yes" is not an idle prompt.
+    if read_permission_dialog(text) is not None:
+        return PaneState.PERMISSION_DIALOG
     chrome = _chrome(text)
     if _RATE_RE.search(chrome):
         return PaneState.RATE_LIMITED
@@ -1470,3 +1517,124 @@ def choice_dialog_key(text: str) -> str:
     if selected and selected.lower().startswith("keep"):
         return "Enter"
     return "Escape"
+
+
+@dataclass(frozen=True)
+class PermissionDialog:
+    """A permission dialog as read off the pane (see _PERMISSION_QUESTION_RE).
+
+    ``fingerprint`` identifies the request, not the frame: it covers the
+    header, body, question and option labels, but not the selector position
+    or the key-hint line, so the same dialog redrawn reads the same."""
+
+    title: str  # "Bash command"
+    agent: str | None  # "general-purpose" when a background agent asks
+    command: str  # the command (or the dialog body), "" when none
+    description: str  # the CLI's one-line summary of the call, "" when none
+    reason: str  # why it asks ("Dangerous rm operation on …"), "" when none
+    question: str
+    options: tuple[tuple[str, str], ...]  # (digit, label)
+    yes_key: str  # the digit of the plain "Yes" option
+    no_key: str  # the digit of the "No…" option, else "Escape"
+    fingerprint: str
+
+
+_BOX_BAR_RE = re.compile(r"^\s*│\s?")
+
+
+def _dialog_line(line: str) -> str:
+    return _BOX_BAR_RE.sub("", line).strip()
+
+
+def _paragraphs(lines: list[str]) -> list[list[str]]:
+    out: list[list[str]] = [[]]
+    for ln in lines:
+        if ln:
+            out[-1].append(ln)
+        elif out[-1]:
+            out.append([])
+    return [p for p in out if p]
+
+
+def read_permission_dialog(text: str) -> PermissionDialog | None:
+    """The permission dialog on the pane, or None.
+
+    The question must sit in the chrome (bottom) region and be followed by
+    numbered options, one of them a plain "Yes", and the "Esc to cancel"
+    hint. The header, command and reason are read upwards from the question
+    to the dialog's top rule; both layouts seen in the logs are handled (the
+    command framed by ╌ rules on 2.1.318, unframed with │-bars earlier)."""
+    lines = strip_reply_bodies(text).rstrip().splitlines()
+    chrome_start = max(0, len(lines) - _CHROME_LINES)
+    q = None
+    for i in range(len(lines) - 1, chrome_start - 1, -1):
+        if _PERMISSION_QUESTION_RE.match(lines[i]):
+            q = i
+            break
+    if q is None:
+        return None
+    options: list[tuple[str, str]] = []
+    hint = None
+    for i in range(q + 1, len(lines)):
+        m = _PERMISSION_OPTION_RE.match(lines[i])
+        if m:
+            options.append((m.group(1), m.group(2)))
+        elif _PERMISSION_HINT_RE.match(lines[i]):
+            hint = i
+            break
+        elif lines[i].strip():
+            break
+    yes = [d for d, label in options if label.lower() == "yes"]
+    # The open dialog hides the input box: a prompt line below the hint means
+    # these lines are transcript (a reply quoting the dialog), not a modal.
+    if hint is None or not yes or any(
+        _INPUT_LINE_RE.match(ln) for ln in lines[hint + 1 :]
+    ):
+        return None
+    no = [d for d, label in options if label.lower().startswith("no")]
+
+    top = None
+    for i in range(q - 1, max(-1, q - _DIALOG_MAX_LINES), -1):
+        if _DIALOG_TOP_RE.match(lines[i]):
+            top = i
+            break
+    body = [_dialog_line(ln) for ln in lines[top + 1 : q]] if top is not None else []
+    title, agent = "", None
+    while body and not body[0]:
+        body.pop(0)
+    if body:
+        m = _DIALOG_HEADER_RE.match(body.pop(0))
+        title, agent = (m.group(1), m.group(2)) if m else ("", None)
+    description = command = reason = ""
+    frames = [i for i, ln in enumerate(body) if _DIALOG_FRAME_RE.match(ln)]
+    if len(frames) >= 2:
+        description = " ".join(ln for ln in body[: frames[0]] if ln)
+        command = "\n".join(ln for ln in body[frames[0] + 1 : frames[1]] if ln)
+        tail = [ln for ln in body[frames[1] + 1 :] if not ln.startswith("/permissions")]
+        reason = " ".join(ln for ln in tail if ln)
+    else:
+        paras = _paragraphs(
+            [ln for ln in body if not ln.startswith("/permissions")]
+        )
+        if len(paras) > 1:
+            reason = " ".join(paras[-1])
+            paras = paras[:-1]
+        command = "\n".join("\n".join(p) for p in paras)
+
+    question = lines[q].strip()
+    key_lines = [title, agent or "", *body, question, *(lb for _, lb in options)]
+    digest = hashlib.sha1(
+        "\n".join(" ".join(ln.split()) for ln in key_lines).encode()
+    ).hexdigest()[:16]
+    return PermissionDialog(
+        title=title,
+        agent=agent,
+        command=command,
+        description=description,
+        reason=reason,
+        question=question,
+        options=tuple(options),
+        yes_key=yes[0],
+        no_key=no[0] if no else "Escape",
+        fingerprint=digest,
+    )

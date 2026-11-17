@@ -20,11 +20,13 @@ from pathlib import Path
 from typing import Any
 
 from d_brain.config import Settings, get_settings
-from d_brain.services import ask_health, long_run
+from d_brain.services import ask_health, long_run, permission_gate
 from d_brain.services.claude_session import (
     DEFAULT_LONG_RUN_STALE_AFTER,
     DEFAULT_TIMEOUT,
     NOT_SUBMITTED_DETAIL,
+    NOT_SUBMITTED_HIDDEN_DETAIL,
+    PERMISSION_STATUS,
     AskResult,
 )
 from d_brain.services.runtime import get_ask_lock, get_duty_session, get_session
@@ -69,6 +71,12 @@ _STATUS_MESSAGES = {
     # .request_abort). Neutral in ask_health: not a delivery failure.
     "reset": "⏹ Этот ход прерван командой /reset — если ответ ещё нужен, "
     "повтори сообщение.",
+    # A permission dialog waits for the person (services/permission_gate.py).
+    # Reached only without a chat queue (or from the duty session): with one,
+    # the message is parked and answered after the dialog.
+    PERMISSION_STATUS: "🔐 Сессия ждёт твоего решения по запросу фоновой "
+    "задачи (сообщение с кнопками «Да» / «Нет»). Ответь на него и повтори "
+    "сообщение.",
 }
 # 2026-10-29 (rid 21687a6e): the prompt was pasted but never left the input
 # box despite repeated Enters; ask() took it back out. Nothing is running for
@@ -76,6 +84,13 @@ _STATUS_MESSAGES = {
 _NOT_SUBMITTED_MESSAGE = (
     "⚠️ Сообщение не ушло в сессию: оно застряло в поле ввода, и Enter не "
     "сработал. Я убрал его оттуда. Отправь, пожалуйста, ещё раз."
+)
+# 2026-11-05: a minute without a submit, the prompt gone from the
+# input box and nothing running. It did not reach the session; no answer
+# will come for it.
+_NOT_SUBMITTED_HIDDEN_MESSAGE = (
+    "⚠️ Сообщение не дошло до сессии: за минуту она его так и не приняла, "
+    "ответа на него не будет. Отправь, пожалуйста, ещё раз."
 )
 # R2c (Fable audit, F2 class): the ceiling's honest message for "no reply
 # markers ever appeared at all" — distinguished from the generic "timeout"
@@ -224,6 +239,9 @@ class Busy:
     session stays for the ``busy`` case, where no progress was observed
     across the whole busy-wait budget and the pane is, by that evidence,
     wedged.
+
+    Also returned for a permission dialog on the main session (2026-11-05):
+    nothing was typed, and the message waits until the person has answered.
 
     Being a separate type rather than a magic string is what keeps every
     caller honest: a reply is a ``str``, and this is not one, so a path that
@@ -470,7 +488,7 @@ class ChatSessionManager:
             )
         if (
             not res.ok
-            and res.status not in ("busy", "busy_active", "reset")
+            and res.status not in ("busy", "busy_active", "reset", PERMISSION_STATUS)
             and _last_reset_ts >= started
         ):
             res = AskResult("reset", detail=f"cut short by /reset ({res.status})")
@@ -490,6 +508,16 @@ class ChatSessionManager:
                 busy_seconds=res.busy_seconds,
                 fallback=_busy_active_message(res.busy_seconds),
             )
+        if res.status == PERMISSION_STATUS:
+            # Not typed: a permission dialog waits for the person. Parked like
+            # live work and sent after the answer. Neutral in ask_health.
+            self._record_health(res.status)
+            logger.info(
+                "permission dialog on the main session — parking the message "
+                "for user %d",
+                user_id,
+            )
+            return Busy(fallback=_STATUS_MESSAGES[PERMISSION_STATUS])
         if res.status == "busy":
             logger.warning(
                 "main session showed no progress across the whole busy wait "
@@ -930,6 +958,8 @@ class ChatSessionManager:
             return _NO_MARKERS_MESSAGE
         if res.status == "error" and res.detail == NOT_SUBMITTED_DETAIL:
             return _NOT_SUBMITTED_MESSAGE
+        if res.status == "error" and res.detail == NOT_SUBMITTED_HIDDEN_DETAIL:
+            return _NOT_SUBMITTED_HIDDEN_MESSAGE
         if self._is_turn_limit(res):
             # Engine-dependent truth (F4). Claude: the turn is still running
             # and still in flight — "попробуй ещё раз" would queue a second
@@ -994,6 +1024,11 @@ class ChatSessionManager:
         Settings.reply_ledger on). The steer gate then follows the CLI turn,
         not the ask-lock."""
         return bool(getattr(self._session, "reply_ledger", False))
+
+    def permission_pending(self) -> bool:
+        """True while a permission dialog on the main session waits for the
+        person: the chat path parks messages instead of entering ask()."""
+        return permission_gate.pending(getattr(self._session, "runtime_dir", None))
 
     def is_pane_turn_active(self) -> bool:
         """Step D: true iff the PANE shows the

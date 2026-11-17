@@ -2146,3 +2146,120 @@ def test_dialog_text_inside_reply_is_not_a_dialog():
 
 def test_trust_prompt_not_taken_for_choice_dialog():
     assert classify_state(TRUST_CAPTURE) == PaneState.TRUST_PROMPT
+
+
+# ── PERMISSION_DIALOG: the CLI asks the person to approve a tool call ─────
+# (2026-11-02..05: messages pasted into such a dialog were lost.)
+
+from d_brain.services.tmux_parse import read_permission_dialog  # noqa: E402
+
+
+def _permission_fixture(name: str) -> str:
+    return (_FIXTURES_DIR / f"pane_permission_{name}.txt").read_text(encoding="utf-8")
+
+
+# Captured live on Claude Code 2.1.318 (isolated tmux server, a Bash(rm:*) ask
+# rule, a background general-purpose agent); paths neutral.
+ASK_RULE = _permission_fixture("ask_rule")
+# The instances' shape: a background agent's dangerous rm on a glob.
+DANGEROUS_RM = _permission_fixture("dangerous_rm")
+# The older layout (Sept 2026): command unframed, summary under it.
+UNFRAMED = _permission_fixture("unframed")
+# "This command requires approval" (2026-11-02) on the same
+# chrome; the three-option variant uses the CLI's own option label.
+REQUIRES_APPROVAL = DANGEROUS_RM.replace(
+    " │ Dangerous rm operation on statically-unresolvable target: "
+    "/srv/demo/vault/sheets/*",
+    " This command requires approval",
+)
+THREE_OPTIONS = ASK_RULE.replace(
+    "   2. No\n",
+    "   2. Yes, and don't ask again for rm commands in /srv/demo\n   3. No\n",
+)
+
+
+@pytest.mark.parametrize(
+    "cap", [ASK_RULE, DANGEROUS_RM, UNFRAMED, REQUIRES_APPROVAL, THREE_OPTIONS]
+)
+def test_permission_dialog_is_its_own_state_not_ready(cap):
+    # Before the fix "❯ 1. Yes" matched the idle prompt → READY, and the bot
+    # pasted the next message into the dialog.
+    assert classify_state(cap) == PaneState.PERMISSION_DIALOG
+
+
+def test_permission_dialog_live_capture_fields():
+    d = read_permission_dialog(ASK_RULE)
+    assert d is not None
+    assert d.title == "Bash command"
+    assert d.agent == "general-purpose"
+    assert d.command == "rm -f png/c.png"
+    assert d.description == "Remove png/c.png from the working directory"
+    assert d.reason.startswith("Permission rule Bash(rm:*) requires confirmation")
+    assert d.options == (("1", "Yes"), ("2", "No"))
+    assert (d.yes_key, d.no_key) == ("1", "2")
+
+
+def test_permission_dialog_dangerous_rm_reason():
+    d = read_permission_dialog(DANGEROUS_RM)
+    assert d.reason == (
+        "Dangerous rm operation on statically-unresolvable target: "
+        "/srv/demo/vault/sheets/*"
+    )
+    assert "rm -f /srv/demo/vault/sheets/*" in d.command
+
+
+def test_permission_dialog_unframed_layout():
+    d = read_permission_dialog(UNFRAMED)
+    assert d.reason == "Dangerous rm operation on possibly-empty variable path: $d/*"
+    assert "rm -f $d/*" in d.command
+    assert d.agent == "general-purpose"
+
+
+def test_permission_dialog_requires_approval_reason():
+    assert read_permission_dialog(REQUIRES_APPROVAL).reason == (
+        "This command requires approval"
+    )
+
+
+def test_three_option_dialog_answers_with_plain_yes_and_no():
+    d = read_permission_dialog(THREE_OPTIONS)
+    assert len(d.options) == 3
+    # Never the "don't ask again" option.
+    assert (d.yes_key, d.no_key) == ("1", "3")
+
+
+def test_permission_fingerprint_ignores_selector_and_hint():
+    moved = ASK_RULE.replace(" ❯ 1. Yes\n   2. No", "   1. Yes\n ❯ 2. No")
+    hint = ASK_RULE.replace(" · ctrl+x ctrl+k twice to stop background agents", "")
+    fp = read_permission_dialog(ASK_RULE).fingerprint
+    assert read_permission_dialog(moved).fingerprint == fp
+    assert read_permission_dialog(hint).fingerprint == fp
+    other = ASK_RULE.replace("rm -f png/c.png", "rm -f png/d.png")
+    assert read_permission_dialog(other).fingerprint != fp
+
+
+def test_permission_dialog_outranks_text_in_its_body():
+    # The quoted command may say anything; it must not read as a logout.
+    cap = ASK_RULE.replace("rm -f png/c.png", "grep 'logged out' log && rm -f x/*")
+    assert classify_state(cap) == PaneState.PERMISSION_DIALOG
+
+
+def test_dialog_quoted_inline_in_a_reply_is_not_a_dialog():
+    cap = (
+        "● Программа спрашивает «Do you want to proceed? ❯ 1. Yes  2. No · "
+        "Esc to cancel», и бот этого не видит.\n" + READY_CAPTURE
+    )
+    assert classify_state(cap) == PaneState.READY
+    assert read_permission_dialog(cap) is None
+
+
+def test_dialog_lines_in_the_transcript_above_the_input_box_are_not_a_dialog():
+    # The model reproduced the dialog line by line; the input box below it
+    # shows that no modal is open.
+    quoted = ASK_RULE.split("\n", 2)[2]  # drop the wait line
+    assert classify_state(quoted + READY_CAPTURE) == PaneState.READY
+
+
+def test_choice_dialog_unaffected_by_permission_parsing():
+    assert classify_state(COMPACT_OFFER_CAPTURE) == PaneState.CHOICE_DIALOG
+    assert read_permission_dialog(COMPACT_OFFER_CAPTURE) is None

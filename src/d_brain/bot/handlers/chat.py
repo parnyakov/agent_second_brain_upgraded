@@ -8,11 +8,13 @@ ChatSessionManager for Claude to process and respond — no debounce buffer.
 import asyncio
 import contextlib
 import html
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -75,6 +77,16 @@ _MAINTENANCE_MESSAGE = (
     "несколько минут, отвечу как освобожусь."
 )
 _BUSY_FALLBACK_MESSAGE = busy_fallback_message()
+# A permission dialog waits for the person (services/permission_gate.py).
+# Only reached without a chat queue; with one, the message is parked.
+_PERMISSION_WAIT_MESSAGE = (
+    "🔐 Сессия ждёт твоего решения по запросу фоновой задачи (сообщение с "
+    "кнопками «Да» / «Нет»). Ответь на него и повтори сообщение."
+)
+_PERMISSION_FIRST_MESSAGE = (
+    "🔐 Сначала ответь на запрос фоновой задачи (кнопки «Да» / «Нет» выше), "
+    "потом повтори команду."
+)
 
 
 def classify_concurrent_input(text: str, turn_active: bool) -> str:
@@ -122,6 +134,9 @@ async def _dispatch_text(
     else:
         prompt = f"{context}{text}"
     kind = classify_command(text)
+    if kind == "control" and _permission_pending(_get_manager()):
+        await bot.send_message(chat_id, _PERMISSION_FIRST_MESSAGE)
+        return
     if kind == "control":
         await _get_manager().send_control(text)
         await bot.send_message(
@@ -166,7 +181,7 @@ async def _dispatch_text(
         await bot.send_message(chat_id, "⏹ Останавливаю текущий ответ.")
         return
     if mode == "steer":
-        if not manager.is_steerable_turn():
+        if not manager.is_steerable_turn() or _permission_pending(manager):
             # Maintenance turn (nightly pipeline / doctor / startup) holds
             # the session — injecting user text would contaminate it. Falls
             # through to the ordinary path, which parks it in the per-chat
@@ -295,6 +310,18 @@ def _queue() -> Any | None:
         return None
 
 
+def _permission_pending(manager: Any) -> bool:
+    """True while a permission dialog on the main session waits for the
+    person (services/permission_gate.py). Nothing may be typed into the pane
+    then — Enter would answer the dialog — so messages wait in the queue.
+    Never fatal: a manager without the probe reads as "no dialog"."""
+    try:
+        return getattr(manager, "permission_pending", lambda: False)() is True
+    except Exception:  # noqa: BLE001
+        logger.warning("permission probe failed", exc_info=True)
+        return False
+
+
 def _held_by_maintenance(manager: Any) -> bool:
     """True iff the session is held by a turn that is NOT this chat's and
     cannot take input: the nightly pipeline, the doctor canary, a startup or
@@ -371,7 +398,13 @@ async def run_queued_job(bot: Bot, job: Any) -> bool:
     It deliberately runs the SAME ``_run_turn`` a fresh message does: same
     typing indicator, same progress card, same retry-on-empty, same error
     handling. A second code path here would drift.
+
+    While a permission dialog waits for the person the job is not even
+    started: the drain comes round every couple of seconds, and each pass
+    would cost a typing indicator for nothing.
     """
+    if _permission_pending(_get_manager()):
+        return False
     later = await _run_turn(
         bot,
         job.chat_id,
@@ -529,6 +562,10 @@ async def _run_turn(
         except Exception:  # noqa: BLE001 — an indicator is never worth a reply
             logger.debug("typing indicator failed", exc_info=True)
         manager = _get_manager()
+        # A permission dialog waits for the person: not even a queued retry
+        # goes into ask() — it would only find the dialog again.
+        if _permission_pending(manager):
+            return _Later(fallback=_PERMISSION_WAIT_MESSAGE)
         if not from_queue:
             # The session is held by work that takes no input — nightly
             # pipeline, doctor canary, startup/recovery. ask() would sit on
@@ -1153,12 +1190,21 @@ async def handle_chat_text(message: Message, bot: Bot) -> None:
     """
     if not message.text or not message.from_user:
         return
+    await _handle_text(message, bot, message.text)
 
+
+async def _handle_text(message: Message, bot: Bot, body: str) -> None:
+    """Shared text path: daily safety net, session log, dispatch.
+
+    ``body`` is the message text — ``message.text`` for a plain message,
+    or text recovered by the catch-all from a rich/unknown message."""
+    if not message.from_user:
+        return
     settings = get_settings()
     storage = VaultStorage(settings.vault_path)
 
     fwd = forward_note(getattr(message, "forward_origin", None))
-    text = f"{fwd}{message.text}" if fwd else message.text
+    text = f"{fwd}{body}" if fwd else body
 
     # Safety net: save to daily
     timestamp = datetime.fromtimestamp(message.date.timestamp())
@@ -1324,7 +1370,115 @@ async def handle_chat_media(message: Message, bot: Bot) -> None:
             logger.exception("Failed to send media error message")
 
 
+# --- Catch-all: rich messages (Bot API 10.1 ``Message.rich_message``) and ---
+# --- any other text-bearing type the filters above do not know yet.    ---
+
+UNSUPPORTED_DUMP_DIR = Path.home() / ".dbrain" / "unsupported"
+
+# Keys whose STRING values are human text. Everything else (ids, urls,
+# usernames, file ids, languages, alignment, ...) is ignored even if it is a
+# string. Rich text in Bot API 10.1+ is "a String, an Array of RichText or a
+# RichText* object" — bare strings inside a list under such a key are text too.
+_TEXT_KEYS = frozenset({
+    "text", "caption", "plain", "content", "summary", "credit", "body",
+    "expression", "alternative_text", "description", "question", "explanation",
+})
+# Top-level subtrees that carry somebody else's text (the replied/quoted/
+# pinned message, the sender, the chat) — never mistake it for this message.
+_SKIP_KEYS = frozenset({
+    "from_user", "from", "chat", "sender_chat", "sender_business_bot",
+    "forward_origin", "reply_to_message", "external_reply", "quote",
+    "pinned_message", "reply_markup", "via_bot", "entities",
+    "caption_entities", "users", "chat_shared",
+})
+_RICH_TEXT_LIMIT = 20000
+
+
+def _collect_text(node: Any, in_text: bool = False) -> str:
+    """Flatten a message dump into readable text (pragmatic, not lossless).
+
+    A list holding bare strings is inline rich text — joined without a
+    separator; a list of objects is a sequence of blocks — one per line."""
+    if isinstance(node, str):
+        return node if in_text else ""
+    if isinstance(node, list):
+        parts = [_collect_text(item, in_text) for item in node]
+        inline = any(isinstance(item, str) for item in node)
+        return ("" if inline else "\n").join(p for p in parts if p)
+    if isinstance(node, dict):
+        parts = []
+        for key, value in node.items():
+            if key in _SKIP_KEYS:
+                continue
+            part = _collect_text(value, key in _TEXT_KEYS)
+            if part:
+                parts.append(part)
+        return "\n".join(parts)
+    return ""
+
+
+def extract_any_text(message: Any) -> str:
+    """Text from a message the typed filters did not match: ``text``,
+    ``caption``, unknown extra fields and nested rich/formatted structures."""
+    for attr in ("text", "caption"):
+        value = getattr(message, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    try:
+        raw = message.model_dump(exclude_none=True)
+    except Exception:
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    text = _collect_text(raw).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text[:_RICH_TEXT_LIMIT]
+
+
+def _dump_unsupported(message: Any, update_id: int | None) -> None:
+    """Log content_type + top-level keys (no content), and save the full raw
+    JSON for diagnosis. Best effort: never raises."""
+    try:
+        raw = message.model_dump(mode="json", exclude_none=True)
+    except Exception:
+        logger.exception("unsupported message: model_dump failed")
+        return
+    try:
+        logger.warning(
+            "unsupported message: content_type=%s keys=%s",
+            getattr(message, "content_type", "?"),
+            sorted(raw.keys()) if isinstance(raw, dict) else type(raw).__name__,
+        )
+    except Exception:
+        pass
+    try:
+        UNSUPPORTED_DUMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ident = update_id if update_id is not None else (
+            f"m{getattr(message, 'message_id', 'x')}"
+        )
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = UNSUPPORTED_DUMP_DIR / f"{stamp}_{ident}.json"
+        path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        logger.exception("unsupported message: raw dump failed")
+
+
 @router.message()
-async def handle_chat_other(message: Message) -> None:
-    """Catch-all: never go silent — tell the user what the bot accepts."""
+async def handle_chat_other(
+    message: Message, bot: Bot, event_update: Any = None
+) -> None:
+    """Catch-all. A rich/formatted message (e.g. forwarded from another bot)
+    or any future type that still carries text goes the normal text path;
+    only a truly non-text message gets the "can't process" reply."""
+    _dump_unsupported(message, getattr(event_update, "update_id", None))
+    try:
+        text = extract_any_text(message)
+    except Exception:
+        logger.exception("unsupported message: text extraction failed")
+        text = ""
+    if text and message.from_user:
+        await _handle_text(message, bot, text)
+        return
     await message.answer(UNSUPPORTED_REPLY)

@@ -35,6 +35,7 @@ def create_dispatcher() -> Dispatcher:
         # buttons,
         chat,
         commands,
+        permission,
         process,
         resend,
         work,
@@ -49,6 +50,8 @@ def create_dispatcher() -> Dispatcher:
     # Read-only status of what's running — must be reachable while the
     # session is busy, so it goes BEFORE chat.router's catch-all.
     dp.include_router(work.router)
+    # «Да» / «Нет» on a permission question — callback queries only.
+    dp.include_router(permission.router)
     # Reply-keyboard buttons DISABLED 2026-08-22: the owner kept
     # hitting "⚙️ Обработать" by accident. To restore: uncomment the import
     # above and this include_router call, and re-add
@@ -206,6 +209,35 @@ def _reply_pumps(settings: Settings, deliver) -> list:
     return pumps
 
 
+def _start_permission_gate(bot: Bot, settings: Settings) -> asyncio.Task | None:
+    """Watch the Claude sessions for permission dialogs and ask the owner
+    (services/permission_gate.py). Main always; cron and duty when enabled —
+    each is a pane a background agent can ask in. Sessions are built, not
+    started: a pane that does not exist is simply never looked at."""
+    from d_brain.services import permission_gate, runtime
+
+    getters = {"main": runtime.get_session}
+    if settings.cron_enabled:
+        getters["cron"] = runtime.get_cron_session
+    if settings.duty_session_enabled:
+        getters["duty"] = runtime.get_duty_session
+    sessions = {}
+    for slot, get in getters.items():
+        try:
+            sessions[slot] = get(settings)
+        except Exception:  # noqa: BLE001 — never cost the bot its boot
+            logger.exception("permission gate: no %s session to watch", slot)
+    gate = permission_gate.configure(
+        permission_gate.PermissionGate(
+            sessions,
+            chat_id=settings.admin_chat_id,
+            allowed_ids=list(settings.allowed_user_ids),
+            remind_after=settings.permission_remind_after,
+        )
+    )
+    return asyncio.create_task(permission_gate.run(bot, gate))
+
+
 def _start_reply_pump(bot: Bot, settings: Settings) -> asyncio.Task | None:
     """Run the session pumps (see _reply_pumps) in one background task. Every
     pump delivers to the owner chat, the same chat cron jobs report to."""
@@ -304,6 +336,7 @@ async def run_bot(settings: Settings) -> None:
     # backoff that outlived the process).
     outbox_task = asyncio.create_task(outbox.run(bot, box))
     pump_task = _start_reply_pump(bot, settings)
+    gate_task = _start_permission_gate(bot, settings)
     cron_task = (
         asyncio.create_task(run_cron(settings, bot)) if settings.cron_enabled else None
     )
@@ -408,6 +441,8 @@ async def run_bot(settings: Settings) -> None:
         outbox_task.cancel()
         if pump_task is not None:
             pump_task.cancel()
+        if gate_task is not None:
+            gate_task.cancel()
         # Not cancelled before the grace, unlike cron: `should_start` above
         # already stopped it taking NEW jobs, and the one it may still be
         # running is tracked in `stopper`, so `wait_for_turns` gives it the

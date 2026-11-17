@@ -1516,3 +1516,28 @@ def test_send_message_delivers_the_empty_notice_when_the_instance_wants_it(
 
     m = _manager(tmp_path, AskResult("ok", reply=LEDGER_EMPTY_REPLY))
     assert asyncio.run(m.send_message(1, "x")) == LEDGER_EMPTY_REPLY
+
+
+# ── permission dialog on the main session (2026-11-05) ────────────────────
+
+
+def test_permission_dialog_parks_the_message_and_is_neutral(tmp_path):
+    """Nothing was typed: the message waits in the queue for the person's
+    answer. Not a delivery failure, so it never grows the fail streak."""
+    from d_brain.services import ask_health
+    from d_brain.services.chat_session import Busy
+
+    m = _manager(tmp_path, AskResult("permission", detail="dialog"))
+    res = asyncio.run(m.send_message(1, "x"))
+    assert isinstance(res, Busy)
+    assert "Да" in res.fallback and "Ошибка" not in res.fallback
+    health = ask_health.read(tmp_path)
+    assert health.last_status == "permission" and health.fail_streak == 0
+
+
+def test_prompt_that_never_reached_the_session_says_so(tmp_path):
+    from d_brain.services.claude_session import NOT_SUBMITTED_HIDDEN_DETAIL
+
+    m = _manager(tmp_path, AskResult("error", detail=NOT_SUBMITTED_HIDDEN_DETAIL))
+    reply = asyncio.run(m.send_message(1, "x"))
+    assert "не дошло до сессии" in reply and "ещё раз" in reply

@@ -217,12 +217,73 @@ fi
 # C6: `-u <me>` scopes the count to THIS instance's user. Without it, once a
 # second instance runs under another account, each install would see the
 # other's healthy bot and report a phantom "orphan process" (F5) forever.
-# Single-instance result is unchanged: the only matching process is our own.
-# pgrep -c prints "0" itself and exits 1 on no match; `|| echo 0` would then
-# append a second "0" and break the integer test below ("0\n0").
-n_bots=$(pgrep -u "$(id -un)" -cxf '.*/python[0-9.]* -m d_brain' 2>/dev/null)
-n_bots=${n_bots:-0}
-if [ "${n_bots:-0}" -gt 1 ]; then
+#
+# 2026-11-05: the same user can legitimately run OTHER d_brain bots. The
+# multi-tenant end-to-end smoke test starts two real tenant bots as
+# the same user, each with its own fake token against a fake Telegram, and every
+# run of it alerted "3 процессов бота". What makes a process a duplicate of
+# THIS bot is not its argv but the token it polls with: a second poller on
+# our token is the 409-Conflict orphan F5 exists for; a bot on another token
+# cannot take a single update from ours. So each match is counted only if
+# its effective token is ours, resolved the way pydantic-settings resolves
+# it in src/d_brain/config.py: the process environment first (keys are
+# case-insensitive), then the dotenv file named by its DBRAIN_ENV_FILE
+# (default ".env"), relative to its cwd. Not a cgroup test: a hand-started
+# orphan and the e2e bots both live outside any unit and look the same there.
+# Anything that cannot be resolved (unreadable environ or env file, no token
+# of our own to compare with) is counted, as before — doubt alerts.
+
+# Last `KEY=value` (case-insensitive key, optional `export`, quotes stripped)
+# from a file or a NUL-separated environ on stdin. Prints nothing if absent.
+_kv() {
+    local key="$1" line
+    line=$(tr '\0' '\n' | grep -iE "^[[:space:]]*(export[[:space:]]+)?${key}=" | tail -n1) || true
+    [ -n "$line" ] || return 0
+    line="${line#*=}"
+    line="${line%$'\r'}"
+    case "$line" in
+        \"*\") line="${line#\"}"; line="${line%\"}" ;;
+        \'*\') line="${line#\'}"; line="${line%\'}" ;;
+    esac
+    printf '%s' "$line"
+}
+
+# 0 = this process polls with OUR token, or we cannot tell (count it);
+# 1 = it provably uses another token, or it is already gone (do not count).
+_is_our_bot() {
+    local pid="$1" environ tok envf cwd
+    [ -d "/proc/$pid" ] || return 1
+    [ -n "$OWN_TOKEN" ] || return 0
+    environ="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null)" || return 0
+    [ -n "$environ" ] || return 0
+    tok="$(printf '%s\n' "$environ" | _kv TELEGRAM_BOT_TOKEN)"
+    if [ -z "$tok" ]; then
+        envf="$(printf '%s\n' "$environ" | _kv DBRAIN_ENV_FILE)"
+        envf="${envf:-.env}"
+        if [ "${envf#/}" = "$envf" ]; then
+            cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || return 0
+            envf="$cwd/$envf"
+        fi
+        [ -r "$envf" ] || return 0
+        tok="$(_kv TELEGRAM_BOT_TOKEN <"$envf")"
+    fi
+    [ -z "$tok" ] || [ "$tok" = "$OWN_TOKEN" ]
+}
+
+OWN_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+if [ -z "$OWN_TOKEN" ]; then
+    _own_env="${DBRAIN_ENV_FILE:-$PROJECT_DIR/.env}"
+    [ -r "$_own_env" ] && OWN_TOKEN="$(_kv TELEGRAM_BOT_TOKEN <"$_own_env")"
+fi
+
+n_bots=0
+for pid in $(pgrep -u "$(id -un)" -xf '.*/python[0-9.]* -m d_brain' 2>/dev/null); do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if _is_our_bot "$pid"; then
+        n_bots=$((n_bots + 1))
+    fi
+done
+if [ "$n_bots" -gt 1 ]; then
     faults+=("$n_bots процессов бота одновременно (осиротевший процесс)")
 fi
 

@@ -1520,3 +1520,38 @@ def test_choice_dialog_with_busy_pane_falls_back_to_hang_clock(tmp_path):
     assert wd.check_once() == "healthy"
     clock["now"] += 301.0
     assert wd.check_once() == "recover_deferred"
+
+
+# ── permission dialog (2026-11-05): the person's call, never the watchdog's ──
+
+
+def test_permission_dialog_is_never_taken_for_a_hang(tmp_path):
+    """It waits for the person, possibly for hours. Recovering would kill
+    the agent that asked; the watchdog must leave it alone."""
+    clock = {"now": 1000.0}
+    sess = FakeSession(state=PaneState.PERMISSION_DIALOG, working=False)
+    wd = make_wd(tmp_path, sess, clock=clock)
+    for _ in range(5):
+        assert wd.check_once() == "healthy"
+        clock["now"] += 3600.0
+    assert sess.recovered == 0
+
+
+def test_long_run_cap_does_not_escape_a_permission_dialog(tmp_path):
+    """The cap's Escape would refuse the command on the person's behalf. It
+    waits until the dialog is answered, then closes the run as usual."""
+    clock = {"now": 1000.0}
+    sess = CapFakeSession(pane_text=_ACTIVE_PANE, turn_active=False)
+    alerts: list[str] = []
+    wd = _cap_wd(tmp_path, sess, clock, alerts, cap=300.0)
+    wd.check_once()  # started
+    sess.state = PaneState.PERMISSION_DIALOG
+    clock["now"] = 1301.0
+    wd.check_once()
+    clock["now"] = 2000.0
+    wd.check_once()
+    assert sess.interrupts == 0
+    sess.state = PaneState.READY  # answered
+    clock["now"] = 2010.0
+    wd.check_once()
+    assert sess.interrupts == 1

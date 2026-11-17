@@ -22,6 +22,7 @@ from d_brain.services.claude_session import (
     DEFAULT_STALL_TIMEOUT,
     DEFAULT_TIMEOUT,
     MAINT_PREFIX,
+    PERMISSION_STATUS,
     STATIC_TRUST_WINDOW,
     AskResult,
     ClaudeSession,
@@ -31,6 +32,7 @@ from d_brain.services.tmux_parse import (
     extract_reply,
     is_main_turn_active,
     open_reply_rids,
+    read_permission_dialog,
     reply_rids,
 )
 
@@ -1131,6 +1133,19 @@ def test_pop_orphan_replies_open_span_rescue_does_not_touch_complete_pairs(
 # ── health ──────────────────────────────────────────────────────────────
 
 
+def test_exists_is_a_quiet_has_session(tmp_path, clock, caplog):
+    """exists() is the pollers' probe: an absent session is a plain False,
+    not a "tmux has-session failed" warning on every poll."""
+    fake = FakeTmux([], exists=False)
+    session = make_session(tmp_path, fake, clock)
+    with caplog.at_level(logging.WARNING, logger="d_brain.services.claude_session"):
+        assert session.exists() is False
+    assert "has-session failed" not in caplog.text
+    assert fake.calls[-1][-3:] == ["has-session", "-t", session._target]
+    fake.exists = True
+    assert session.exists() is True
+
+
 def test_is_healthy_true_when_session_exists(tmp_path, clock):
     fake = FakeTmux([READY], exists=True)
     s = make_session(tmp_path, fake, clock)
@@ -1346,9 +1361,11 @@ def test_ask_dismisses_feedback_survey_instead_of_stalling(tmp_path, clock):
         "● How is Claude doing this session? (optional)\n"
         "  1: Bad    2: Fine   3: Good   0: Dismiss\n" + READY
     )
-    # The 2nd READY is the post-Enter look at the input box (_confirm_submitted).
+    # The 2nd READY is the pre-Enter look for a permission dialog
+    # (_send_enter), the 3rd the post-Enter look at the input box
+    # (_confirm_submitted).
     fake = FakeTmux(
-        [READY, READY, survey, THINKING, _complete("rid00001")], exists=True
+        [READY, READY, READY, survey, THINKING, _complete("rid00001")], exists=True
     )
     s = make_session(tmp_path, fake, clock)
     res = s.ask("привет")
@@ -3876,7 +3893,10 @@ def _unsent_box(text: str) -> str:
 def test_lost_enter_is_pressed_again(tmp_path, clock, caplog):
     rid = "rid00001"
     unsent = _unsent_box(f"ping\nfiller\nend with <<<E:{rid}>>>. The reply is")
-    fake = FakeTmux([READY, unsent, READY, _complete(rid, "HELLO")], exists=True)
+    # Every Enter is preceded by its own look for a permission dialog.
+    fake = FakeTmux(
+        [READY, unsent, unsent, unsent, READY, _complete(rid, "HELLO")], exists=True
+    )
     s = make_session(tmp_path, fake, clock, rid=rid)
     with caplog.at_level(logging.WARNING):
         r = s.ask("ping")
@@ -3888,7 +3908,9 @@ def test_lost_enter_is_pressed_again(tmp_path, clock, caplog):
 def test_collapsed_paste_left_in_the_box_is_sent(tmp_path, clock):
     rid = "rid00001"
     unsent = _unsent_box("[Pasted text #1 +200 lines]")
-    fake = FakeTmux([READY, unsent, READY, _complete(rid, "HELLO")], exists=True)
+    fake = FakeTmux(
+        [READY, unsent, unsent, unsent, READY, _complete(rid, "HELLO")], exists=True
+    )
     s = make_session(tmp_path, fake, clock, rid=rid)
     assert s.ask("ping").status == "ok"
     assert fake.enter_count() == 2
@@ -3897,7 +3919,7 @@ def test_collapsed_paste_left_in_the_box_is_sent(tmp_path, clock):
 def test_enter_retries_are_capped_at_two(tmp_path, clock, caplog):
     rid = "rid00001"
     unsent = _unsent_box(f"ping <<<E:{rid}>>>")
-    fake = FakeTmux([READY, unsent, unsent, unsent, _complete(rid)], exists=True)
+    fake = FakeTmux([READY] + [unsent] * 6 + [_complete(rid)], exists=True)
     s = make_session(tmp_path, fake, clock, rid=rid)
     with caplog.at_level(logging.WARNING):
         s.ask("ping", timeout=30)
@@ -3921,7 +3943,7 @@ def test_marker_in_the_transcript_echo_is_not_an_unsent_prompt(tmp_path, clock):
 
 def test_unwrapped_prompt_left_as_collapsed_paste_is_sent(tmp_path, clock):
     fake = FakeTmux(
-        [READY, _unsent_box("[Pasted text #3 +40 lines]"), READY, READY, READY],
+        [READY] + [_unsent_box("[Pasted text #3 +40 lines]")] * 3 + [READY] * 3,
         exists=True,
     )
     s = make_session(tmp_path, fake, clock)
@@ -4069,9 +4091,10 @@ def test_half_written_reply_is_not_delivered_until_it_is_closed(tmp_path, clock)
         polls["n"] += 1
         # Still writing for the first few polls (well inside the salvage
         # window), then the model finishes the reply properly.
-        if polls["n"] == 3:
+        # (Poll 2 is the pre-Enter look for a permission dialog.)
+        if polls["n"] == 4:
             _write_record(s, "Second half of the answer.")
-        if polls["n"] == 5:
+        if polls["n"] == 6:
             _write_record(s, f"<<<E:{rid}>>>")
         return original_capture()
 
@@ -4721,7 +4744,11 @@ def test_ask_resubmits_prompt_swallowed_by_dialog(tmp_path, clock):
     # The dialog opened between the pre-send look and the paste: the prompt
     # went into it, the transcript saw nothing. Close it and send again.
     fake = FakeTmux(
-        [READY, READY, DIALOG, READY, READY, READY, THINKING, _complete("rid00001")],
+        [READY]
+        + [READY] * 2
+        + [DIALOG]
+        + [READY] * 4
+        + [THINKING, _complete("rid00001")],
         exists=True,
     )
     s = make_session(tmp_path, fake, clock)
@@ -4765,6 +4792,98 @@ def test_startup_closes_choice_dialog(tmp_path, clock):
     s.ensure_session()
     assert fake.enter_count() >= 1
     assert (tmp_path / ".dbrain" / "ready").exists()
+
+
+
+# ── permission dialog (2026-11-02..05) ───────────────────────────
+
+PERM = (_FIXTURES_DIR / "pane_permission_dangerous_rm.txt").read_text(encoding="utf-8")
+
+
+def test_ask_never_types_into_a_permission_dialog(tmp_path, clock):
+    fake = FakeTmux([PERM], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    res = s.ask("привет")
+    assert res.status == PERMISSION_STATUS
+    assert _pastes(fake) == 0
+    assert fake.sent_keys() == []  # no Enter (would approve), no Escape
+    assert not (tmp_path / ".dbrain" / "inflight").exists()
+
+
+def test_dialog_that_opens_after_the_paste_gets_no_enter(tmp_path, clock):
+    # The dialog drew between the pre-send look and the Enter: Enter there
+    # approves "Yes" (verified live), so it is withheld, and the dropped
+    # prompt goes back to the caller to be sent after the person's answer.
+    fake = FakeTmux([READY, PERM], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    res = s.ask("привет")
+    assert res.status == PERMISSION_STATUS
+    assert _pastes(fake) == 1
+    assert fake.enter_count() == 0
+    assert not [c for c in fake.sent_keys() if c[-1] == "Escape"]
+    assert clock["now"] < 30
+
+
+def test_dialog_during_a_running_turn_is_waited_out_not_escaped(tmp_path, clock):
+    # Our turn started; a background agent then asks. Thirty silent polls
+    # with stall_timeout=10 must not interrupt: Escape would refuse it.
+    started = "● <<<R:rid00001>>>\nпишу ответ\n" + THINKING
+    fake = FakeTmux(
+        [READY, READY, READY, started] + [PERM] * 30 + [_complete("rid00001")],
+        exists=True,
+    )
+    s = make_session(tmp_path, fake, clock, stall_timeout=10.0)
+    res = s.ask("привет")
+    assert res.status == "ok"
+    assert not [c for c in fake.sent_keys() if c[-1] in ("Escape", "1", "2")]
+
+
+def test_send_enter_is_withheld_over_a_permission_dialog(tmp_path, clock):
+    fake = FakeTmux([PERM], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    assert s._send_enter() is False
+    assert fake.enter_count() == 0
+
+
+def test_answer_permission_presses_the_digit_of_yes(tmp_path, clock):
+    fake = FakeTmux([PERM, READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    fp = read_permission_dialog(PERM).fingerprint
+    assert s.answer_permission(fp, True) == "done"
+    assert [c[-1] for c in fake.sent_keys()] == ["1"]
+
+
+def test_answer_permission_presses_the_digit_of_no(tmp_path, clock):
+    # Still on screen at the first look after the key, gone at the second.
+    fake = FakeTmux([PERM, PERM, READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    fp = read_permission_dialog(PERM).fingerprint
+    assert s.answer_permission(fp, False) == "done"
+    assert [c[-1] for c in fake.sent_keys()] == ["2"]
+
+
+def test_answer_permission_never_answers_another_dialog(tmp_path, clock):
+    other = PERM.replace("sheets/*", "other/*")
+    fake = FakeTmux([other], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    fp = read_permission_dialog(PERM).fingerprint
+    assert s.answer_permission(fp, True) == "changed"
+    assert fake.sent_keys() == []
+
+
+def test_answer_permission_when_the_dialog_is_gone(tmp_path, clock):
+    fake = FakeTmux([READY], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    assert s.answer_permission("anything", True) == "gone"
+    assert fake.sent_keys() == []
+
+
+def test_answer_permission_reports_a_dialog_that_stays(tmp_path, clock):
+    fake = FakeTmux([PERM], exists=True)
+    s = make_session(tmp_path, fake, clock)
+    fp = read_permission_dialog(PERM).fingerprint
+    assert s.answer_permission(fp, True) == "stuck"
+    assert [c[-1] for c in fake.sent_keys()] == ["1"]  # pressed once only
 
 
 # ── persona changed while the CLI kept running (2026-11-02) ─────────────

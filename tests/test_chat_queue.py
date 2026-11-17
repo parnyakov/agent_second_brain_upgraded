@@ -850,3 +850,61 @@ def test_the_worker_keeps_sweeping_after_a_failed_pass(queue, monkeypatch):
 
     asyncio.run(scenario())
     assert passes["n"] == 2  # it came back for a second pass
+
+
+# ── a permission dialog waits for the person (2026-11-05) ─────────────
+
+
+class AskingManager(FakeManager):
+    """A permission dialog is open on the main session."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending = True
+        self.steered: list[str] = []
+
+    def permission_pending(self) -> bool:
+        return self.pending
+
+    def is_turn_active(self) -> bool:
+        return True
+
+    async def steer(self, text: str) -> None:
+        self.steered.append(text)
+
+
+def test_message_waits_while_a_permission_dialog_is_open(monkeypatch, queue):
+    """Nothing is typed into the dialog (Enter would approve it): the
+    message is parked with the usual receipt and answered after the person's
+    decision."""
+    from d_brain.bot.handlers import chat
+
+    mgr = AskingManager()
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+
+    asyncio.run(chat._process_and_reply(bot, 10, 7, "голосовое", message_id=5))
+    assert mgr.sent == []
+    assert "Сообщение принято" in bot.texts()
+
+    # The drain does not even start it while the dialog is open…
+    asyncio.run(chat_queue.drain(bot, queue, chat.run_queued_job))
+    assert mgr.sent == [] and len(queue.waiting(10)) == 1
+
+    # …and sends it once the person has answered.
+    mgr.pending = False
+    asyncio.run(chat_queue.drain(bot, queue, chat.run_queued_job))
+    assert mgr.sent == [(7, "голосовое")]
+    assert queue.waiting() == []
+
+
+def test_steering_text_is_parked_not_typed_into_the_dialog(monkeypatch, queue):
+    from d_brain.bot.handlers import chat
+
+    mgr = AskingManager()
+    monkeypatch.setattr(chat, "_get_manager", lambda: mgr)
+    bot = FakeBot()
+
+    asyncio.run(chat._dispatch_text(bot, 10, 7, "и ещё добавь", message_id=6))
+    assert mgr.steered == [] and mgr.sent == []
+    assert [j.prompt for j in queue.waiting(10)] == ["и ещё добавь"]

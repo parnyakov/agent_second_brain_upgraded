@@ -51,11 +51,13 @@ esac
 exit 0
 """
 
-# Real procps pgrep -c prints "0" AND exits 1 on no match; the stub must too,
-# or the "0\n0" bug of 2026-10-26 stays invisible.
+# `pgrep -u <me> -xf <pattern>`: one pid per line from STUB_BOT_PIDS, and,
+# like real procps, exit 1 on no match. The pids are real processes the test
+# started, so the script reads their /proc for real; the stub only keeps the
+# machine's own bots (same user as the test run) out of the count.
 _PGREP_STUB = (
-    "#!/bin/bash\nn=\"${STUB_BOT_COUNT:-1}\"\necho \"$n\"\n"
-    "[ \"$n\" = 0 ] && exit 1\nexit 0\n"
+    "#!/bin/bash\n[ -n \"${STUB_BOT_PIDS:-}\" ] || exit 1\n"
+    "printf '%s\\n' $STUB_BOT_PIDS\n"
 )
 
 # `curl` stands in for both notify channels' only side effect, so nothing
@@ -250,9 +252,88 @@ def test_a_dead_unit_is_still_reported(watch):
 def test_no_running_bot_does_not_break_the_count_check(watch):
     """pgrep -c with no match printed "0" and exited 1, ``|| echo 0`` added a
     second "0" and bash failed with "integer expression expected" every run."""
-    code, err = watch(STUB_BOT_STATE="failed", STUB_BOT_COUNT="0")
+    code, err = watch(STUB_BOT_STATE="failed", STUB_BOT_PIDS="")
     assert "integer expression expected" not in err
     assert "не активен" in err
+
+
+# ── F5: a duplicate is a second poller on OUR token (2026-11-05) ──────
+
+
+@pytest.fixture
+def bots(tmp_path):
+    """``start(env, cwd=None)`` → pid of a live stand-in bot process whose
+    /proc environ and cwd the script reads for real."""
+    procs: list[subprocess.Popen] = []
+
+    def start(env: dict[str, str], cwd: Path | None = None) -> str:
+        proc = subprocess.Popen(
+            ["sleep", "60"],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env},
+            cwd=cwd or tmp_path,
+        )
+        procs.append(proc)
+        return str(proc.pid)
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+def test_other_bots_of_the_same_user_are_not_orphans(watch, bots):
+    """A multi-tenant e2e smoke test runs two tenant bots as the same user, each on
+    its own token: three matching processes, one bot of ours, no alert."""
+    pids = [
+        bots({"TELEGRAM_BOT_TOKEN": "stub"}),
+        bots({"TELEGRAM_BOT_TOKEN": "tenant-a", "DBRAIN_ENV_FILE": "/nope.env"}),
+        bots({"TELEGRAM_BOT_TOKEN": "tenant-b", "DBRAIN_ENV_FILE": "/nope.env"}),
+    ]
+    code, err = watch(STUB_BOT_PIDS=" ".join(pids))
+    assert code == 0, err
+    assert "процессов бота" not in err
+
+
+def test_a_second_poller_on_our_token_is_still_an_orphan(watch, bots):
+    pids = [bots({"TELEGRAM_BOT_TOKEN": "stub"}) for _ in range(2)]
+    pids.append(bots({"TELEGRAM_BOT_TOKEN": "tenant-a"}))
+    code, err = watch(STUB_BOT_PIDS=" ".join(pids))
+    assert code == 1
+    assert "2 процессов бота" in err
+
+
+def test_a_hand_started_bot_reading_our_env_file_is_an_orphan(watch, bots, tmp_path):
+    """`uv run python -m d_brain` from a shell: no token in its environment,
+    pydantic reads it from ./.env in its cwd, or from its DBRAIN_ENV_FILE."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".env").write_text('export TELEGRAM_BOT_TOKEN="stub"\n')
+    named = tmp_path / "named.env"
+    named.write_text("telegram_bot_token=stub\n")
+    pids = [
+        bots({"TELEGRAM_BOT_TOKEN": "stub"}),
+        bots({}, cwd=checkout),
+        bots({"DBRAIN_ENV_FILE": str(named)}),
+    ]
+    code, err = watch(STUB_BOT_PIDS=" ".join(pids))
+    assert code == 1
+    assert "3 процессов бота" in err
+
+
+def test_a_bot_whose_token_cannot_be_resolved_is_counted(watch, bots):
+    """Doubt alerts: no token in the environment and no readable env file."""
+    pids = [
+        bots({"TELEGRAM_BOT_TOKEN": "stub"}),
+        bots({"DBRAIN_ENV_FILE": "/nonexistent/.env"}),
+    ]
+    code, err = watch(STUB_BOT_PIDS=" ".join(pids))
+    assert code == 1
+    assert "2 процессов бота" in err
+
+
+def test_a_single_bot_of_ours_says_nothing(watch, bots):
+    code, err = watch(STUB_BOT_PIDS=bots({"TELEGRAM_BOT_TOKEN": "stub"}))
+    assert code == 0, err
 
 
 # ── self-heal: a `failed` bot is restarted, rate-limited (2026-10-26) ──

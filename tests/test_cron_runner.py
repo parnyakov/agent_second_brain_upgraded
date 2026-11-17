@@ -285,6 +285,21 @@ async def test_rate_limited_skips_without_recover_or_count(tmp_path):
     assert "/clear" not in session.controls
 
 
+async def test_permission_dialog_in_the_cron_pane_skips_without_recover(tmp_path):
+    """A background agent of an earlier job asks the owner to approve a
+    command in the cron pane. Not the job's fault, and force_recover would
+    kill the agent that asked: retry later, uncounted."""
+    store = _store(tmp_path)
+    _add_job(store, "j1")
+    session = FakeSession([AskResult("permission")])
+    await _runner(store, session).tick()
+    job = store.load()[0]
+    assert session.recovered == 0
+    assert job.state.consecutive_errors == 0
+    assert job.state.last_status == "permission"
+    assert "/clear" not in session.controls
+
+
 # ── rate-limit self-recovery (Fix A/B) ────────────────────────────────────
 #
 # 2026-08-28 incident: the cron pane got permanently parked at a stale

@@ -677,6 +677,9 @@ def test_is_authorized_matches_what_the_auth_middleware_used_to_do(tmp_path):
                 "is_anonymous": True,
                 "type": "regular",
                 "allows_multiple_answers": False,
+                # required since Bot API 10.x (aiogram >= 3.29)
+                "allows_revoting": False,
+                "members_only": False,
             },
         },
         context={"bot": bot},
