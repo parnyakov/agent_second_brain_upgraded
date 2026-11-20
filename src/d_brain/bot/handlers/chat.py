@@ -24,7 +24,7 @@ from aiogram.types import Message
 from d_brain import logsafe
 from d_brain.bot.formatters import send_response
 from d_brain.config import get_settings
-from d_brain.services import chat_queue, progress
+from d_brain.services import chat_queue, progress, turn_merge
 from d_brain.services.chat_session import (
     Busy,
     ChatSessionManager,
@@ -152,6 +152,26 @@ async def _dispatch_text(
         return
 
     manager = _get_manager()
+    opening = turn_merge.current(chat_id, user_id)
+    if opening and not _permission_pending(manager):
+        if text.strip().lower() in _STOP_WORDS:
+            if not opening.sealed:
+                opening.cancelled = True
+            else:
+                token = turn_merge.owner.set(opening)
+                try:
+                    if await opening.wait_for_engine(manager):
+                        await manager.interrupt()
+                finally:
+                    turn_merge.owner.reset(token)
+            await bot.send_message(chat_id, "⏹ Останавливаю текущий ответ.")
+            return
+        if await opening.join(manager, prompt):
+            await bot.send_message(chat_id, "↪️ Передал в текущую задачу.")
+            return
+        # The exact turn closed before Codex accepted this message.
+        await _process_and_reply(bot, chat_id, user_id, prompt, message_id=message_id)
+        return
     turn_active = manager.is_turn_active()
     if not turn_active and _cli_turn_steerable(manager):
         # Reply ledger: the CLI turn itself is open although nothing holds
@@ -181,7 +201,11 @@ async def _dispatch_text(
         await bot.send_message(chat_id, "⏹ Останавливаю текущий ответ.")
         return
     if mode == "steer":
-        if not manager.is_steerable_turn() or _permission_pending(manager):
+        if (
+            not manager.is_steerable_turn()
+            or _permission_pending(manager)
+            or getattr(manager, "engine_name", None) == "codex"
+        ):
             # Maintenance turn (nightly pipeline / doctor / startup) holds
             # the session — injecting user text would contaminate it. Falls
             # through to the ordinary path, which parks it in the per-chat
@@ -197,8 +221,12 @@ async def _dispatch_text(
         # right now, which is strictly better than making it wait for a turn
         # of its own. "One work at a time per chat" still holds — steering
         # adds input to the live work, it does not start a second one.
-        await manager.steer(prompt)
-        await bot.send_message(chat_id, "↪️ Передал в текущую задачу.")
+        if await manager.steer(prompt) is False:
+            await _process_and_reply(
+                bot, chat_id, user_id, prompt, message_id=message_id
+            )
+        else:
+            await bot.send_message(chat_id, "↪️ Передал в текущую задачу.")
         return
     # mode == "ask". The busy gate used to live right here — it now lives
     # inside _run_turn, behind the single _process_and_reply choke point
@@ -405,14 +433,19 @@ async def run_queued_job(bot: Bot, job: Any) -> bool:
     """
     if _permission_pending(_get_manager()):
         return False
-    later = await _run_turn(
-        bot,
-        job.chat_id,
-        job.user_id,
-        job.prompt,
-        job.message_id,
-        from_queue=True,
+    registration = (
+        turn_merge.register(job.chat_id, job.user_id)
+        if getattr(_get_manager(), "engine_name", None) == "codex"
+        else contextlib.nullcontext(None)
     )
+    with registration as opening:
+        if opening:
+            # A queued job can be retried from disk with its original prompt.
+            # Wait for actual steering acceptance on this path.
+            opening.seal(job.prompt)
+        later = await _run_turn(
+            bot, job.chat_id, job.user_id, job.prompt, job.message_id, from_queue=True
+        )
     return later is None
 
 
@@ -423,6 +456,7 @@ async def _process_and_reply(
     prompt: str,
     *,
     message_id: int | None = None,
+    opening: turn_merge.Opening | None = None,
 ) -> None:
     """THE choke point every input path funnels through — and therefore the
     place the per-chat lane is taken.
@@ -470,9 +504,24 @@ async def _process_and_reply(
             )
             return
     try:
-        later = await _run_turn(
-            bot, chat_id, user_id, prompt, message_id, from_queue=False
+        registration = (
+            turn_merge.register(chat_id, user_id)
+            if opening is None
+            and getattr(_get_manager(), "engine_name", None) == "codex"
+            else contextlib.nullcontext(opening)
         )
+        with registration as active:
+            later = await _run_turn(
+                bot,
+                chat_id,
+                user_id,
+                prompt,
+                message_id,
+                from_queue=False,
+                opening=active,
+            )
+            if later and active and active.sealed:
+                prompt = active.seal(prompt)
     finally:
         if queue is not None:
             queue.release(chat_id)
@@ -508,6 +557,7 @@ async def _run_turn(
     message_id: int | None = None,
     *,
     from_queue: bool = False,
+    opening: turn_merge.Opening | None = None,
 ) -> _Later | None:
     """Send the prompt to the shared session and deliver the reply.
 
@@ -585,6 +635,10 @@ async def _run_turn(
         # конец файла в момент создания — иначе первые события хода
         # окажутся позади курсора и человек их не увидит.
         card, card_task = _start_progress_card(bot, chat_id, manager)
+        if opening:
+            if opening.cancelled:
+                return None
+            prompt = opening.seal(prompt)
         response = await manager.send_message(user_id, prompt)
         # Карточка снимается ПЕРЕД ответом, а не после: ответ должен быть
         # последним сообщением в чате, а не встать над ещё живой карточкой.
@@ -1130,6 +1184,21 @@ async def handle_chat_voice(message: Message, bot: Bot) -> None:
     if not message.voice or not message.from_user:
         return
 
+    # Reserve the opening before download/transcription yields to a later text.
+    manager = _get_manager()
+    if (
+        getattr(manager, "engine_name", None) == "codex"
+        and not manager.is_turn_active()
+    ):
+        with turn_merge.register(message.chat.id, message.from_user.id) as opening:
+            await _process_voice(message, bot, opening)
+    else:
+        await _process_voice(message, bot, None)
+
+
+async def _process_voice(
+    message: Message, bot: Bot, opening: turn_merge.Opening | None
+):
     settings = get_settings()
     storage = VaultStorage(settings.vault_path)
     transcriber = DeepgramTranscriber(settings.deepgram_api_key)
@@ -1170,6 +1239,7 @@ async def handle_chat_voice(message: Message, bot: Bot) -> None:
             message.from_user.id,
             f"{reply_context(message)}[voice] {transcript}",
             message_id=message.message_id,
+            opening=opening,
         )
 
     except Exception as e:

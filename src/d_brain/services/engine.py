@@ -95,7 +95,7 @@ class EngineDriver(Protocol):
         maintenance turn must not be contaminated)."""
         ...
 
-    def steer(self, text: str) -> None:
+    def steer(self, text: str) -> bool:
         """Inject text into a live turn, without taking the lock."""
         ...
 

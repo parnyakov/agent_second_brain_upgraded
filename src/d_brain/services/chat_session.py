@@ -1039,8 +1039,8 @@ class ChatSessionManager:
     def is_steerable_turn(self) -> bool:
         return self._session.is_steerable_turn()
 
-    async def steer(self, text: str) -> None:
-        await asyncio.to_thread(self._session.steer, text)
+    async def steer(self, text: str) -> bool:
+        return await asyncio.to_thread(self._session.steer, text) is not False
 
     async def interrupt(self) -> None:
         await asyncio.to_thread(self._session.interrupt)

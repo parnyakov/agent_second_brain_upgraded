@@ -2326,7 +2326,7 @@ class ClaudeSession:
 
     # ── steering (concurrent input into a live turn) ─────────────────
 
-    def steer(self, text: str) -> None:
+    def steer(self, text: str) -> bool:
         """Type text into the pane WITHOUT taking the pane lock.
 
         Used to inject guidance into an in-flight turn (the lock is held by
@@ -2345,9 +2345,10 @@ class ClaudeSession:
             self._send_text(text)
             self._send_enter()
             self._confirm_submitted(turn_ledger.turn_tag(rid, "steer"))
-            return
+            return True
         self._send_text(text)
         self._send_enter()
+        return True
 
     def interrupt(self) -> None:
         """Stop the current response (TUI-native Escape, no lock).

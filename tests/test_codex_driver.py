@@ -296,6 +296,9 @@ def test_thread_id_persists_across_two_sequential_asks(tmp_path):
     # `codex exec resume` rejects both ("error: unexpected argument").
     assert second[:5] == ["codex", "exec", "resume", THREAD, "--json"]
     assert "-s" not in second and "-C" not in second
+    assert second[second.index("-c") + 1] == (
+        f"sandbox_mode={first[first.index('-s') + 1]}"
+    )
 
 
 def test_a_fresh_driver_reuses_the_thread_left_on_disk(tmp_path):
@@ -747,15 +750,10 @@ def test_bare_model_and_unknown_controls_are_refused_not_faked(tmp_path, caplog)
     assert "/compact" in text
 
 
-def test_steering_is_refused_rather_than_silently_dropped(tmp_path, caplog):
+def test_idle_driver_refuses_steering(tmp_path):
     drv = make_driver(tmp_path, FakePopen())
-    assert drv.is_steerable_turn() is False
-    with caplog.at_level("ERROR"):
-        drv.steer("допиши ещё вот это")
-    # chat.py never reaches steer() while is_steerable_turn() is False, but if
-    # anything does, the text must be recoverable from the journal.
-    assert "допиши ещё вот это" in caplog.text
-    assert "NOT delivered" in caplog.text
+    assert not drv.is_steerable_turn()
+    assert drv.steer("допиши ещё вот это") is False
 
 
 # ── 9. health / recovery ─────────────────────────────────────────────────

@@ -78,7 +78,9 @@ def test_engine_round_trip_keeps_names_and_dirs(tmp_path):
 
     def build(engine):
         rt.reset()
-        s = _settings(tmp_path, chat_engine=engine, cron_engine=engine)
+        s = _settings(
+            tmp_path, chat_engine=engine, cron_engine=engine, codex_sandbox="read-only"
+        )
         (tmp_path / "deploy" / "codex-agents.md").write_text(
             "# d-brain codex agent contract\n"
         )
@@ -95,6 +97,9 @@ def test_engine_round_trip_keeps_names_and_dirs(tmp_path):
     assert isinstance(chat1, ClaudeSession) and isinstance(chat2, ClaudeSession)
     assert isinstance(chat_cx, CodexExecDriver)
     assert isinstance(cron_cx, CodexExecDriver)
+    assert chat_cx.chat_steering
+    assert not cron_cx.chat_steering
+    assert chat_cx.sandbox == cron_cx.sandbox == "read-only"
     for a, b in ((chat1, chat_cx), (chat1, chat2), (cron1, cron_cx), (cron1, cron2)):
         assert a.session_name == b.session_name
         assert a.runtime_dir == b.runtime_dir
@@ -222,6 +227,7 @@ def test_the_codex_duty_session_gets_the_same_override(tmp_path):
     duty = rt.get_duty_session(s)
     rt.reset()
     assert isinstance(duty, CodexExecDriver)
+    assert not duty.chat_steering
     assert duty._stall_timeout == s.duty_stall_timeout
 
 

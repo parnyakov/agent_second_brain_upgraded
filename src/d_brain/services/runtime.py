@@ -107,6 +107,7 @@ def _build_codex_session(
         runtime_dir=runtime_dir,
         instructions_file=instructions,
         model=settings.codex_model or None,
+        chat_steering=runtime_dir == settings.runtime_dir,
         **extra,
         **_stall_kwarg(stall_timeout),
     )

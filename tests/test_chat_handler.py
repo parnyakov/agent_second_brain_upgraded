@@ -1311,3 +1311,80 @@ def test_catchall_dump_failure_never_breaks_handler(monkeypatch, tmp_path):
     asyncio.run(chat.handle_chat_other(msg, FakeBot()))
 
     assert dispatched and answers == []
+
+
+async def test_codex_voice_followups_during_transcription_and_live_turn(
+    monkeypatch, tmp_path
+):
+    from d_brain.bot.handlers import chat
+
+    transcribing = asyncio.Event()
+    transcript_ready = asyncio.Event()
+    live = asyncio.Event()
+    finish = asyncio.Event()
+
+    class Transcriber:
+        def __init__(self, key):
+            pass
+
+        async def transcribe(self, payload):
+            transcribing.set()
+            await transcript_ready.wait()
+            return "собери таблицу"
+
+    class Manager(SteerableManager):
+        engine_name = "codex"
+
+        async def send_message(self, user_id, prompt):
+            self.sent.append(prompt)
+            self.active = True
+            live.set()
+            await finish.wait()
+            self.active = False
+            return "Готово"
+
+    manager = Manager()
+    monkeypatch.setattr(chat, "_get_manager", lambda: manager)
+    monkeypatch.setattr(chat, "_queue", lambda: None)
+    monkeypatch.setattr(chat, "DeepgramTranscriber", Transcriber)
+    monkeypatch.setattr(
+        chat, "get_settings", lambda: _Stub(vault_path=tmp_path, deepgram_api_key="k")
+    )
+    bot = VoiceBot()
+    async with asyncio.timeout(5):
+        voice = asyncio.create_task(chat.handle_chat_voice(_voice_message(), bot))
+        await transcribing.wait()
+        early = asyncio.create_task(chat._dispatch_text(bot, 10, 7, "только Москва"))
+        await asyncio.sleep(0)
+        transcript_ready.set()
+        await live.wait()
+        await early
+        await chat._dispatch_text(bot, 10, 7, "в рублях")
+        await chat._dispatch_text(bot, 10, 7, "за ноябрь")
+        finish.set()
+        await voice
+
+    assert manager.sent == ["[voice] собери таблицу\n\nтолько Москва"]
+    assert manager.steered == ["в рублях", "за ноябрь"]
+    assert [message for _, message in bot.messages].count(
+        "↪️ Передал в текущую задачу."
+    ) == 3
+
+
+async def test_rejected_steer_is_routed_once_without_success_ack(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from d_brain.bot.handlers import chat
+    from d_brain.services import turn_merge
+
+    manager = SteerableManager(active=True)
+    manager.steer = AsyncMock(return_value=False)
+    fallback = AsyncMock()
+    monkeypatch.setattr(chat, "_get_manager", lambda: manager)
+    monkeypatch.setattr(chat, "_process_and_reply", fallback)
+    bot = FakeBot()
+    with turn_merge.register(10, 7) as opening:
+        opening.seal("первое")
+        await chat._dispatch_text(bot, 10, 7, "позднее уточнение")
+    fallback.assert_awaited_once()
+    assert not bot.messages

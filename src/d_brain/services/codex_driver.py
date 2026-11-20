@@ -43,12 +43,8 @@ keep working unmodified whichever engine is behind them.
 
 Facts about the CLI this driver depends on (verified, not assumed)
 ------------------------------------------------------------------
-* ``codex exec resume`` does NOT accept ``-s/--sandbox`` or ``-C/--cd``
-  ("error: unexpected argument") — the sandbox and working root are fixed at
-  thread-creation time. Hence the ``thread_id`` MUST be persisted and the
-  first call of a thread is the only one that carries those flags. (Spike
-  step 2's "trap that cost me the first run"; re-verified here against
-  ``codex exec resume --help`` on 0.153.4.)
+* Resume rejects ``-s`` and ``-C``. Reapply the configured sandbox via
+  ``-c sandbox_mode=…`` on every resumed turn.
 * Rate-limit telemetry is NOT in the ``--json`` stream. ``used_percent`` /
   ``resets_at`` / ``rate_limit_reached_type`` live only in the thread's
   rollout file under ``$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl``
@@ -66,14 +62,8 @@ Facts about the CLI this driver depends on (verified, not assumed)
 
 Deliberate non-parity, stated plainly rather than faked
 -------------------------------------------------------
-``steer()`` — NO PARITY. A ``codex exec`` process consumes its prompt at
-start-up; there is no mid-turn input channel, and stdin is DEVNULL by
-necessity (above). ``is_steerable_turn()`` therefore returns False
-unconditionally, which routes ``bot/handlers/chat.py`` into its existing
-"background work in progress, resend in a few minutes" branch — the user is
-told to resend rather than having their text silently dropped. ``steer()``
-itself only ever logs the text at ERROR (so it is recoverable from the
-journal) and is unreachable through the bot.
+Chat turns use exec over a private app-server socket. Telegram can submit
+additional input with turn/steer while the original exec consumes the reply.
 
 ``send_control()`` — different semantics by necessity, see that method.
 
@@ -94,6 +84,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -102,6 +93,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 
+from d_brain.services import codex_steering, turn_merge
 from d_brain.services.claude_session import (
     DEFAULT_BUSY_WAIT_BUDGET,
     DEFAULT_STALL_TIMEOUT,
@@ -266,6 +258,7 @@ class CodexExecDriver:
         instructions_file: Path | None = None,
         model: str | None = None,
         sandbox: str = DEFAULT_SANDBOX,
+        chat_steering: bool = False,
         codex_bin: str = "codex",
         codex_home: Path | None = None,
         popen: Callable[..., subprocess.Popen] = subprocess.Popen,
@@ -294,6 +287,8 @@ class CodexExecDriver:
         self.instructions_file = Path(instructions_file) if instructions_file else None
         self.model = model
         self.sandbox = sandbox
+        self.chat_steering = chat_steering
+        self._steer_target: tuple[Path, str, object] | None = None
         self.codex_bin = codex_bin
         self.codex_home = Path(codex_home) if codex_home else None
         self._popen = popen
@@ -670,34 +665,15 @@ class CodexExecDriver:
             logger.warning("codex interrupt: could not signal pid=%s: %s", pid, exc)
 
     def is_steerable_turn(self) -> bool:
-        """Always False — NO PARITY, see the module docstring.
+        target = self._steer_target
+        owner = turn_merge.owner.get()
+        return target is not None and (owner is None or owner is target[2])
 
-        A ``codex exec`` process reads its prompt once at start-up and its
-        stdin is DEVNULL by necessity (an inherited stdin makes the CLI wait
-        on "Reading additional input from stdin..." forever). There is no
-        mid-turn input channel to be steerable *into*.
-
-        Returning False is the honest answer AND the one with the best
-        behavior: ``bot/handlers/chat.py`` already handles it by telling the
-        user to resend in a few minutes, so their text is never silently
-        swallowed — it just does not get injected into the running turn.
-        """
-        return False
-
-    def steer(self, text: str) -> None:
-        """No-op with a loud log — unreachable through the bot.
-
-        Kept as a real method (the Protocol requires the name) but it cannot
-        do what its contract says on this engine. It is only reachable if
-        something calls it WITHOUT consulting ``is_steerable_turn()`` first;
-        rather than drop the text, log it at ERROR so it is recoverable from
-        the journal, and say plainly that nothing was injected.
-        """
-        logger.error(
-            "codex engine cannot steer a live turn (no mid-turn stdin "
-            "channel) — text NOT delivered to the model: %r",
-            text,
-        )
+    def steer(self, text: str) -> bool:
+        target = self._steer_target
+        if target is None or target[2] is not turn_merge.owner.get():
+            return False
+        return codex_steering.steer(target[0], target[1], text)
 
     def send_control(self, text: str) -> None:
         """Client-side control command. Semantics are engine-specific.
@@ -872,15 +848,13 @@ class CodexExecDriver:
     def _argv(self, thread_id: str | None, prompt: str) -> list[str]:
         """Build the exec command line.
 
-        The ``resume`` branch carries NEITHER ``-s`` nor ``-C``: the CLI
-        rejects them outright ("error: unexpected argument"), because the
-        sandbox and working root are properties of the thread, fixed when it
-        was created. This is the single most load-bearing CLI fact in this
-        module — see the module docstring.
+        Resume accepts the sandbox via a config override and gets the
+        working directory from the subprocess cwd on every turn.
         """
         argv = [self.codex_bin, "exec"]
         if thread_id:
             argv += ["resume", thread_id, "--json", "--skip-git-repo-check"]
+            argv += ["-c", f"sandbox_mode={self.sandbox}"]
         else:
             argv += [
                 "--json",
@@ -1124,27 +1098,63 @@ class CodexExecDriver:
             except Exception as exc:  # noqa: BLE001 — must never escape ask()
                 logger.error("codex ensure_session failed for %s: %s", log_id, exc)
                 return AskResult("error", detail=f"session start failed: {exc}")
+            if self.chat_steering and request_id is None:
+                try:
+                    with codex_steering.chat_server(
+                        self.codex_bin,
+                        self.work_dir,
+                        self.sandbox,
+                        self._effective_model(),
+                    ) as socket:
+                        return self._run_turn(
+                            prompt, log_id=log_id, timeout=timeout, socket=socket
+                        )
+                except OSError as exc:
+                    return AskResult("error", detail=f"chat server unavailable: {exc}")
+                finally:
+                    self._steer_target = None
             return self._run_turn(prompt, log_id=log_id, timeout=timeout)
         finally:
             self._inflight.unlink(missing_ok=True)
             self._pid_file.unlink(missing_ok=True)
             self._unlock(fd)
 
-    def _run_turn(self, prompt: str, *, log_id: str, timeout: float) -> AskResult:
+    def _run_turn(
+        self, prompt: str, *, log_id: str, timeout: float, socket: Path | None = None
+    ) -> AskResult:
         thread_id = self._read_text(self._thread_file)
         payload = self._compose_prompt(prompt, fresh_thread=thread_id is None)
-        argv = self._argv(thread_id, payload)
+        if socket is None:
+            argv = self._argv(thread_id, payload)
+        else:
+            argv = [self.codex_bin, "exec"]
+            if thread_id:
+                codex_steering.prepare_resume(
+                    socket,
+                    thread_id,
+                    self.work_dir,
+                    self.sandbox,
+                    self._effective_model(),
+                )
+                argv += ["resume", thread_id]
+            argv += ["--remote", f"unix://{socket}", "--json", "--", "-"]
         started = self._clock()
         try:
-            proc = self._popen(
-                argv,
-                cwd=str(self.work_dir),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
+            # Command lines are visible to other Unix users. An anonymous
+            # file also gives Codex a finite stdin without a pipe writer.
+            with tempfile.TemporaryFile() as prompt_file:
+                if socket is not None:
+                    prompt_file.write(payload.encode("utf-8"))
+                prompt_file.seek(0)
+                proc = self._popen(
+                    argv,
+                    cwd=str(self.work_dir),
+                    stdin=prompt_file if socket is not None else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
         except OSError as exc:
             logger.error("codex: could not launch %s: %s", argv[0], exc)
             self._journal_turn(rid=log_id, status="error", reason="spawn_failed")
@@ -1175,6 +1185,18 @@ class CodexExecDriver:
                     else:
                         outcome.events += 1
                         self._handle_event(event, outcome)
+                        if (
+                            socket
+                            and event.get("type") == "turn.started"
+                            and outcome.thread_id
+                        ):
+                            self._steer_target = (
+                                socket,
+                                outcome.thread_id,
+                                turn_merge.owner.get(),
+                            )
+                        if event.get("type") in ("turn.completed", "turn.failed"):
+                            self._steer_target = None
                         if outcome.completed:
                             break
                 continue
